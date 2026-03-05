@@ -26,9 +26,6 @@ const DEFAULT_NAMES: Record<string, string> = {
   go: 'main', rs: 'main', java: 'Main', c: 'main', cpp: 'main',
 };
 
-// Languages whose content commonly contains ``` fences of their own.
-// When we open a block with one of these langs, inner ``` lines are treated
-// as literal content — not new block openers — until the matching close fence.
 const FENCE_CONTAINING_LANGS = new Set(['md', 'markdown', 'text', 'txt', '']);
 
 export interface CodeBlock {
@@ -50,9 +47,7 @@ function detectFilename(contextText: string, ext: string): string | null {
   const filenamePattern = /(?:^|[\s(`'"*([])([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]{1,6})(?:[)`'"*\]\s:,]|$)/gm;
   const matches: string[] = [];
   let m: RegExpExecArray | null;
-  while ((m = filenamePattern.exec(tail)) !== null) {
-    matches.push(m[1]);
-  }
+  while ((m = filenamePattern.exec(tail)) !== null) matches.push(m[1]);
   if (!matches.length) return null;
   const extNorm = ext.toLowerCase();
   const sameExt = matches.filter(f => f.toLowerCase().endsWith(`.${extNorm}`));
@@ -63,15 +58,27 @@ function detectFilename(contextText: string, ext: string): string | null {
 }
 
 /**
- * Line-by-line parser that correctly handles nested ``` inside md/text blocks.
+ * Pre-processes raw AI output before line-by-line fence parsing.
  *
- * For normal code langs (js, ts, py, etc.): the first closing ``` ends the block.
- * For fence-containing langs (md, markdown, text, ''): we match the exact same
- * fence string that opened the block, so inner ``` for code examples are safe.
+ * Converts inline single-line triple-backtick spans into proper fenced blocks:
+ *   ```bash npm install```   →   a real fenced block on its own lines
+ *
+ * This is the primary source of stray backticks in rendered text — the AI
+ * writes commands as inline spans rather than proper fenced blocks.
  */
+function preprocess(raw: string): string {
+  // Match: ```lang<space>content``` all on one line (no newline inside the content)
+  // Must have at least one space between lang/fence and content so we don't
+  // accidentally collapse a real opening fence that has trailing spaces.
+  return raw.replace(/```(\w*)[ \t]+([^`\n]+?)```/g, (_match, lang, code) => {
+    const l = lang.trim() || 'bash';
+    return `\n\`\`\`${l}\n${code.trim()}\n\`\`\`\n`;
+  });
+}
+
 export function parseContent(raw: string): ParsedContent {
   const parts: ParsedContent['parts'] = [];
-  const lines = raw.split('\n');
+  const lines = preprocess(raw).split('\n');
   let i = 0;
   let textBuffer = '';
 
@@ -90,26 +97,15 @@ export function parseContent(raw: string): ParsedContent {
       while (i < lines.length) {
         const inner = lines[i];
         const closeMatch = inner.match(/^(`{3,})\s*$/);
-
         if (isFenceContaining) {
-          // For md/text: only close on the exact same fence string
-          if (closeMatch && closeMatch[1] === outerFence) {
-            i++;
-            break;
-          }
+          if (closeMatch && closeMatch[1] === outerFence) { i++; break; }
         } else {
-          // For normal langs: close on any fence of >= outer length
-          if (closeMatch && closeMatch[1].length >= outerFenceLen) {
-            i++;
-            break;
-          }
+          if (closeMatch && closeMatch[1].length >= outerFenceLen) { i++; break; }
         }
-
         codeLines.push(inner);
         i++;
       }
 
-      // Flush text before this block
       if (textBuffer) {
         parts.push({ type: 'text', content: textBuffer });
         textBuffer = '';
@@ -128,8 +124,7 @@ export function parseContent(raw: string): ParsedContent {
         type: 'code',
         block: {
           id: `cb_${++blockCounter}`,
-          lang,
-          ext,
+          lang, ext,
           code: codeLines.join('\n').replace(/\n$/, ''),
           suggestedFilename,
         },
@@ -140,10 +135,7 @@ export function parseContent(raw: string): ParsedContent {
     }
   }
 
-  if (textBuffer) {
-    parts.push({ type: 'text', content: textBuffer });
-  }
-
+  if (textBuffer) parts.push({ type: 'text', content: textBuffer });
   return { parts };
 }
 
@@ -160,6 +152,25 @@ export function renderInlineMarkdown(text: string): string {
 }
 
 export function renderTextBlock(text: string): string {
+  // ── Pre-clean AI artifacts before HTML conversion ─────────────────────────
+
+  // 1. Strip FILE: annotation lines — already consumed by extractFilePath,
+  //    showing them in rendered text is just noise.
+  text = text.replace(/^(?:\/\/\s*|#\s*|<!--\s*)?FILE:\s*.+?(?:\s*-->)?\s*$/gm, '');
+
+  // 2. Strip lang-prefixed single-backtick spans the AI emits, e.g.:
+  //    `bash npm install discord.js`  →  `npm install discord.js`
+  //    `node src/index.js`            →  `src/index.js`  (node is the runner, not content)
+  //    We remove the leading lang keyword so the content renders as clean <code>.
+  text = text.replace(
+    /`(bash|sh|shell|node|python|py|js|ts|npm|npx|yarn|pnpm|cmd|powershell)\s+([^`\n]+)`/g,
+    '`$2`'
+  );
+
+  // 3. Remove stray lone backticks sitting on their own line (malformed fence remnants).
+  text = text.replace(/^`{1,2}\s*$/gm, '');
+
+  // ── Standard markdown → HTML ──────────────────────────────────────────────
   let html = text
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -173,9 +184,10 @@ export function renderTextBlock(text: string): string {
     .replace(/\*(.+?)\*/g, '<em>$1</em>')
     .replace(/__(.+?)__/g, '<strong>$1</strong>')
     .replace(/_(.+?)_/g, '<em>$1</em>')
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    // Inline code — allow anything except newlines inside backticks
+    .replace(/`([^`\n]+)`/g, '<code>$1</code>')
     .replace(/^[\*\-] (.+)$/gm, '<li>$1</li>')
-    .replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
+    .replace(/^\d+\.\s+(.+)$/gm, '<li>$1</li>');
 
   html = html.replace(/(<li>[\s\S]*?<\/li>\n?)+/g, (m) => `<ul>${m}</ul>`);
   html = html.replace(/\n{2,}/g, '</p><p>');
@@ -185,4 +197,48 @@ export function renderTextBlock(text: string): string {
   html = html.replace(/(<\/(?:h[123]|ul|ol|div|blockquote|hr|pre)>)<\/p>/g, '$1');
 
   return html;
+}
+
+export function extractFilePath(code: string, suggestedFilename: string): string {
+  const firstLine = code.split('\n')[0].trim();
+  const patterns = [
+    /^\/\/\s*FILE:\s*(.+)$/,
+    /^#\s*FILE:\s*(.+)$/,
+    /^<!--\s*FILE:\s*(.+?)\s*-->$/,
+  ];
+  for (const pat of patterns) {
+    const m = firstLine.match(pat);
+    if (m) {
+      const p = m[1].trim();
+      if (p && p.includes('.')) return p;
+    }
+  }
+  return suggestedFilename;
+}
+
+export function stripFileComment(code: string): string {
+  const lines = code.split('\n');
+  const first = lines[0].trim();
+  if (
+    /^\/\/\s*FILE:/.test(first) ||
+    /^#\s*FILE:/.test(first) ||
+    /^<!--\s*FILE:/.test(first)
+  ) {
+    return lines.slice(1).join('\n').replace(/^\n/, '');
+  }
+  return code;
+}
+
+export function extractCodeBlocksForRegistry(
+  raw: string,
+): Array<{ path: string; content: string; lang: string }> {
+  const { parts } = parseContent(raw);
+  return parts
+    .filter((p): p is { type: 'code'; block: CodeBlock } => p.type === 'code')
+    .map(p => ({
+      path: extractFilePath(p.block.code, p.block.suggestedFilename),
+      content: stripFileComment(p.block.code),
+      lang: p.block.lang,
+    }))
+    .filter(b => b.content.trim().length > 0);
 }

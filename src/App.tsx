@@ -4,7 +4,15 @@ import { HistoryModal } from './components/HistoryModal';
 import { useOllama } from './hooks/useOllama';
 import { useDB } from './hooks/useDB';
 import { useToast } from './hooks/useToast';
+import { createRegistry, updateRegistry } from './lib/fileRegistry';
 import type { Panel, ChatRecord } from './types';
+import type { FileRegistry } from './lib/fileRegistry';
+
+function restoreRegistry(chatData?: ChatRecord): FileRegistry {
+  const reg = createRegistry();
+  if (!chatData?.fileEntries?.length) return reg;
+  return updateRegistry(reg, chatData.fileEntries, 0);
+}
 
 function newPanel(index: number, models: string[], chatData?: ChatRecord): Panel {
   return {
@@ -14,6 +22,7 @@ function newPanel(index: number, models: string[], chatData?: ChatRecord): Panel
     messages: chatData?.messages ?? [],
     streaming: false,
     streamingContent: '',
+    fileRegistry: restoreRegistry(chatData),
   };
 }
 
@@ -24,42 +33,36 @@ export default function App() {
   const [panels, setPanels] = useState<Panel[]>([]);
   const [historyOpen, setHistoryOpen] = useState(false);
 
-  // ── Panel management ──────────────────────────────────────────────────────
-
   const createPanel = useCallback((chatData?: ChatRecord) => {
-    setPanels((prev) => {
+    setPanels(prev => {
       if (prev.length >= 4) { toast('Max 4 panels open at once.'); return prev; }
       return [...prev, newPanel(prev.length, models, chatData)];
     });
   }, [models, toast]);
 
   const closePanel = useCallback((id: string) => {
-    setPanels((prev) => prev.filter((p) => p.id !== id));
+    setPanels(prev => prev.filter(p => p.id !== id));
   }, []);
 
   const updatePanel = useCallback((id: string, patch: Partial<Panel>) => {
-    setPanels((prev) => prev.map((p) => p.id === id ? { ...p, ...patch } : p));
+    setPanels(prev => prev.map(p => p.id === id ? { ...p, ...patch } : p));
   }, []);
 
   const savePanel = useCallback((panel: Panel) => {
+    const fileEntries = [...panel.fileRegistry.values()];
     save({
       id: panel.id,
       title: panel.title,
       model: panel.model,
       messages: panel.messages,
       updatedAt: Date.now(),
+      fileEntries,
     });
   }, [save]);
 
-  // ── History modal ─────────────────────────────────────────────────────────
-
   function handleOpenFromHistory(chat: ChatRecord) {
-    const existing = panels.find((p) => p.id === chat.id);
-    if (existing) {
-      // already open, just close modal
-    } else {
-      createPanel(chat);
-    }
+    const existing = panels.find(p => p.id === chat.id);
+    if (!existing) createPanel(chat);
     setHistoryOpen(false);
   }
 
@@ -75,8 +78,6 @@ export default function App() {
     toast('History cleared.');
   }
 
-  // ── Status indicator ──────────────────────────────────────────────────────
-
   const statusLabel =
     status === 'connecting' ? 'connecting...' :
     status === 'online' ? `ollama · ${models.length} model${models.length !== 1 ? 's' : ''}` :
@@ -84,7 +85,6 @@ export default function App() {
 
   return (
     <div id="app">
-      {/* Topbar */}
       <div id="topbar">
         <div className={`status-dot ${status}`} />
         <span id="status-label">{statusLabel}</span>
@@ -94,7 +94,6 @@ export default function App() {
         </div>
       </div>
 
-      {/* Workspace */}
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden', minHeight: 0 }}>
         <div id="workspace">
           {panels.length === 0 ? (
@@ -105,7 +104,7 @@ export default function App() {
             </div>
           ) : (
             <div id="panels-area">
-              {panels.map((panel) => (
+              {panels.map(panel => (
                 <ChatPanel
                   key={panel.id}
                   panel={panel}
@@ -120,11 +119,10 @@ export default function App() {
         </div>
       </div>
 
-      {/* History modal */}
       {historyOpen && (
         <HistoryModal
           chats={chats}
-          openPanelIds={panels.map((p) => p.id)}
+          openPanelIds={panels.map(p => p.id)}
           onOpen={handleOpenFromHistory}
           onDelete={handleDeleteChat}
           onClearAll={handleClearAll}

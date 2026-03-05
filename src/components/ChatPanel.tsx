@@ -1,6 +1,10 @@
 import React, { useRef, useEffect, useState, useCallback, KeyboardEvent } from 'react';
 import { MessageBubble } from './MessageBubble';
-import { streamChat } from '../lib/ollama';
+import { FileRegistryPanel } from './FileRegistryPanel';
+import { streamChat, BASE_SYSTEM_PROMPT } from '../lib/ollama';
+import { updateRegistry } from '../lib/fileRegistry';
+import { extractCodeBlocksForRegistry } from '../lib/markdown';
+import { registryToSystemPrompt } from '../lib/fileRegistry';
 import type { Panel, Message } from '../types';
 
 interface Props {
@@ -38,10 +42,13 @@ export function ChatPanel({ panel, models, onUpdate, onClose, onSave }: Props) {
     const abort = new AbortController();
     abortRef.current = abort;
 
+    // Build system prompt: base instructions + current file registry
+    const systemPrompt = BASE_SYSTEM_PROMPT + registryToSystemPrompt(panel.fileRegistry);
+
     let accumulated = '';
 
     try {
-      const gen = streamChat(panel.model || models[0] || 'llama3', updatedMessages, abort.signal);
+      const gen = streamChat(panel.model || models[0] || 'llama3', updatedMessages, systemPrompt, abort.signal);
       for await (const chunk of gen) {
         accumulated += chunk;
         onUpdate(panel.id, { streamingContent: accumulated });
@@ -49,8 +56,25 @@ export function ChatPanel({ panel, models, onUpdate, onClose, onSave }: Props) {
 
       const assistantMsg: Message = { role: 'assistant', content: accumulated };
       const finalMessages = [...updatedMessages, assistantMsg];
-      const updated: Panel = { ...panel, messages: finalMessages, streaming: false, streamingContent: '' };
-      onUpdate(panel.id, { messages: finalMessages, streaming: false, streamingContent: '' });
+
+      // Update the file registry with any new/edited files from this response
+      const newBlocks = extractCodeBlocksForRegistry(accumulated);
+      const updatedRegistry = updateRegistry(panel.fileRegistry, newBlocks, finalMessages.length - 1);
+
+      const updated: Panel = {
+        ...panel,
+        messages: finalMessages,
+        streaming: false,
+        streamingContent: '',
+        fileRegistry: updatedRegistry,
+      };
+
+      onUpdate(panel.id, {
+        messages: finalMessages,
+        streaming: false,
+        streamingContent: '',
+        fileRegistry: updatedRegistry,
+      });
       onSave(updated);
 
     } catch (err: unknown) {
@@ -58,8 +82,10 @@ export function ChatPanel({ panel, models, onUpdate, onClose, onSave }: Props) {
         if (accumulated) {
           const assistantMsg: Message = { role: 'assistant', content: accumulated + '\n\n_[stopped]_' };
           const finalMessages = [...updatedMessages, assistantMsg];
-          onUpdate(panel.id, { messages: finalMessages, streaming: false, streamingContent: '' });
-          onSave({ ...panel, messages: finalMessages });
+          const newBlocks = extractCodeBlocksForRegistry(accumulated);
+          const updatedRegistry = updateRegistry(panel.fileRegistry, newBlocks, finalMessages.length - 1);
+          onUpdate(panel.id, { messages: finalMessages, streaming: false, streamingContent: '', fileRegistry: updatedRegistry });
+          onSave({ ...panel, messages: finalMessages, fileRegistry: updatedRegistry });
         } else {
           onUpdate(panel.id, { streaming: false, streamingContent: '' });
         }
@@ -82,7 +108,6 @@ export function ChatPanel({ panel, models, onUpdate, onClose, onSave }: Props) {
       e.preventDefault();
       handleSend();
     }
-    // auto-resize
     const el = e.currentTarget;
     el.style.height = 'auto';
     el.style.height = `${Math.min(el.scrollHeight, 120)}px`;
@@ -96,8 +121,8 @@ export function ChatPanel({ panel, models, onUpdate, onClose, onSave }: Props) {
   }
 
   function handleClear() {
-    onUpdate(panel.id, { messages: [] });
-    onSave({ ...panel, messages: [] });
+    onUpdate(panel.id, { messages: [], fileRegistry: new Map() });
+    onSave({ ...panel, messages: [], fileRegistry: new Map() });
   }
 
   return (
@@ -108,17 +133,17 @@ export function ChatPanel({ panel, models, onUpdate, onClose, onSave }: Props) {
           className="panel-title"
           value={panel.title}
           placeholder="Chat name..."
-          onChange={(e) => onUpdate(panel.id, { title: e.target.value })}
+          onChange={e => onUpdate(panel.id, { title: e.target.value })}
           onBlur={() => onSave(panel)}
         />
         <select
           className="model-select"
           value={panel.model}
-          onChange={(e) => onUpdate(panel.id, { model: e.target.value })}
+          onChange={e => onUpdate(panel.id, { model: e.target.value })}
         >
           {models.length === 0
             ? <option value="">No models</option>
-            : models.map((m) => <option key={m} value={m}>{m}</option>)
+            : models.map(m => <option key={m} value={m}>{m}</option>)
           }
         </select>
         <button className="panel-btn" onClick={handleClear} title="Clear messages">↺</button>
@@ -136,11 +161,7 @@ export function ChatPanel({ panel, models, onUpdate, onClose, onSave }: Props) {
         ) : (
           <>
             {panel.messages.map((msg, i) => (
-              <MessageBubble
-                key={i}
-                message={msg}
-                withDownload={true}
-              />
+              <MessageBubble key={i} message={msg} withDownload={true} />
             ))}
             {panel.streaming && (
               panel.streamingContent ? (
@@ -150,9 +171,7 @@ export function ChatPanel({ panel, models, onUpdate, onClose, onSave }: Props) {
                 />
               ) : (
                 <div className="thinking">
-                  <div className="thinking-dots">
-                    <span /><span /><span />
-                  </div>
+                  <div className="thinking-dots"><span /><span /><span /></div>
                   <span>thinking...</span>
                 </div>
               )
@@ -161,6 +180,9 @@ export function ChatPanel({ panel, models, onUpdate, onClose, onSave }: Props) {
         )}
         <div ref={messagesEndRef} />
       </div>
+
+      {/* File Registry — shown above the input when files exist */}
+      <FileRegistryPanel registry={panel.fileRegistry} chatTitle={panel.title} />
 
       {/* Input */}
       <div className="panel-input">

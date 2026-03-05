@@ -236,7 +236,7 @@ html, body, #root {
   color: var(--muted);
   padding: 0 4px;
 }
-.msg.user .msg-label { color: var(--accent); align-self: flex-end; }
+.msg.user .msg-label { color: var(--accent); }
 .msg.assistant .msg-label { color: var(--accent2); }
 
 .msg-bubble {
@@ -740,3 +740,112 @@ html, body, #root {
 .code-pre::-webkit-scrollbar { width: 4px; }
 .code-pre::-webkit-scrollbar-track { background: transparent; }
 .code-pre::-webkit-scrollbar-thumb { background: var(--dim); border-radius: 4px; }
+/* ── FILE REGISTRY PANEL ── */
+.registry-panel {
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  flex-shrink: 0;
+}
+
+.registry-header {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 10px;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.12s;
+}
+.registry-header:hover { background: var(--border); }
+
+.registry-header-icon { font-size: 13px; }
+.registry-header-title {
+  font-family: 'Syne', sans-serif;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text);
+  flex: 1;
+}
+.registry-file-count {
+  font-size: 10px;
+  color: var(--muted);
+  background: var(--border-bright);
+  padding: 1px 6px;
+  border-radius: 10px;
+}
+.registry-zip-btn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 9px;
+  background: var(--panel);
+  border: 1px solid var(--border-bright);
+  border-radius: 5px;
+  color: var(--accent2);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.registry-zip-btn:hover {
+  background: var(--border-bright);
+  border-color: var(--accent2);
+}
+.registry-chevron {
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.registry-tree {
+  padding: 4px 0 8px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+.registry-tree::-webkit-scrollbar { width: 3px; }
+.registry-tree::-webkit-scrollbar-thumb { background: var(--dim); border-radius: 3px; }
+
+.registry-tree-dir {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 11px;
+  transition: color 0.12s;
+}
+.registry-tree-dir:hover { color: var(--text); }
+.registry-tree-arrow { font-size: 9px; width: 10px; flex-shrink: 0; }
+.registry-tree-icon { font-size: 11px; flex-shrink: 0; }
+.registry-tree-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.registry-tree-file {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  font-size: 11px;
+  color: var(--text);
+}
+.registry-tree-file .registry-tree-name { flex: 1; }
+.registry-file-dl {
+  background: none;
+  border: none;
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  opacity: 0;
+  transition: all 0.12s;
+}
+.registry-tree-file:hover .registry-file-dl {
+  opacity: 1;
+  color: var(--accent2);
+}
