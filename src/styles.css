@@ -287,7 +287,7 @@ html, body, #root {
 .msg-bubble em { color: var(--accent2); font-style: italic; }
 .msg-bubble ul, .msg-bubble ol { padding-left: 18px; margin-bottom: 8px; }
 .msg-bubble li { margin-bottom: 3px; line-height: 1.5; }
-.msg-bubble h1, .msg-bubble h2, .msg-bubble h3 {
+.msg-bubble h1, .msg-bubble h2, .msg-bubble h3, .msg-bubble h4, .msg-bubble h5 {
   font-family: 'Syne', sans-serif;
   color: var(--text);
   margin: 12px 0 6px;
@@ -295,6 +295,8 @@ html, body, #root {
 .msg-bubble h1 { font-size: 16px; }
 .msg-bubble h2 { font-size: 14px; }
 .msg-bubble h3 { font-size: 13px; }
+.msg-bubble h4 { font-size: 12px; }
+.msg-bubble h5 { font-size: 11px; letter-spacing: 0.3px; }
 .msg-bubble code:not(.block-code) {
   background: var(--code-bg);
   border: 1px solid var(--border-bright);
@@ -951,6 +953,9 @@ html, body, #root {
   flex-direction: column;
   gap: 3px;
 }
+.change-pills:hover {
+  cursor:default;
+}
 .change-pill {
   display: flex;
   align-items: center;
@@ -998,4 +1003,283 @@ html, body, #root {
   font-size: 10px;
   font-weight: 600;
   letter-spacing: 0.4px;
+}
+
+/* ── NO CODE WARNING ── */
+.no-code-warning {
+  margin-top: 8px;
+  padding: 12px 14px;
+  background: rgba(247, 106, 106, 0.07);
+  border: 1px solid rgba(247, 106, 106, 0.35);
+  border-radius: 8px;
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+.no-code-warning-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 7px;
+}
+.no-code-warning-title {
+  font-weight: 700;
+  color: var(--danger);
+  font-size: 12px;
+}
+.no-code-warning-close {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 2px;
+  display: grid;
+  place-items: center;
+  border-radius: 4px;
+}
+.no-code-warning-close:hover { color: var(--danger); }
+.no-code-warning p {
+  color: var(--text);
+  margin-bottom: 6px;
+}
+.no-code-warning-suggestions-label {
+  color: var(--muted);
+  font-size: 11px;
+  margin-bottom: 4px !important;
+}
+.no-code-warning ul {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--muted);
+}
+.no-code-warning li {
+  margin-bottom: 3px;
+}
+.no-code-warning code {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 10.5px;
+  color: var(--accent2);
+}
+
+/* ── STREAMING PHASE INDICATOR ── */
+.phase-indicator {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 2px 0;
+}
+.phase-indicator-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.phase-label {
+  font-size: 11px;
+  color: var(--muted);
+  font-style: italic;
+}
+.phase-progress-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.phase-progress-bar {
+  flex: 1;
+  height: 3px;
+  background: var(--border-bright);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.phase-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.4s ease;
+}
+.phase-progress-text {
+  font-size: 10px;
+  color: var(--dim);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* ── STREAMING WRAP (phase overlay during content streaming) ── */
+.streaming-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+.streaming-phase-overlay {
+  padding: 6px 16px 0;
+  opacity: 0.8;
+}
+
+/* ── INLINE CODE BLOCK (shell / plain text) ── */
+.inline-code-block {
+  margin: 8px 0;
+  border-radius: 6px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: var(--code-bg);
+}
+.inline-code-lang {
+  display: block;
+  padding: 3px 10px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--muted);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  letter-spacing: 0.4px;
+  text-transform: lowercase;
+}
+.inline-code-pre {
+  margin: 0;
+  padding: 10px 12px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+}
+.inline-code-pre code {
+  background: none;
+  padding: 0;
+  font-size: inherit;
+  color: inherit;
+}
+
+/* ── PHASE STEP COUNTER (shown inline with the phase label) ── */
+.phase-step-counter {
+  font-size: 10px;
+  color: var(--accent);
+  font-weight: 600;
+  padding: 1px 6px;
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  margin-left: 4px;
+  flex-shrink: 0;
+}
+
+/* ── CHECKLIST INDICATOR (code-planning preset) ── */
+.checklist-wrap {
+  padding: 0 16px 8px;
+}
+
+.checklist-indicator {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  font-size: 12px;
+}
+
+.checklist-header {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.checklist-header-label {
+  font-weight: 600;
+  color: var(--text);
+  font-size: 11px;
+}
+
+.checklist-progress-text {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--muted);
+  font-family: 'JetBrains Mono', monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 200px;
+}
+
+.checklist-steps {
+  padding: 6px 0;
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+.checklist-steps::-webkit-scrollbar { width: 4px; }
+.checklist-steps::-webkit-scrollbar-track { background: transparent; }
+.checklist-steps::-webkit-scrollbar-thumb { background: var(--dim); border-radius: 4px; }
+
+.checklist-steps:hover {
+  cursor:default;
+}
+
+.checklist-step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px;
+  transition: background 0.1s;
+}
+
+.checklist-step.active {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.checklist-step-icon {
+  width: 14px;
+  height: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.checklist-step.done .checklist-step-icon { color: var(--accent); }
+.checklist-step.future .checklist-step-icon { color: var(--muted); }
+
+.checklist-step-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+
+.active-dot {
+  background: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent);
+  animation: pulse-dot 1.2s ease-in-out infinite;
+}
+
+.future-dot {
+  background: var(--border);
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.checklist-step-path {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.checklist-step.done .checklist-step-path { color: var(--muted); }
+.checklist-step.active .checklist-step-path { color: var(--text); font-weight: 500; }
+.checklist-step.future .checklist-step-path { color: var(--muted); opacity: 0.6; }
+
+.checklist-step-writing {
+  font-size: 10px;
+  color: var(--accent);
+  font-style: italic;
+  flex-shrink: 0;
 }

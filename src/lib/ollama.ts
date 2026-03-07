@@ -1,3 +1,4 @@
+// FILE: src/lib/ollama.ts
 import type { Message } from '../types';
 
 export const OLLAMA_BASE = 'http://localhost:11434';
@@ -10,6 +11,40 @@ export async function fetchModels(): Promise<string[]> {
   return (data.models ?? []).map((m: { name: string }) => m.name);
 }
 
+/**
+ * Single non-streaming request — used for the planning phase.
+ * Returns the full response text once complete.
+ */
+export async function chatOnce(
+  model: string,
+  messages: Message[],
+  systemPrompt: string,
+  signal: AbortSignal,
+): Promise<string> {
+  const payload = [
+    { role: 'system', content: systemPrompt },
+    ...messages,
+  ];
+
+  const res = await fetch(`${OLLAMA_BASE}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    signal,
+    body: JSON.stringify({ model, messages: payload, stream: false }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Ollama error ${res.status}: ${res.statusText}`);
+  }
+
+  const data = await res.json();
+  return data.message?.content ?? '';
+}
+
+/**
+ * Streaming request — used for implementation phases.
+ * Yields text chunks as they arrive.
+ */
 export async function* streamChat(
   model: string,
   messages: Message[],

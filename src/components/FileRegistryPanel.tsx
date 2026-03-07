@@ -1,3 +1,4 @@
+// FILE: src/components/FileRegistryPanel.tsx
 import React, { useState } from 'react';
 import type { FileRegistry } from '../lib/fileRegistry';
 import { downloadRegistryAsZip } from '../lib/zip';
@@ -20,9 +21,15 @@ interface TreeNode {
   children: TreeNode[];
 }
 
+/**
+ * Builds a tree from a flat list of file paths.
+ * Children are sorted so directories always appear before files,
+ * with each group sorted alphabetically (case-insensitive).
+ */
 function buildTree(paths: string[]): TreeNode[] {
   const root: TreeNode[] = [];
-  for (const path of paths.sort()) {
+
+  for (const path of paths) {
     const parts = path.split('/');
     let level = root;
     for (let i = 0; i < parts.length; i++) {
@@ -36,10 +43,31 @@ function buildTree(paths: string[]): TreeNode[] {
       level = node.children;
     }
   }
+
+  /** Recursively sort: directories first (alpha), then files (alpha). */
+  function sortLevel(nodes: TreeNode[]): void {
+    nodes.sort((a, b) => {
+      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+      return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+    });
+    for (const node of nodes) {
+      if (node.isDir) sortLevel(node.children);
+    }
+  }
+
+  sortLevel(root);
   return root;
 }
 
-function TreeItem({ node, registry, depth }: { node: TreeNode; registry: FileRegistry; depth: number }) {
+function TreeItem({
+  node,
+  registry,
+  depth,
+}: {
+  node: TreeNode;
+  registry: FileRegistry;
+  depth: number;
+}) {
   const [open, setOpen] = useState(true);
   const entry = registry.get(node.path);
 
@@ -63,7 +91,10 @@ function TreeItem({ node, registry, depth }: { node: TreeNode; registry: FileReg
           onClick={() => setOpen(o => !o)}
         >
           <span className="registry-tree-arrow">
-            <IconChevronRight size={10} style={{ transform: open ? 'rotate(90deg)' : 'none', transition: 'transform 0.15s' }} />
+            <IconChevronRight
+              size={10}
+              style={{ transform: open ? 'rotate(90deg)' : 'none', transition: 'transform 0.15s' }}
+            />
           </span>
           <span className="registry-tree-icon">
             {open ? <IconFolderOpen size={13} /> : <IconFolder size={13} />}
@@ -81,7 +112,11 @@ function TreeItem({ node, registry, depth }: { node: TreeNode; registry: FileReg
     <div className="registry-tree-file" style={{ paddingLeft: depth * 12 + 6 }}>
       <span className="registry-tree-icon"><IconFileText size={13} /></span>
       <span className="registry-tree-name">{node.name}</span>
-      <button className="registry-file-dl" onClick={handleDownload} title={`Download ${node.name}`}>
+      <button
+        className="registry-file-dl"
+        onClick={handleDownload}
+        title={`Download ${node.name}`}
+      >
         <IconDownload size={11} />
       </button>
     </div>
@@ -108,7 +143,9 @@ export function FileRegistryPanel({ registry, chatTitle }: Props) {
     <div className={`registry-panel${open ? ' open' : ''}`}>
       <div className="registry-header" onClick={() => setOpen(o => !o)}>
         <span className="registry-header-title">Project Files</span>
-        <span className="registry-file-count">{registry.size} file{registry.size !== 1 ? 's' : ''}</span>
+        <span className="registry-file-count">
+          {registry.size} file{registry.size !== 1 ? 's' : ''}
+        </span>
         <button
           className="registry-zip-btn"
           onClick={e => { e.stopPropagation(); handleZipDownload(); }}

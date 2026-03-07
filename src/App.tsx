@@ -27,6 +27,7 @@ function newPanel(index: number, models: string[], chatData?: ChatRecord): Panel
     streamingContent: '',
     fileRegistry: restoreRegistry(chatData),
     prevRegistry: new Map(),
+    streamingPhase: null,
   };
 }
 

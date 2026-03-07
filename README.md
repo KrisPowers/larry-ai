@@ -1,6 +1,6 @@
-# Larry AI - A Ollama Chat UI
+# Ollama Chat UI
 
-Larry AI is a local multi-panel chat UI for Ollama, built with React + TypeScript + Vite, for all types of usage including coding, chat-bot expereinces, and creative work.
+A local multi-panel chat UI for Ollama, built with React + TypeScript + Vite.
 
 ## Requirements
 
@@ -33,7 +33,7 @@ npm run preview
 
 ## Features
 
-- Up to 4 side-by-side chat panels
+- Up to 3 side-by-side chat panels
 - Per-panel model selection (auto-fetched from Ollama)
 - Streaming responses token-by-token
 - Stop generation mid-stream
@@ -44,3 +44,7 @@ npm run preview
 - History modal with search + delete
 - Chat rename (click the title in the panel header)
 - Toast notifications
+
+Roadmap:
+Chat's able to reference other chat's
+Node.js FS to edit files in a Larry-AI directory in real-time (locked to the Larry-AI directory to prevent mass-purges, and worse.)
