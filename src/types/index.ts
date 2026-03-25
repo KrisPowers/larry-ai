@@ -11,9 +11,17 @@ export interface ChatRecord {
   title: string;
   model: string;
   preset: string;
+  projectId?: string;
+  projectLabel?: string;
   messages: Message[];
   updatedAt: number;
   fileEntries?: Array<{ path: string; content: string; lang: string; updatedAt: number }>;
+}
+
+export interface ProjectFolder {
+  id: string;
+  label: string;
+  createdAt: number;
 }
 
 /**
@@ -34,6 +42,8 @@ export interface Panel {
   title: string;
   model: string;
   preset: string;
+  projectId?: string;
+  projectLabel?: string;
   messages: Message[];
   streaming: boolean;
   streamingContent: string;

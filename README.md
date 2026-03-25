@@ -1,4 +1,4 @@
-# Ollama Chat UI
+# Larry AI
 
 A local multi-panel chat UI for Ollama, built with React + TypeScript + Vite.
 

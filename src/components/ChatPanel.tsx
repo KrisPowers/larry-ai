@@ -6,15 +6,14 @@ import { ChecklistIndicator } from './ChecklistIndicator';
 import { streamChat } from '../lib/ollama';
 import { buildDeepPlan, buildStepUserMessage, getStepExecutorSystem, buildSummaryUserMessage, getSummarySystem, packageVersionsToSystemInject } from '../lib/deepPlanner';
 import type { DeepStep } from '../lib/deepPlanner';
-import { updateRegistry, registryToSystemPrompt } from '../lib/fileRegistry';
+import { registryToSystemPrompt, updateRegistry } from '../lib/fileRegistry';
 import { extractCodeBlocksForRegistry } from '../lib/markdown';
 import { fetchUrlsFromPrompt, fetchGlobalContext, urlContextToSystemInject, globalContextToSystemInject, globalContextToConversationInject, contextsToSystemInject } from '../lib/fetcher';
 import type { FetchedContext } from '../lib/fetcher';
 import { PRESETS, getPreset, DEFAULT_PRESET_ID } from '../lib/presets';
-import { readZipEntries } from '../lib/zip';
 import {
   IconSend, IconStop, IconRotateCcw, IconX,
-  IconPaperclip, IconFolder, IconHexagon,
+  IconHexagon,
   IconDownload,
 } from './Icon';
 import type { Panel, Message } from '../types';
@@ -26,18 +25,8 @@ interface Props {
   onUpdate: (id: string, patch: Partial<Panel>) => void;
   onClose: (id: string) => void;
   onSave: (panel: Panel) => void;
-}
-
-function langFromPath(path: string): string {
-  const ext = path.split('.').pop()?.toLowerCase() ?? '';
-  const map: Record<string, string> = {
-    ts: 'ts', tsx: 'tsx', js: 'js', jsx: 'jsx',
-    py: 'py', html: 'html', css: 'css', scss: 'scss',
-    json: 'json', md: 'md', sh: 'sh', bash: 'bash',
-    yaml: 'yaml', yml: 'yaml', xml: 'xml', sql: 'sql',
-    go: 'go', rs: 'rs', java: 'java', c: 'c', cpp: 'cpp',
-  };
-  return map[ext] ?? ext ?? 'text';
+  selected?: boolean;
+  onActivate?: (id: string) => void;
 }
 
 function exportChatAsMarkdown(panel: Panel): string {
@@ -46,6 +35,7 @@ function exportChatAsMarkdown(panel: Panel): string {
     `# Chat Log — ${panel.title}`, ``,
     `**Model:** ${panel.model || 'unknown'}  `,
     `**Preset:** ${panel.preset || 'code'}  `,
+    ...(panel.projectLabel ? [`**Project:** ${panel.projectLabel}  `] : []),
     `**Exported:** ${date}  `,
     ``, `---`, ``,
   ];
@@ -55,11 +45,9 @@ function exportChatAsMarkdown(panel: Panel): string {
   return lines.join('\n');
 }
 
-export function ChatPanel({ panel, models, onUpdate, onClose, onSave }: Props) {
+export function ChatPanel({ panel, models, onUpdate, onClose, onSave, selected, onActivate }: Props) {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef       = useRef<HTMLTextAreaElement>(null);
-  const fileInputRef   = useRef<HTMLInputElement>(null);
-  const dirInputRef    = useRef<HTMLInputElement>(null);
   const abortRef       = useRef<AbortController | null>(null);
   const [inputValue, setInputValue] = useState('');
 
@@ -318,57 +306,6 @@ export function ChatPanel({ panel, models, onUpdate, onClose, onSave }: Props) {
 
   }, [inputValue, panel, models, onUpdate, onSave]);
 
-  // ── File / dir upload ──────────────────────────────────────────────────────
-  async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
-    const files = Array.from(e.target.files ?? []);
-    if (!files.length) return;
-    e.target.value = '';
-    let added = 0;
-    let reg = new Map(panel.fileRegistry);
-    for (const file of files) {
-      const uint8 = new Uint8Array(await file.arrayBuffer());
-      if (file.name.endsWith('.zip')) {
-        for (const entry of readZipEntries(uint8)) {
-          reg = updateRegistry(reg, [{ path: entry.path, content: entry.content, lang: langFromPath(entry.path) }], 0);
-          added++;
-        }
-      } else {
-        const content = new TextDecoder('utf-8', { fatal: false }).decode(uint8);
-        if (!content.includes('\0')) {
-          reg = updateRegistry(reg, [{ path: file.name, content, lang: langFromPath(file.name) }], 0);
-          added++;
-        }
-      }
-    }
-    const sysMsg: Message = { role: 'assistant', content: `_Uploaded ${added} file${added !== 1 ? 's' : ''} into the project registry._` };
-    const finalMessages = [...panel.messages, sysMsg];
-    onUpdate(panel.id, { messages: finalMessages, fileRegistry: reg });
-    onSave({ ...panel, messages: finalMessages, fileRegistry: reg });
-  }
-
-  async function handleDirImport(e: React.ChangeEvent<HTMLInputElement>) {
-    const files = Array.from(e.target.files ?? []);
-    if (!files.length) return;
-    e.target.value = '';
-    let reg = new Map(panel.fileRegistry);
-    let added = 0;
-    for (const file of files) {
-      const rel       = (file as File & { webkitRelativePath?: string }).webkitRelativePath ?? file.name;
-      const parts     = rel.split('/');
-      const cleanPath = parts.length > 1 ? parts.slice(1).join('/') : rel;
-      if (/\.(png|jpg|jpeg|gif|webp|ico|woff|woff2|ttf|eot|mp4|mp3|pdf|zip|tar|gz|lock)$/.test(cleanPath)) continue;
-      if (/node_modules|\.git|\.next|dist\/|build\//.test(cleanPath)) continue;
-      const fileText = await file.text();
-      if (fileText.includes('\0')) continue;
-      reg = updateRegistry(reg, [{ path: cleanPath, content: fileText, lang: langFromPath(cleanPath) }], 0);
-      added++;
-    }
-    const sysMsg: Message = { role: 'assistant', content: `_Imported ${added} file${added !== 1 ? 's' : ''} from directory into the project registry._` };
-    const finalMessages = [...panel.messages, sysMsg];
-    onUpdate(panel.id, { messages: finalMessages, fileRegistry: reg });
-    onSave({ ...panel, messages: finalMessages, fileRegistry: reg });
-  }
-
   function handleStop()  { abortRef.current?.abort(); }
   function handleClear() {
     onUpdate(panel.id, { messages: [], fileRegistry: new Map(), prevRegistry: new Map(), streamingPhase: null });
@@ -396,7 +333,7 @@ export function ChatPanel({ panel, models, onUpdate, onClose, onSave }: Props) {
   const hasMessages     = panel.messages.length > 0;
 
   return (
-    <div className="chat-panel">
+    <div className={`chat-panel${selected ? ' active' : ''}`} onMouseDown={() => onActivate?.(panel.id)}>
       <div className="panel-header">
         <input
           className="panel-title"
@@ -517,18 +454,6 @@ export function ChatPanel({ panel, models, onUpdate, onClose, onSave }: Props) {
 
       <div className="panel-input">
         <div className="input-row">
-          <input ref={fileInputRef} type="file" multiple accept="*/*" style={{ display: 'none' }} onChange={handleFileUpload} />
-          <input ref={dirInputRef} type="file"
-            // @ts-ignore
-            webkitdirectory="" multiple style={{ display: 'none' }} onChange={handleDirImport} />
-          <div className="input-actions">
-            <button className="input-action-btn" onClick={() => fileInputRef.current?.click()} title="Upload files or zip" disabled={panel.streaming}>
-              <IconPaperclip size={14} />
-            </button>
-            <button className="input-action-btn" onClick={() => dirInputRef.current?.click()} title="Import project directory" disabled={panel.streaming}>
-              <IconFolder size={14} />
-            </button>
-          </div>
           <textarea
             ref={inputRef}
             className="msg-input"
