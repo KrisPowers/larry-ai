@@ -1,22 +1,97 @@
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { ChatPanel } from './components/ChatPanel';
+import { ChatHistoryDrawer } from './components/ChatHistoryDrawer';
+import { PromptLibraryView } from './components/PromptLibraryView';
 import { Sidebar } from './components/Sidebar';
 import { useOllama } from './hooks/useOllama';
 import { useDB } from './hooks/useDB';
+import { useReplyPreferences } from './hooks/useReplyPreferences';
 import { useToast } from './hooks/useToast';
 import { createRegistry, updateRegistry } from './lib/fileRegistry';
+import {
+  ANTHROPIC_UI_SAMPLE_KEY,
+  DEFAULT_OLLAMA_BASE,
+  getAnthropicApiKey,
+  getModelDisplayLabel,
+  getOpenAIApiKey,
+  getOllamaBase,
+  OPENAI_UI_SAMPLE_KEY,
+  normalizeModelHandle,
+  resolveModelHandle,
+  setAnthropicApiKey as persistAnthropicApiKey,
+  setOllamaBase as persistOllamaBase,
+  setOpenAIApiKey as persistOpenAIApiKey,
+} from './lib/ollama';
 import { DEFAULT_PRESET_ID } from './lib/presets';
-import { IconFolderPlus, IconHexagon, IconTrash2, IconUpload, IconX } from './components/Icon';
-import type { Panel, ChatRecord, ProjectFolder } from './types';
+import { REPLY_PREFERENCES_STORAGE_KEY } from './lib/replyPreferences';
+import { IconFolderPlus, IconHexagon, IconMessageSquare, IconSettings, IconTerminal, IconTrash2, IconUpload, IconX } from './components/Icon';
+import { deriveWorkspaceFromChat, normaliseProjectId } from './lib/workspaces';
+import type { ChatReasoningEffort, Panel, ChatRecord, ProjectFolder, ThreadType } from './types';
 import type { FileRegistry } from './lib/fileRegistry';
 
 const FOLDERS_STORAGE_KEY = 'larry_project_folders_v1';
 const DEFAULT_MODEL_STORAGE_KEY = 'larry_default_model_v1';
+const DEVELOPER_TOOLS_STORAGE_KEY = 'larry_developer_tools_v1';
+const ADVANCED_USE_STORAGE_KEY = 'larry_advanced_use_v1';
+const MAX_VISIBLE_CHAT_PANELS = 3;
+const CHAT_FORM_TRANSITION_MIN_MS = 2000;
+const DEFAULT_REASONING_EFFORT: ChatReasoningEffort = 'balanced';
 
 interface BrowserStorageSnapshot {
   supported: boolean;
   usage?: number;
   quota?: number;
+}
+
+type AppRoute =
+  | { kind: 'landing' }
+  | { kind: 'chat-start' }
+  | { kind: 'code-start' }
+  | { kind: 'debug-start' }
+  | { kind: 'settings' }
+  | { kind: 'chat'; chatId: string }
+  | { kind: 'not-found'; path: string };
+
+type SettingsTabId = 'general' | 'models' | 'storage' | 'developerTools';
+
+const SETTINGS_TABS: Array<{
+  id: SettingsTabId;
+  label: string;
+}> = [
+  {
+    id: 'general',
+    label: 'General',
+  },
+  {
+    id: 'models',
+    label: 'Models',
+  },
+  {
+    id: 'storage',
+    label: 'Storage',
+  },
+  {
+    id: 'developerTools',
+    label: 'Developer Tools',
+  },
+];
+
+function buildStartPath(threadType: ThreadType): string {
+  if (threadType === 'code') return '/code';
+  if (threadType === 'debug') return '/debug';
+  return '/chat';
+}
+
+function resolveThreadSurface(record?: Partial<Pick<ChatRecord, 'threadType' | 'preset' | 'projectId' | 'projectLabel'>> | null): ThreadType {
+  if (record?.threadType === 'chat' || record?.threadType === 'code' || record?.threadType === 'debug') {
+    return record.threadType;
+  }
+
+  if (record?.preset === 'code' && record.projectId && record.projectLabel) {
+    return 'code';
+  }
+
+  return 'chat';
 }
 
 function measureStringBytes(value: string): number {
@@ -124,29 +199,47 @@ function getCustomPresetStorageUsage(): { bytes: number; count: number } {
   }
 }
 
-function normaliseProjectId(label: string): string {
-  return `project:${label.toLowerCase().replace(/[^a-z0-9-_]+/g, '-')}`;
+function decodeRouteSegment(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
 }
 
-function deriveWorkspaceFromChat(chat: ChatRecord): { id: string; label: string } {
-  if (chat.projectId && chat.projectLabel) {
-    return { id: chat.projectId, label: chat.projectLabel };
+function parseAppRoute(pathname: string): AppRoute {
+  const cleanPath = pathname === '/' ? '/' : pathname.replace(/\/+$/, '');
+
+  if (cleanPath === '/') {
+    return { kind: 'landing' };
   }
 
-  const entries = chat.fileEntries ?? [];
-  if (!entries.length) return { id: 'project:general', label: 'General' };
-
-  const counts = new Map<string, number>();
-  for (const entry of entries) {
-    const top = entry.path.split('/')[0]?.trim();
-    if (!top) continue;
-    counts.set(top, (counts.get(top) ?? 0) + 1);
+  if (cleanPath === '/chat') {
+    return { kind: 'chat-start' };
   }
 
-  if (!counts.size) return { id: 'project:general', label: 'General' };
+  if (cleanPath === '/code') {
+    return { kind: 'code-start' };
+  }
 
-  const [label] = [...counts.entries()].sort((a, b) => b[1] - a[1])[0];
-  return { id: normaliseProjectId(label), label };
+  if (cleanPath === '/debug') {
+    return { kind: 'debug-start' };
+  }
+
+  if (cleanPath === '/settings') {
+    return { kind: 'settings' };
+  }
+
+  const segments = cleanPath.split('/').filter(Boolean);
+  if (segments.length === 1) {
+    return { kind: 'chat', chatId: decodeRouteSegment(segments[0]) };
+  }
+
+  return { kind: 'not-found', path: pathname };
+}
+
+function buildChatPath(chatId: string): string {
+  return `/${encodeURIComponent(chatId)}`;
 }
 
 function restoreRegistry(chatData?: Partial<ChatRecord>): FileRegistry {
@@ -167,12 +260,32 @@ function registryFromEntries(entries?: ChatRecord['fileEntries']): FileRegistry 
   return new Map(cloneFileEntries(entries).map((entry) => [entry.path, entry]));
 }
 
-function newPanel(index: number, defaultModel: string, chatData?: Partial<ChatRecord>): Panel {
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  const tagName = target.tagName;
+  return (
+    target.isContentEditable ||
+    tagName === 'INPUT' ||
+    tagName === 'TEXTAREA' ||
+    tagName === 'SELECT'
+  );
+}
+
+function isPinnedDraftChatPanel(panel: Panel): boolean {
+  if (resolveThreadSurface(panel) !== 'chat') return false;
+
+  const hasAssistantReply = panel.messages.some((message) => message.role === 'assistant');
+  return !hasAssistantReply;
+}
+
+function newPanel(defaultModel: string, chatData?: Partial<ChatRecord>): Panel {
   return {
     id: chatData?.id ?? `p_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-    title: chatData?.title ?? `Chat ${index + 1}`,
-    model: chatData?.model ?? defaultModel,
+    title: chatData?.title ?? 'New chat',
+    model: normalizeModelHandle(chatData?.model ?? defaultModel),
     preset: chatData?.preset ?? DEFAULT_PRESET_ID,
+    reasoningEffort: chatData?.reasoningEffort ?? DEFAULT_REASONING_EFFORT,
+    threadType: chatData?.threadType,
     projectId: chatData?.projectId,
     projectLabel: chatData?.projectLabel,
     messages: chatData?.messages ?? [],
@@ -226,7 +339,7 @@ function parseChatLog(md: string, filename: string): ChatRecord | null {
     return {
       id: `import_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
       title,
-      model,
+      model: normalizeModelHandle(model),
       preset,
       projectId,
       projectLabel: projectLabel || undefined,
@@ -246,15 +359,35 @@ interface ConfirmDialogState {
   onConfirm: () => Promise<void> | void;
 }
 
+interface ChatLaunchTransitionState {
+  chatId: string;
+  prompt: string;
+  startedAt: number;
+}
+
 export default function App() {
-  const { models, status } = useOllama();
+  const [ollamaEndpoint, setOllamaEndpoint] = useState(() => getOllamaBase());
+  const [ollamaEndpointDraft, setOllamaEndpointDraft] = useState(() => getOllamaBase());
+  const [openAIApiKey, setOpenAIApiKey] = useState(() => getOpenAIApiKey());
+  const [openAIApiKeyDraft, setOpenAIApiKeyDraft] = useState(() => getOpenAIApiKey());
+  const [anthropicApiKey, setAnthropicApiKey] = useState(() => getAnthropicApiKey());
+  const [anthropicApiKeyDraft, setAnthropicApiKeyDraft] = useState(() => getAnthropicApiKey());
+  const { models, providers, status } = useOllama({
+    endpoint: ollamaEndpoint,
+    openAIApiKey,
+    anthropicApiKey,
+  });
   const { chats, ready, save, remove, clearAll } = useDB();
+  const { replyPreferences } = useReplyPreferences();
   const { toast } = useToast();
   const [panels, setPanels] = useState<Panel[]>([]);
   const [activePanelId, setActivePanelId] = useState<string | null>(null);
-  const [view, setView] = useState<'chats' | 'settings'>('chats');
+  const [route, setRoute] = useState<AppRoute>(() => parseAppRoute(window.location.pathname));
+  const [queuedLaunchPrompts, setQueuedLaunchPrompts] = useState<Record<string, string>>({});
   const [projectFolders, setProjectFolders] = useState<ProjectFolder[]>([]);
   const [defaultModel, setDefaultModel] = useState('');
+  const [developerToolsEnabled, setDeveloperToolsEnabled] = useState(false);
+  const [advancedUseEnabled, setAdvancedUseEnabled] = useState(false);
   const [browserStorage, setBrowserStorage] = useState<BrowserStorageSnapshot>({
     supported: true,
   });
@@ -269,9 +402,30 @@ export default function App() {
   const [workspaceDraftName, setWorkspaceDraftName] = useState('');
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogState | null>(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
+  const [chatHistoryDrawerOpen, setChatHistoryDrawerOpen] = useState(false);
+  const [chatStarterVisible, setChatStarterVisible] = useState(false);
+  const [chatStarterPanelId, setChatStarterPanelId] = useState<string | null>(null);
+  const [chatLaunchTransition, setChatLaunchTransition] = useState<ChatLaunchTransitionState | null>(null);
+  const [settingsTab, setSettingsTab] = useState<SettingsTabId>('general');
 
-  const resolvedDefaultModel =
-    defaultModel && models.includes(defaultModel) ? defaultModel : models[0] ?? '';
+  const resolvedDefaultModel = resolveModelHandle(defaultModel, models);
+
+  const navigate = useCallback((path: string, replace = false) => {
+    const nextRoute = parseAppRoute(path);
+    if (window.location.pathname !== path) {
+      window.history[replace ? 'replaceState' : 'pushState']({}, '', path);
+    }
+    setRoute(nextRoute);
+  }, []);
+
+  useEffect(() => {
+    const handlePopState = () => {
+      setRoute(parseAppRoute(window.location.pathname));
+    };
+
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
 
   useEffect(() => {
     try {
@@ -294,6 +448,40 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    setOllamaEndpointDraft(ollamaEndpoint);
+  }, [ollamaEndpoint]);
+
+  useEffect(() => {
+    setOpenAIApiKeyDraft(openAIApiKey);
+  }, [openAIApiKey]);
+
+  useEffect(() => {
+    setAnthropicApiKeyDraft(anthropicApiKey);
+  }, [anthropicApiKey]);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(DEVELOPER_TOOLS_STORAGE_KEY);
+      if (raw === '1' || raw === 'true') {
+        setDeveloperToolsEnabled(true);
+      }
+    } catch {
+      // ignore malformed local cache
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(ADVANCED_USE_STORAGE_KEY);
+      if (raw === '1' || raw === 'true') {
+        setAdvancedUseEnabled(true);
+      }
+    } catch {
+      // ignore malformed local cache
+    }
+  }, []);
+
+  useEffect(() => {
     localStorage.setItem(FOLDERS_STORAGE_KEY, JSON.stringify(projectFolders));
   }, [projectFolders]);
 
@@ -302,6 +490,22 @@ export default function App() {
       localStorage.setItem(DEFAULT_MODEL_STORAGE_KEY, defaultModel);
     }
   }, [defaultModel]);
+
+  useEffect(() => {
+    if (developerToolsEnabled) {
+      localStorage.setItem(DEVELOPER_TOOLS_STORAGE_KEY, '1');
+    } else {
+      localStorage.removeItem(DEVELOPER_TOOLS_STORAGE_KEY);
+    }
+  }, [developerToolsEnabled]);
+
+  useEffect(() => {
+    if (advancedUseEnabled) {
+      localStorage.setItem(ADVANCED_USE_STORAGE_KEY, '1');
+    } else {
+      localStorage.removeItem(ADVANCED_USE_STORAGE_KEY);
+    }
+  }, [advancedUseEnabled]);
 
   useEffect(() => {
     let cancelled = false;
@@ -373,7 +577,6 @@ export default function App() {
   }, []);
 
   const openWorkspaceLauncher = useCallback((mode: 'create' | 'import' = 'create') => {
-    setView('chats');
     setWorkspaceLauncherMode(mode);
     setWorkspaceDraftName('');
     setWorkspaceLauncherOpen(true);
@@ -415,16 +618,82 @@ export default function App() {
   }, [confirmDialog]);
 
   const createPanel = useCallback((chatData?: Partial<ChatRecord>) => {
+    const nextPanel = newPanel(resolvedDefaultModel, chatData);
     setPanels((prev) => {
-      if (prev.length >= 3) {
-        toast('Max 3 panels open at once.');
+      const existing = prev.find((panel) => panel.id === nextPanel.id);
+      if (existing) {
+        setActivePanelId(existing.id);
         return prev;
       }
-      const nextPanel = newPanel(prev.length, resolvedDefaultModel, chatData);
+
       setActivePanelId(nextPanel.id);
       return [...prev, nextPanel];
     });
-  }, [resolvedDefaultModel, toast]);
+    return nextPanel;
+  }, [resolvedDefaultModel]);
+
+  const consumeLaunchPrompt = useCallback((panelId: string) => {
+    setQueuedLaunchPrompts((prev) => {
+      if (!(panelId in prev)) return prev;
+      const next = { ...prev };
+      delete next[panelId];
+      return next;
+    });
+  }, []);
+
+  const openDraftChat = useCallback((options: {
+    model?: string;
+    preset?: string;
+    reasoningEffort?: ChatReasoningEffort;
+    threadType?: ThreadType;
+    projectId?: string;
+    projectLabel?: string;
+    fileEntries?: ChatRecord['fileEntries'];
+    initialPrompt?: string;
+    title?: string;
+    navigateOnCreate?: boolean;
+  }) => {
+    const fileEntries = cloneFileEntries(options.fileEntries);
+    const panel = createPanel({
+      title: options.title ?? 'New chat',
+      model: options.model || resolvedDefaultModel,
+      preset: options.preset ?? DEFAULT_PRESET_ID,
+      reasoningEffort: options.reasoningEffort ?? DEFAULT_REASONING_EFFORT,
+      threadType: options.threadType,
+      projectId: options.projectId,
+      projectLabel: options.projectLabel,
+      messages: [],
+      fileEntries,
+      updatedAt: Date.now(),
+    });
+
+    void save({
+      id: panel.id,
+      title: panel.title,
+      model: panel.model,
+      preset: panel.preset,
+      reasoningEffort: panel.reasoningEffort ?? DEFAULT_REASONING_EFFORT,
+      threadType: panel.threadType,
+      projectId: panel.projectId,
+      projectLabel: panel.projectLabel,
+      messages: [],
+      updatedAt: Date.now(),
+      fileEntries,
+    });
+
+    const initialPrompt = options.initialPrompt?.trim();
+    if (initialPrompt) {
+      setQueuedLaunchPrompts((prev) => ({
+        ...prev,
+        [panel.id]: initialPrompt,
+      }));
+    }
+
+    if (options.navigateOnCreate ?? true) {
+      navigate(buildChatPath(panel.id));
+    }
+    return panel.id;
+  }, [createPanel, navigate, resolvedDefaultModel, save]);
 
   const upsertProjectFolder = useCallback((folder: {
     id: string;
@@ -466,42 +735,70 @@ export default function App() {
     }
     const id = normaliseProjectId(clean);
     upsertProjectFolder({ id, label: clean, fileEntries: [] });
-    setView('chats');
     toast(`Created workspace "${clean}".`);
     return true;
   }, [toast, upsertProjectFolder]);
 
-  const handleCreateChatInFolder = useCallback((folder: { id: string; label: string }) => {
+  const handleCreateChatInFolder = useCallback((folder: { id: string; label: string }, threadType: ThreadType = 'code') => {
     const workspaceEntries = cloneFileEntries(
       projectFolders.find((workspace) => workspace.id === folder.id)?.fileEntries,
     );
     upsertProjectFolder({ id: folder.id, label: folder.label });
-    createPanel({
-      title: `${folder.label} Chat`,
-      model: resolvedDefaultModel,
-      preset: DEFAULT_PRESET_ID,
+    openDraftChat({
+      title: `${folder.label} ${threadType === 'debug' ? 'Debug' : 'Code'}`,
+      preset: 'code',
+      threadType,
       projectId: folder.id,
       projectLabel: folder.label,
-      messages: [],
       fileEntries: workspaceEntries,
-      updatedAt: Date.now(),
     });
-    setView('chats');
-  }, [createPanel, projectFolders, resolvedDefaultModel, setView, upsertProjectFolder]);
+  }, [openDraftChat, projectFolders, upsertProjectFolder]);
 
   const closePanel = useCallback((id: string) => {
-    setPanels(prev => {
-      const next = prev.filter(p => p.id !== id);
-      if (activePanelId === id) {
-        setActivePanelId(next[0]?.id ?? null);
-      }
+    const closingRecord = panels.find((panel) => panel.id === id) ?? chats.find((chat) => chat.id === id);
+    const closingSurface = resolveThreadSurface(closingRecord);
+    const fallbackPath = buildStartPath(closingSurface);
+    const closingIndex = panels.findIndex((panel) => panel.id === id);
+    const remainingPanels = panels.filter((panel) => panel.id !== id);
+    const nextSameSurfaceAfter = panels
+      .slice(closingIndex + 1)
+      .find((panel) => panel.id !== id && resolveThreadSurface(panel) === closingSurface) ?? null;
+    const nextSameSurfaceBefore = [...panels.slice(0, Math.max(closingIndex, 0))]
+      .reverse()
+      .find((panel) => panel.id !== id && resolveThreadSurface(panel) === closingSurface) ?? null;
+    const replacementPanel = nextSameSurfaceAfter
+      ?? nextSameSurfaceBefore
+      ?? remainingPanels[0]
+      ?? null;
+
+    setPanels(prev => prev.filter(p => p.id !== id));
+
+    if (activePanelId === id) {
+      setActivePanelId(replacementPanel?.id ?? null);
+    }
+
+    setQueuedLaunchPrompts((prev) => {
+      if (!(id in prev)) return prev;
+      const next = { ...prev };
+      delete next[id];
       return next;
     });
-  }, [activePanelId]);
+
+    if (route.kind === 'chat' && route.chatId === id) {
+      if (replacementPanel && resolveThreadSurface(replacementPanel) === closingSurface) {
+        navigate(buildChatPath(replacementPanel.id));
+      } else {
+        navigate(fallbackPath);
+      }
+    }
+  }, [activePanelId, chats, navigate, panels, route]);
 
   const activatePanel = useCallback((id: string) => {
     setActivePanelId(id);
-  }, []);
+    if (route.kind === 'chat-start' || (route.kind === 'chat' && route.chatId !== id)) {
+      navigate(buildChatPath(id));
+    }
+  }, [navigate, route]);
 
   const updatePanel = useCallback((id: string, patch: Partial<Panel>) => {
     setPanels(prev => prev.map(p => p.id === id ? { ...p, ...patch } : p));
@@ -521,6 +818,8 @@ export default function App() {
       title: panel.title,
       model: panel.model,
       preset: panel.preset,
+      reasoningEffort: panel.reasoningEffort ?? DEFAULT_REASONING_EFFORT,
+      threadType: panel.threadType,
       projectId: panel.projectId,
       projectLabel: panel.projectLabel,
       messages: panel.messages,
@@ -542,6 +841,8 @@ export default function App() {
     } else {
       setActivePanelId(existing.id);
     }
+
+    navigate(buildChatPath(chat.id));
   }
 
   function handleImportChat(chat: ChatRecord) {
@@ -557,6 +858,7 @@ export default function App() {
       title: chat.title,
       model: chat.model,
       preset: chat.preset,
+      reasoningEffort: chat.reasoningEffort ?? DEFAULT_REASONING_EFFORT,
       projectId: chat.projectId,
       projectLabel: chat.projectLabel,
       messages: chat.messages,
@@ -634,7 +936,6 @@ export default function App() {
       ),
     );
 
-    setView('chats');
     if (targetFolder) {
       toast(`Updated workspace "${projectLabel}" with ${added} file${added !== 1 ? 's' : ''}.`);
     } else {
@@ -671,6 +972,11 @@ export default function App() {
       message: `${descriptor} This action cannot be undone.`,
       confirmLabel: 'Delete workspace',
       onConfirm: async () => {
+        const currentRouteRecord = route.kind === 'chat'
+          ? panels.find((panel) => panel.id === route.chatId) ?? chats.find((chat) => chat.id === route.chatId)
+          : null;
+        const fallbackPath = buildStartPath(resolveThreadSurface(currentRouteRecord));
+
         if (relatedChats.length) {
           await Promise.all(relatedChats.map((chat) => remove(chat.id)));
         }
@@ -684,10 +990,25 @@ export default function App() {
           return next;
         });
 
+        setQueuedLaunchPrompts((prev) => {
+          const next = { ...prev };
+          for (const chatId of relatedIds) {
+            delete next[chatId];
+          }
+          return next;
+        });
+
+        if (
+          route.kind === 'chat' &&
+          (relatedIds.has(route.chatId) || panels.some((panel) => panel.id === route.chatId && panel.projectId === workspace.id))
+        ) {
+          navigate(fallbackPath);
+        }
+
         toast(`Deleted workspace "${workspace.label}".`);
       },
     });
-  }, [chats, projectFolders, remove, requestConfirmation, toast]);
+  }, [chats, navigate, panels, projectFolders, remove, requestConfirmation, route, toast]);
 
   const requestClearAll = useCallback(() => {
     requestConfirmation({
@@ -698,15 +1019,511 @@ export default function App() {
         await clearAll();
         setPanels([]);
         setActivePanelId(null);
+        setQueuedLaunchPrompts({});
+        navigate('/');
         toast('History cleared.');
       },
     });
-  }, [clearAll, requestConfirmation, toast]);
+  }, [clearAll, navigate, requestConfirmation, toast]);
+
+  const handleStartChatFromHome = useCallback((options: {
+    prompt: string;
+    preset: string;
+    title: string;
+    threadType: ThreadType;
+    model?: string;
+    reasoningEffort?: ChatReasoningEffort;
+    workspace?: { id: string; label: string };
+  }) => {
+    const workspaceEntries = options.workspace
+      ? cloneFileEntries(projectFolders.find((folder) => folder.id === options.workspace?.id)?.fileEntries)
+      : [];
+
+    if (options.workspace) {
+      upsertProjectFolder({ id: options.workspace.id, label: options.workspace.label });
+    }
+
+    const shouldUseChatLaunchTransition =
+      options.threadType === 'chat' &&
+      (route.kind === 'chat-start' || chatStarterVisible);
+
+    const starterHostPanel = shouldUseChatLaunchTransition && chatStarterPanelId
+      ? panels.find((panel) => panel.id === chatStarterPanelId) ?? null
+      : null;
+
+    let createdChatId: string;
+
+    if (starterHostPanel && resolveThreadSurface(starterHostPanel) === 'chat' && starterHostPanel.messages.length === 0) {
+      const updatedStarterPanel: Panel = {
+        ...starterHostPanel,
+        title: options.title,
+        model: options.model || resolvedDefaultModel,
+        preset: options.preset,
+        reasoningEffort: options.reasoningEffort ?? starterHostPanel.reasoningEffort ?? DEFAULT_REASONING_EFFORT,
+        threadType: options.threadType,
+        projectId: options.workspace?.id,
+        projectLabel: options.workspace?.label,
+        fileRegistry: registryFromEntries(workspaceEntries),
+      };
+
+      setPanels((prev) => prev.map((panel) => panel.id === starterHostPanel.id
+        ? {
+            ...panel,
+            title: updatedStarterPanel.title,
+            model: updatedStarterPanel.model,
+            preset: updatedStarterPanel.preset,
+            reasoningEffort: updatedStarterPanel.reasoningEffort,
+            threadType: updatedStarterPanel.threadType,
+            projectId: updatedStarterPanel.projectId,
+            projectLabel: updatedStarterPanel.projectLabel,
+            fileRegistry: updatedStarterPanel.fileRegistry,
+          }
+        : panel));
+      void save({
+        id: updatedStarterPanel.id,
+        title: updatedStarterPanel.title,
+        model: updatedStarterPanel.model,
+        preset: updatedStarterPanel.preset,
+        reasoningEffort: updatedStarterPanel.reasoningEffort,
+        threadType: updatedStarterPanel.threadType,
+        projectId: updatedStarterPanel.projectId,
+        projectLabel: updatedStarterPanel.projectLabel,
+        messages: updatedStarterPanel.messages,
+        updatedAt: Date.now(),
+        fileEntries: workspaceEntries,
+      });
+      setQueuedLaunchPrompts((prev) => ({
+        ...prev,
+        [starterHostPanel.id]: options.prompt.trim(),
+      }));
+      setActivePanelId(starterHostPanel.id);
+      createdChatId = starterHostPanel.id;
+    } else {
+      createdChatId = openDraftChat({
+        title: options.title,
+        model: options.model,
+        preset: options.preset,
+        reasoningEffort: options.reasoningEffort,
+        threadType: options.threadType,
+        projectId: options.workspace?.id,
+        projectLabel: options.workspace?.label,
+        fileEntries: workspaceEntries,
+        initialPrompt: options.prompt,
+        navigateOnCreate: !shouldUseChatLaunchTransition,
+      });
+    }
+
+    if (shouldUseChatLaunchTransition) {
+      setChatStarterVisible(true);
+      setChatLaunchTransition({
+        chatId: createdChatId,
+        prompt: options.prompt,
+        startedAt: Date.now(),
+      });
+    }
+
+    return true;
+  }, [chatStarterPanelId, chatStarterVisible, openDraftChat, panels, projectFolders, resolvedDefaultModel, route.kind, save, upsertProjectFolder]);
+
+  useEffect(() => {
+    if (route.kind !== 'chat') return;
+
+    const existing = panels.find((panel) => panel.id === route.chatId);
+    if (existing) {
+      if (activePanelId !== existing.id) {
+        setActivePanelId(existing.id);
+      }
+      return;
+    }
+
+    if (!ready) return;
+
+    const chat = chats.find((candidate) => candidate.id === route.chatId);
+    if (!chat) return;
+
+    const workspaceEntries = chat.projectId
+      ? projectFolders.find((folder) => folder.id === chat.projectId)?.fileEntries
+      : undefined;
+
+    createPanel({
+      ...chat,
+      fileEntries: workspaceEntries?.length ? cloneFileEntries(workspaceEntries) : chat.fileEntries,
+    });
+  }, [activePanelId, chats, createPanel, panels, projectFolders, ready, route]);
+
+  const activePanel = useMemo(
+    () => (route.kind === 'chat' ? panels.find((panel) => panel.id === route.chatId) ?? null : null),
+    [panels, route],
+  );
+  const routeChatRecord = useMemo(
+    () => (route.kind === 'chat'
+      ? activePanel ?? chats.find((chat) => chat.id === route.chatId) ?? null
+      : null),
+    [activePanel, chats, route],
+  );
+  const activeThreadSurface = useMemo<ThreadType>(
+    () => resolveThreadSurface(routeChatRecord),
+    [routeChatRecord],
+  );
+  const isMissingChatRoute =
+    route.kind === 'chat' &&
+    ready &&
+    !activePanel &&
+    !chats.some((chat) => chat.id === route.chatId);
+  const chatSurfaceChats = useMemo(
+    () => chats.filter((chat) => resolveThreadSurface(chat) === 'chat'),
+    [chats],
+  );
+  const chatSurfacePanels = useMemo(
+    () => panels.filter((panel) => resolveThreadSurface(panel) === 'chat'),
+    [panels],
+  );
+  const visibleChatPanels = useMemo(() => {
+    if (!chatSurfacePanels.length) return [];
+
+    if (chatSurfacePanels.length <= MAX_VISIBLE_CHAT_PANELS) {
+      return chatSurfacePanels;
+    }
+
+    const activeId = activePanel?.id ?? activePanelId ?? null;
+    const latestDraftPanel = [...chatSurfacePanels]
+      .reverse()
+      .find((panel) => isPinnedDraftChatPanel(panel)) ?? null;
+
+    if (!latestDraftPanel) {
+      const latestWindowStart = Math.max(0, chatSurfacePanels.length - MAX_VISIBLE_CHAT_PANELS);
+      if (!activeId) {
+        return chatSurfacePanels.slice(latestWindowStart);
+      }
+
+      const activeIndex = chatSurfacePanels.findIndex((panel) => panel.id === activeId);
+      if (activeIndex === -1) {
+        return chatSurfacePanels.slice(latestWindowStart);
+      }
+
+      const windowStart = activeIndex < latestWindowStart
+        ? activeIndex
+        : latestWindowStart;
+      return chatSurfacePanels.slice(windowStart, windowStart + MAX_VISIBLE_CHAT_PANELS);
+    }
+
+    const chosenPanelIds = new Set<string>([latestDraftPanel.id]);
+    if (activeId) {
+      chosenPanelIds.add(activeId);
+    }
+
+    const latestDraftIndex = chatSurfacePanels.findIndex(
+      (panel) => panel.id === latestDraftPanel.id,
+    );
+
+    for (let index = latestDraftIndex - 1; index >= 0 && chosenPanelIds.size < MAX_VISIBLE_CHAT_PANELS; index -= 1) {
+      chosenPanelIds.add(chatSurfacePanels[index].id);
+    }
+
+    for (let index = chatSurfacePanels.length - 1; index >= 0 && chosenPanelIds.size < MAX_VISIBLE_CHAT_PANELS; index -= 1) {
+      chosenPanelIds.add(chatSurfacePanels[index].id);
+    }
+
+    return chatSurfacePanels.filter((panel) => chosenPanelIds.has(panel.id)).slice(-MAX_VISIBLE_CHAT_PANELS);
+  }, [activePanel?.id, activePanelId, chatSurfacePanels]);
+  const pendingChatLaunchPanel = useMemo(
+    () => chatLaunchTransition
+      ? panels.find((panel) => panel.id === chatLaunchTransition.chatId) ?? null
+      : null,
+    [chatLaunchTransition, panels],
+  );
+  const pendingChatLaunchStatusText = useMemo(() => {
+    if (!pendingChatLaunchPanel) return 'Preparing the first response...';
+    if (pendingChatLaunchPanel.messages.some((message) => message.role === 'assistant')) {
+      return 'Reply ready. Opening the conversation...';
+    }
+    if (pendingChatLaunchPanel.streamingContent.trim()) {
+      return 'Receiving the first answer...';
+    }
+    return pendingChatLaunchPanel.streamingPhase?.label ?? 'Starting reply...';
+  }, [pendingChatLaunchPanel]);
+  const pendingChatLaunchHasResponse = useMemo(
+    () => Boolean(
+      pendingChatLaunchPanel &&
+      (
+        pendingChatLaunchPanel.streamingContent.trim() ||
+        pendingChatLaunchPanel.messages.some((message) => message.role === 'assistant')
+      )
+    ),
+    [pendingChatLaunchPanel],
+  );
+  const chatSurfaceOpenPanelIds = useMemo(
+    () => chatSurfacePanels.map((panel) => panel.id),
+    [chatSurfacePanels],
+  );
+  const isChatSurfaceRoute =
+    route.kind === 'chat-start' || (route.kind === 'chat' && activeThreadSurface === 'chat');
+  const embeddedChatStarterPanelId = chatLaunchTransition?.chatId ?? chatStarterPanelId;
+  const showEmbeddedChatStarter =
+    route.kind === 'chat-start'
+      ? !chatSurfacePanels.length || chatStarterVisible || Boolean(chatLaunchTransition)
+      : isChatSurfaceRoute && (chatStarterVisible || Boolean(chatLaunchTransition));
+  const chatStarterCompanionPanels = useMemo(() => {
+    const filteredPanels = visibleChatPanels.filter(
+      (panel) => panel.id !== embeddedChatStarterPanelId,
+    );
+
+    if (!showEmbeddedChatStarter) {
+      return filteredPanels;
+    }
+
+    const limit = Math.max(0, MAX_VISIBLE_CHAT_PANELS - 1);
+    if (filteredPanels.length <= limit) {
+      return filteredPanels;
+    }
+
+    const activeChatPanelId =
+      route.kind === 'chat' && activeThreadSurface === 'chat'
+        ? activePanel?.id ?? route.chatId
+        : activePanelId;
+
+    if (!activeChatPanelId) {
+      return filteredPanels.slice(-limit);
+    }
+
+    const activeStarterCompanion = filteredPanels.find(
+      (panel) => panel.id === activeChatPanelId,
+    );
+    if (!activeStarterCompanion) {
+      return filteredPanels.slice(-limit);
+    }
+
+    const otherPanels = filteredPanels.filter((panel) => panel.id !== activeStarterCompanion.id);
+    const selectedPanels = [...otherPanels.slice(-(limit - 1)), activeStarterCompanion];
+
+    return filteredPanels.filter((panel) =>
+      selectedPanels.some((selectedPanel) => selectedPanel.id === panel.id),
+    );
+  }, [
+    activePanel?.id,
+    activePanelId,
+    activeThreadSurface,
+    embeddedChatStarterPanelId,
+    route,
+    showEmbeddedChatStarter,
+    visibleChatPanels,
+  ]);
+  const chatDisplayPanels = showEmbeddedChatStarter ? chatStarterCompanionPanels : visibleChatPanels;
+  const chatDisplayFrameCount = Math.max(
+    1,
+    Math.min(
+      MAX_VISIBLE_CHAT_PANELS,
+      chatDisplayPanels.length + (showEmbeddedChatStarter ? 1 : 0),
+    ),
+  );
+  const codeSurfaceChats = useMemo(
+    () => chats.filter((chat) => resolveThreadSurface(chat) === 'code'),
+    [chats],
+  );
+  const debugSurfaceChats = useMemo(
+    () => chats.filter((chat) => resolveThreadSurface(chat) === 'debug'),
+    [chats],
+  );
+  const explorerMode = route.kind === 'code-start'
+    ? 'code'
+    : route.kind === 'debug-start'
+      ? 'debug'
+      : route.kind === 'chat' && activeThreadSurface !== 'chat'
+        ? activeThreadSurface
+        : null;
+  const explorerChats = explorerMode === 'debug' ? debugSurfaceChats : codeSurfaceChats;
+  const handleCreateCodeThreadInFolder = useCallback(
+    (folder: { id: string; label: string }) => handleCreateChatInFolder(folder, 'code'),
+    [handleCreateChatInFolder],
+  );
+  const handleCreateDebugThreadInFolder = useCallback(
+    (folder: { id: string; label: string }) => handleCreateChatInFolder(folder, 'debug'),
+    [handleCreateChatInFolder],
+  );
+  const embeddedChatStarterFrame = showEmbeddedChatStarter ? (
+    <section className="chat-starter-frame">
+      <div className="chat-starter-frame-head">
+        <div className="chat-starter-frame-copy">
+          <span className="chat-starter-frame-kicker">Composer</span>
+          <strong>{chatLaunchTransition ? 'Starting a new chat' : 'New conversation'}</strong>
+        </div>
+        <span className="chat-starter-frame-meta">
+          {chatLaunchTransition ? 'Generating...' : 'Prompt + model'}
+        </span>
+      </div>
+
+      <div className="chat-starter-frame-body">
+        <PromptLibraryView
+          page="chat"
+          embedded={true}
+          chats={chatSurfaceChats}
+          folders={projectFolders}
+          defaultModel={resolvedDefaultModel}
+          models={models}
+          chatLaunchTransition={chatLaunchTransition ? {
+            prompt: chatLaunchTransition.prompt,
+            statusText: pendingChatLaunchStatusText,
+          } : null}
+          onStartChat={handleStartChatFromHome}
+          onOpenChat={handleOpenFromHistory}
+          onCreateChatInFolder={handleCreateCodeThreadInFolder}
+          onOpenWorkspaceLauncher={openWorkspaceLauncher}
+          onDeleteChat={requestDeleteChat}
+          onDeleteWorkspace={requestDeleteWorkspace}
+        />
+      </div>
+    </section>
+  ) : null;
+  const isChatRouteActive = route.kind === 'chat-start' || (route.kind === 'chat' && activeThreadSurface === 'chat');
+  const isCodeRouteActive = route.kind === 'code-start' || (route.kind === 'chat' && activeThreadSurface === 'code');
+  const isDebugRouteActive = route.kind === 'debug-start' || (route.kind === 'chat' && activeThreadSurface === 'debug');
+  const showChatHistoryDrawer =
+    !chatLaunchTransition &&
+    isChatSurfaceRoute;
+  const activeChatHistoryId = route.kind === 'chat' && activeThreadSurface === 'chat'
+    ? activePanel?.id ?? route.chatId
+    : null;
+
+  useEffect(() => {
+    if (!showChatHistoryDrawer && chatHistoryDrawerOpen) {
+      setChatHistoryDrawerOpen(false);
+    }
+  }, [chatHistoryDrawerOpen, showChatHistoryDrawer]);
+
+  useEffect(() => {
+    if (!isChatSurfaceRoute && chatStarterVisible) {
+      setChatStarterVisible(false);
+    }
+  }, [chatStarterVisible, isChatSurfaceRoute]);
+
+  useEffect(() => {
+    if (!chatLaunchTransition) return;
+    if (!isChatSurfaceRoute) {
+      setChatLaunchTransition(null);
+    }
+  }, [chatLaunchTransition, isChatSurfaceRoute]);
+
+  useEffect(() => {
+    if (!chatLaunchTransition) return;
+    if (pendingChatLaunchPanel) return;
+    setChatLaunchTransition(null);
+  }, [chatLaunchTransition, pendingChatLaunchPanel]);
+
+  useEffect(() => {
+    if (!chatStarterPanelId) return;
+    if (panels.some((panel) => panel.id === chatStarterPanelId)) return;
+    setChatStarterPanelId(null);
+    setChatStarterVisible(false);
+  }, [chatStarterPanelId, panels]);
+
+  useEffect(() => {
+    if (!chatLaunchTransition || !pendingChatLaunchPanel || !pendingChatLaunchHasResponse) return undefined;
+
+    const remainingDelay = Math.max(
+      0,
+      CHAT_FORM_TRANSITION_MIN_MS - (Date.now() - chatLaunchTransition.startedAt),
+    );
+
+    const timeout = window.setTimeout(() => {
+      setChatStarterVisible(false);
+      setChatStarterPanelId(null);
+      setChatLaunchTransition((current) =>
+        current?.chatId === pendingChatLaunchPanel.id ? null : current,
+      );
+      navigate(buildChatPath(pendingChatLaunchPanel.id));
+    }, remainingDelay);
+
+    return () => window.clearTimeout(timeout);
+  }, [chatLaunchTransition, navigate, pendingChatLaunchHasResponse, pendingChatLaunchPanel]);
+
+  const ollamaProvider = providers.find((provider) => provider.provider === 'ollama');
+  const openAIProvider = providers.find((provider) => provider.provider === 'openai');
+  const anthropicProvider = providers.find((provider) => provider.provider === 'anthropic');
+  const onlineProviders = providers.filter((provider) => provider.online);
+  const enabledProviders = providers.filter((provider) => provider.enabled);
 
   const statusLabel =
-    status === 'connecting' ? 'connecting...' :
-    status === 'online' ? `ollama / ${models.length} model${models.length !== 1 ? 's' : ''}` :
-    'ollama offline';
+    status === 'connecting' ? 'checking providers...' :
+    onlineProviders.length
+      ? `${onlineProviders.map((provider) => provider.label).join(', ')} / ${models.length} model${models.length !== 1 ? 's' : ''}`
+      : enabledProviders.length
+        ? 'no providers available'
+        : 'no providers configured';
+
+  const ollamaStatusLabel =
+    !ollamaProvider ? 'checking...' :
+    ollamaProvider.online ? `${ollamaProvider.modelCount} model${ollamaProvider.modelCount !== 1 ? 's' : ''} available` :
+    'offline';
+
+  const openAIStatusLabel =
+    !openAIApiKey ? 'No key saved' :
+    !openAIProvider ? 'checking...' :
+    openAIProvider.online
+      ? `${openAIProvider.mode === 'sample' ? 'Sample catalog' : 'Live catalog'} · ${openAIProvider.modelCount} model${openAIProvider.modelCount !== 1 ? 's' : ''}`
+      :
+    openAIProvider.error || 'Unable to connect';
+
+  const anthropicStatusLabel =
+    !anthropicApiKey ? 'No key saved' :
+    !anthropicProvider ? 'checking...' :
+    anthropicProvider.online
+      ? `${anthropicProvider.mode === 'sample' ? 'Sample catalog' : 'Live catalog'} · ${anthropicProvider.modelCount} model${anthropicProvider.modelCount !== 1 ? 's' : ''}`
+      :
+    anthropicProvider.error || 'Unable to connect';
+
+  const applyOllamaEndpoint = useCallback(() => {
+    const next = persistOllamaBase(ollamaEndpointDraft);
+    setOllamaEndpoint(next);
+    setOllamaEndpointDraft(next);
+    toast(`Ollama endpoint set to ${next}`);
+  }, [ollamaEndpointDraft, toast]);
+
+  const resetOllamaEndpoint = useCallback(() => {
+    const next = persistOllamaBase(DEFAULT_OLLAMA_BASE);
+    setOllamaEndpoint(next);
+    setOllamaEndpointDraft(next);
+    toast('Ollama endpoint reset to the default local address.');
+  }, [toast]);
+
+  const applyOpenAIKey = useCallback(() => {
+    const next = persistOpenAIApiKey(openAIApiKeyDraft);
+    setOpenAIApiKey(next);
+    toast(next ? 'OpenAI API key saved for this browser.' : 'OpenAI API key removed.');
+  }, [openAIApiKeyDraft, toast]);
+
+  const clearOpenAIKey = useCallback(() => {
+    persistOpenAIApiKey('');
+    setOpenAIApiKey('');
+    setOpenAIApiKeyDraft('');
+    toast('OpenAI API key cleared.');
+  }, [toast]);
+
+  const useSampleOpenAIKey = useCallback(() => {
+    const next = persistOpenAIApiKey(OPENAI_UI_SAMPLE_KEY);
+    setOpenAIApiKey(next);
+    setOpenAIApiKeyDraft(next);
+    toast('OpenAI sample UI key applied.');
+  }, [toast]);
+
+  const applyAnthropicKey = useCallback(() => {
+    const next = persistAnthropicApiKey(anthropicApiKeyDraft);
+    setAnthropicApiKey(next);
+    toast(next ? 'Anthropic API key saved for this browser.' : 'Anthropic API key removed.');
+  }, [anthropicApiKeyDraft, toast]);
+
+  const clearAnthropicKey = useCallback(() => {
+    persistAnthropicApiKey('');
+    setAnthropicApiKey('');
+    setAnthropicApiKeyDraft('');
+    toast('Anthropic API key cleared.');
+  }, [toast]);
+
+  const useSampleAnthropicKey = useCallback(() => {
+    const next = persistAnthropicApiKey(ANTHROPIC_UI_SAMPLE_KEY);
+    setAnthropicApiKey(next);
+    setAnthropicApiKeyDraft(next);
+    toast('Anthropic sample UI key applied.');
+  }, [toast]);
 
   const chatHistoryBytes = ready ? measureJsonBytes(chats) : 0;
   const workspaceStorageBytes = estimateLocalStorageEntryBytes(
@@ -716,11 +1533,20 @@ export default function App() {
   const defaultModelStorageBytes = defaultModel
     ? estimateLocalStorageEntryBytes(DEFAULT_MODEL_STORAGE_KEY, defaultModel)
     : 0;
+  const replyPreferenceStorageBytes = replyPreferences.length
+    ? estimateLocalStorageEntryBytes(
+        REPLY_PREFERENCES_STORAGE_KEY,
+        JSON.stringify(replyPreferences),
+      )
+    : 0;
+  const likedReplyPreferenceCount = replyPreferences.filter((entry) => entry.feedback === 'liked').length;
+  const dislikedReplyPreferenceCount = replyPreferences.filter((entry) => entry.feedback === 'disliked').length;
   const customPresetStorage = getCustomPresetStorageUsage();
   const appStorageBytes =
     chatHistoryBytes +
     workspaceStorageBytes +
     defaultModelStorageBytes +
+    replyPreferenceStorageBytes +
     customPresetStorage.bytes;
   const storageBuckets = [
     {
@@ -743,8 +1569,17 @@ export default function App() {
       id: 'model',
       label: 'Default model',
       bytes: defaultModelStorageBytes,
-      note: defaultModel ? `Saved preference: ${defaultModel}` : 'No explicit default model saved yet',
+      note: defaultModel ? `Saved preference: ${getModelDisplayLabel(defaultModel)}` : 'No explicit default model saved yet',
       color: '#f2b668',
+    },
+    {
+      id: 'reply-preferences',
+      label: 'Reply preferences',
+      bytes: replyPreferenceStorageBytes,
+      note: replyPreferences.length
+        ? `${replyPreferences.length} rated repl${replyPreferences.length === 1 ? 'y' : 'ies'} stored locally (${likedReplyPreferenceCount} liked, ${dislikedReplyPreferenceCount} disliked)`
+        : 'No reply feedback memory stored yet',
+      color: '#7c8cff',
     },
     {
       id: 'presets',
@@ -774,6 +1609,48 @@ export default function App() {
       ? `max(${appQuotaRatio}%, ${storageMeterMinimumWidthPx}px)`
       : '0%';
   const hoveredStorageBucket = storageMeterSegments.find((bucket) => bucket.id === hoveredStorageBucketId) ?? null;
+  const chatOverviewShortcutLabel =
+    typeof navigator !== 'undefined' && /mac/i.test(navigator.platform)
+      ? 'Cmd + Shift + O'
+      : 'Ctrl + Shift + O';
+  const handleShowChatStarter = useCallback(() => {
+    setChatHistoryDrawerOpen(false);
+    setChatLaunchTransition(null);
+    setChatStarterVisible(true);
+    const existingStarterPanel = chatStarterPanelId
+      ? panels.find((panel) => panel.id === chatStarterPanelId) ?? null
+      : null;
+
+    if (existingStarterPanel && resolveThreadSurface(existingStarterPanel) === 'chat' && existingStarterPanel.messages.length === 0) {
+      navigate(buildChatPath(existingStarterPanel.id));
+      return;
+    }
+
+    const starterPanelId = openDraftChat({
+      title: 'New Chat',
+      preset: 'chatbot',
+      threadType: 'chat',
+      navigateOnCreate: false,
+    });
+    setChatStarterPanelId(starterPanelId);
+    navigate(buildChatPath(starterPanelId));
+  }, [chatStarterPanelId, navigate, openDraftChat, panels]);
+
+  useEffect(() => {
+    if (!showChatHistoryDrawer) return undefined;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (isEditableTarget(event.target)) return;
+      if (!(event.metaKey || event.ctrlKey) || !event.shiftKey || event.altKey) return;
+      if (event.key.toLowerCase() !== 'o') return;
+
+      event.preventDefault();
+      setChatHistoryDrawerOpen((current) => !current);
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [showChatHistoryDrawer]);
 
   return (
     <div id="app">
@@ -806,23 +1683,76 @@ export default function App() {
         }}
       />
 
-      <div id="app-shell">
-        <Sidebar
-          view={view}
-          folders={projectFolders}
-          chats={chats}
-          openPanelIds={panels.map(p => p.id)}
-          status={status}
-          onChangeView={setView}
-          onOpenWorkspaceLauncher={() => openWorkspaceLauncher('create')}
-          onCreateChatInFolder={handleCreateChatInFolder}
-          onOpenChat={handleOpenFromHistory}
-          onDeleteChat={requestDeleteChat}
-          onDeleteWorkspace={requestDeleteWorkspace}
-        />
+      <div id="app-shell" className="route-shell">
+        <header className="route-header">
+          <button className="route-brand" onClick={() => navigate('/')} title="Home">
+            Larry AI
+          </button>
+
+          <div className="route-header-nav">
+            <button
+              className={`route-link${route.kind === 'landing' ? ' active' : ''}`}
+              onClick={() => navigate('/')}
+            >
+              Home
+            </button>
+            <button
+              className={`route-link${isChatRouteActive ? ' active' : ''}`}
+              onClick={() => navigate('/chat')}
+            >
+              Chat
+            </button>
+            <button
+              className={`route-link${isCodeRouteActive ? ' active' : ''}`}
+              onClick={() => navigate('/code')}
+            >
+              Code
+            </button>
+            <button
+              className={`route-link${isDebugRouteActive ? ' active' : ''}`}
+              onClick={() => navigate('/debug')}
+            >
+              Debug
+            </button>
+          </div>
+
+          <div className="route-header-meta">
+            {showChatHistoryDrawer && (
+              <button
+                type="button"
+                className={`route-icon-link route-history-trigger${chatHistoryDrawerOpen ? ' active open' : ''}`}
+                onClick={() => setChatHistoryDrawerOpen((current) => !current)}
+                aria-label={chatHistoryDrawerOpen ? 'Close chat history' : 'Open chat history'}
+                aria-keyshortcuts="Control+Shift+O Meta+Shift+O"
+                title={`${chatHistoryDrawerOpen ? 'Close chat history' : 'Open chat history'} (${chatOverviewShortcutLabel})`}
+              >
+                <span className="route-history-trigger-stack" aria-hidden="true">
+                  <span className="route-history-trigger-icon primary">
+                    <IconMessageSquare size={16} />
+                  </span>
+                  <span className="route-history-trigger-icon secondary">
+                    <IconX size={15} />
+                  </span>
+                </span>
+                <span className="route-history-trigger-label">Chats</span>
+                <span className="route-history-trigger-count">
+                  {chatSurfaceChats.length}
+                </span>
+              </button>
+            )}
+            <button
+              className={`route-icon-link${route.kind === 'settings' ? ' active' : ''}`}
+              onClick={() => navigate('/settings')}
+              title="Settings"
+              aria-label="Settings"
+            >
+              <IconSettings size={16} />
+            </button>
+          </div>
+        </header>
 
         <div id="main-content">
-          {view === 'settings' ? (
+          {route.kind === 'settings' ? (
             <div id="settings-view">
               <div className="settings-header">
                 <span className="settings-eyebrow">Settings</span>
@@ -830,250 +1760,639 @@ export default function App() {
                 <p>Keep the sidebar lean, then manage models and imports from here.</p>
               </div>
 
-              <div className="settings-sections">
-                <section className="settings-section">
-                  <div className="settings-section-head">
-                    <h3>Models</h3>
-                    <p>Choose the default model for every new chat created inside a workspace.</p>
-                  </div>
-
-                  <div className="settings-section-body">
-                    <label className="settings-field">
-                      <span>Default model</span>
-                      <select
-                        className="settings-select"
-                        value={resolvedDefaultModel}
-                        onChange={(e) => setDefaultModel(e.target.value)}
-                        disabled={!models.length}
+                <div className="settings-shell">
+                  <div className="settings-tab-bar" role="tablist" aria-label="Settings categories">
+                    {SETTINGS_TABS.map((tab) => (
+                      <button
+                      key={tab.id}
+                      type="button"
+                      role="tab"
+                      aria-selected={settingsTab === tab.id}
+                        className={`settings-tab${settingsTab === tab.id ? ' active' : ''}`}
+                        onClick={() => setSettingsTab(tab.id)}
                       >
-                        {models.length ? (
-                          models.map((model) => (
-                            <option key={model} value={model}>
-                              {model}
-                            </option>
-                          ))
-                        ) : (
-                          <option value="">No models available</option>
-                        )}
-                      </select>
-                    </label>
-
-                    <div className="settings-model-group">
-                      <div className="settings-inline-row">
-                        <span className="settings-inline-label">Available now</span>
-                        <span className="settings-inline-note">Connection: {statusLabel}</span>
-                      </div>
-
-                      <div className="settings-model-list">
-                        {models.length ? (
-                          models.map((model) => (
-                            <span
-                              key={model}
-                              className={`settings-model-chip${model === resolvedDefaultModel ? ' active' : ''}`}
-                            >
-                              {model}
-                            </span>
-                          ))
-                        ) : (
-                          <span className="settings-model-empty">No models available right now.</span>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                </section>
-
-                <section className="settings-section">
-                  <div className="settings-section-head">
-                    <h3>Imports</h3>
-                    <p>Chat log imports live here. Workspace file folders stay behind the workspace menus.</p>
+                        {tab.label}
+                      </button>
+                    ))}
                   </div>
 
-                  <div className="settings-actions">
-                    <button className="btn" onClick={() => importLogsSettingsRef.current?.click()}>
-                      Import Logs
-                    </button>
-                  </div>
-                </section>
-
-                <section className="settings-section">
-                  <div className="settings-section-head">
-                    <h3>Storage</h3>
-                    <p>Estimated local app data across IndexedDB and browser storage, shown as a single meter with category breakdown.</p>
-                  </div>
-
-                  <div className="settings-storage">
-                    <div className="settings-storage-hero">
-                      <div className="settings-storage-copy">
-                        <span className="settings-storage-kicker">Larry AI storage</span>
-                        <strong>{formatStorageSize(appStorageBytes)}</strong>
-                        <span className="settings-inline-note">
-                          Approximate local data stored by this app on this device.
-                        </span>
-                      </div>
-
-                      <div className="settings-storage-browser-meta">
-                        <span className="settings-storage-kicker">App vs browser limit</span>
-                        <strong>
-                          {browserStorage.supported && browserStorage.quota != null
-                            ? `${formatStorageSize(appStorageBytes)} / ${formatStorageSize(browserStorage.quota)}`
-                            : 'Unavailable'}
-                        </strong>
-                        <span className="settings-inline-note">
-                          {appQuotaRatio != null
-                            ? `Larry AI is using about ${appQuotaRatio.toFixed(appQuotaRatio < 10 ? 1 : 0)}% of this browser's storage limit.`
-                            : 'Quota details are not exposed in this environment.'}
-                        </span>
-                      </div>
-                    </div>
-
-                    <div className="settings-storage-meter-block">
-                      <div className="settings-storage-meter-head">
-                        <span className="settings-storage-meter-label">Browser Storage</span>
-                        <span className="settings-storage-meter-total">
-                          {browserStorage.supported && browserStorage.quota != null
-                            ? `${formatStorageSize(appStorageBytes)} of ${formatStorageSize(browserStorage.quota)}`
-                            : formatStorageSize(appStorageBytes)}
-                        </span>
-                      </div>
-
-                      <div
-                        className="settings-storage-meter-stack"
-                        onMouseEnter={cancelStoragePopupHide}
-                        onMouseLeave={scheduleStoragePopupHide}
-                      >
-                        <div className="settings-storage-meter" role="list" aria-label="Larry AI browser storage breakdown">
-                          {appStorageBytes > 0 ? (
-                            <div className="settings-storage-meter-used" style={{ width: browserStorageBarWidth }}>
-                              {storageMeterSegments.map((bucket) => (
-                                <button
-                                  type="button"
-                                  key={bucket.id}
-                                  className="settings-storage-meter-segment"
-                                  onMouseEnter={() => {
-                                    cancelStoragePopupHide();
-                                    setHoveredStorageBucketId(bucket.id);
-                                  }}
-                                  onFocus={() => setHoveredStorageBucketId(bucket.id)}
-                                  onBlur={scheduleStoragePopupHide}
-                                  aria-label={`${bucket.label}, ${formatStorageSize(bucket.bytes)}, ${formatStoragePercent(bucket.contributionPercent)} of Larry AI storage`}
-                                  style={{
-                                    width: `${bucket.visualPercent}%`,
-                                    background: bucket.color,
-                                  }}
-                                />
-                              ))}
-                            </div>
-                          ) : (
-                            <span className="settings-storage-meter-empty" />
-                          )}
+                  <div className="settings-sections">
+                  {settingsTab === 'general' && (
+                    <>
+                      <section className="settings-section">
+                        <div className="settings-section-head">
+                          <h3>Imports</h3>
+                          <p>Chat log imports live here. Workspace file folders stay behind the workspace menus.</p>
                         </div>
 
-                        {hoveredStorageBucket && (
-                          <div
-                            className="settings-storage-meter-popup"
-                            role="status"
-                            aria-live="polite"
-                            onMouseEnter={cancelStoragePopupHide}
-                            onMouseLeave={scheduleStoragePopupHide}
-                          >
-                            <div className="settings-storage-meter-popup-head">
-                              <span
-                                className="settings-storage-dot settings-storage-dot-large"
-                                style={{ background: hoveredStorageBucket.color }}
-                                aria-hidden="true"
-                              />
-                              <strong>{hoveredStorageBucket.label}</strong>
-                            </div>
-                            <div className="settings-storage-meter-popup-line">
-                              <span>Stored</span>
-                              <strong>{formatStorageSize(hoveredStorageBucket.bytes)}</strong>
-                            </div>
-                            <div className="settings-storage-meter-popup-line">
-                              <span>Contribution</span>
-                              <strong>{formatStoragePercent(hoveredStorageBucket.contributionPercent)}</strong>
-                            </div>
-                            <p>{hoveredStorageBucket.note}</p>
+                        <div className="settings-actions">
+                          <button className="btn" onClick={() => importLogsSettingsRef.current?.click()}>
+                            Import Logs
+                          </button>
+                        </div>
+                      </section>
+
+                    </>
+                  )}
+
+                  {settingsTab === 'models' && (
+                    <>
+                      <section className="settings-section">
+                        <div className="settings-section-head">
+                          <h3>Connection</h3>
+                          <p>Point the frontend at the Ollama host you want to use. The default local endpoint uses the standard Ollama port.</p>
+                        </div>
+
+                        <div className="settings-section-body">
+                          <label className="settings-field">
+                            <span>Ollama endpoint</span>
+                            <input
+                              className="settings-select settings-input"
+                              type="text"
+                              value={ollamaEndpointDraft}
+                              onChange={(e) => setOllamaEndpointDraft(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') {
+                                  e.preventDefault();
+                                  applyOllamaEndpoint();
+                                }
+                              }}
+                              placeholder={DEFAULT_OLLAMA_BASE}
+                              spellCheck={false}
+                              autoCapitalize="off"
+                              autoCorrect="off"
+                            />
+                          </label>
+
+                          <div className="settings-inline-row">
+                            <span className="settings-inline-note">
+                              Current endpoint: <code>{ollamaEndpoint}</code>
+                            </span>
+                            <span className="settings-inline-note">
+                              Ollama: {ollamaStatusLabel}
+                            </span>
                           </div>
-                        )}
-                      </div>
 
-                      <div className="settings-storage-meter-caption">
-                        {appQuotaRatio != null
-                          ? `Larry AI is using about ${formatStoragePercent(appQuotaRatio)} of the browser storage limit. Hover a color segment to inspect what each category stores.`
-                          : 'Quota details are not exposed in this environment.'}
-                      </div>
-                    </div>
+                          <p className="settings-inline-note">
+                            Use a full hosted URL for remote instances, or leave it on <code>{DEFAULT_OLLAMA_BASE}</code> for the standard local Ollama setup.
+                          </p>
 
-                    <div className="settings-storage-breakdown">
-                      {storageBuckets.map((bucket) => {
-                        const share = appStorageBytes > 0 ? (bucket.bytes / appStorageBytes) * 100 : 0;
-                        return (
-                          <div key={bucket.id} className="settings-storage-row">
-                            <div className="settings-storage-row-main">
-                              <span
-                                className="settings-storage-dot"
-                                style={{ background: bucket.color }}
-                                aria-hidden="true"
+                          <div className="settings-actions">
+                            <button className="btn" onClick={applyOllamaEndpoint}>
+                              Apply Endpoint
+                            </button>
+                            <button className="btn settings-secondary-btn" onClick={resetOllamaEndpoint}>
+                              Use Default Local Endpoint
+                            </button>
+                          </div>
+                        </div>
+                      </section>
+
+                      <section className="settings-section">
+                        <div className="settings-section-head">
+                          <h3>API providers</h3>
+                          <p>Add provider keys locally so OpenAI and Anthropic models become available alongside Ollama.</p>
+                        </div>
+
+                        <div className="settings-provider-grid">
+                          <div className="settings-provider-card">
+                            <div className="settings-provider-card-head">
+                              <strong>OpenAI</strong>
+                              <span className="settings-inline-note">{openAIStatusLabel}</span>
+                            </div>
+
+                            <label className="settings-field">
+                              <span>API key</span>
+                              <input
+                                className="settings-select settings-input"
+                                type="password"
+                                value={openAIApiKeyDraft}
+                                onChange={(e) => setOpenAIApiKeyDraft(e.target.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') {
+                                    e.preventDefault();
+                                    applyOpenAIKey();
+                                  }
+                                }}
+                                placeholder="sk-..."
+                                spellCheck={false}
+                                autoCapitalize="off"
+                                autoCorrect="off"
                               />
-                              <div className="settings-storage-row-copy">
-                                <div className="settings-storage-item-head">
-                                  <span className="settings-storage-label">{bucket.label}</span>
-                                  <span className="settings-storage-value">
-                                    {bucket.bytes > 0 ? `${formatStorageSize(bucket.bytes)} - ${share.toFixed(share < 10 && share > 0 ? 1 : 0)}%` : '0 B'}
+                            </label>
+
+                            <p className="settings-inline-note">
+                              Saved locally in this browser. OpenAI models only appear when a key is present. For UI-only testing, the sample key <code>{OPENAI_UI_SAMPLE_KEY}</code> unlocks the chat-capable OpenAI catalog without making live API calls.
+                            </p>
+
+                            <div className="settings-actions">
+                              <button className="btn" onClick={applyOpenAIKey}>
+                                Save Key
+                              </button>
+                              <button className="btn settings-secondary-btn" onClick={useSampleOpenAIKey}>
+                                Use Sample Key
+                              </button>
+                              <button className="btn settings-secondary-btn" onClick={clearOpenAIKey}>
+                                Clear Key
+                              </button>
+                            </div>
+                          </div>
+
+                          <div className="settings-provider-card">
+                            <div className="settings-provider-card-head">
+                              <strong>Anthropic</strong>
+                              <span className="settings-inline-note">{anthropicStatusLabel}</span>
+                            </div>
+
+                            <label className="settings-field">
+                              <span>API key</span>
+                              <input
+                                className="settings-select settings-input"
+                                type="password"
+                                value={anthropicApiKeyDraft}
+                                onChange={(e) => setAnthropicApiKeyDraft(e.target.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') {
+                                    e.preventDefault();
+                                    applyAnthropicKey();
+                                  }
+                                }}
+                                placeholder="sk-ant-..."
+                                spellCheck={false}
+                                autoCapitalize="off"
+                                autoCorrect="off"
+                              />
+                            </label>
+
+                            <p className="settings-inline-note">
+                              Saved locally in this browser. Anthropic models only appear when a key is present. For UI-only testing, the sample key <code>{ANTHROPIC_UI_SAMPLE_KEY}</code> unlocks the Claude catalog without making live API calls.
+                            </p>
+
+                            <div className="settings-actions">
+                              <button className="btn" onClick={applyAnthropicKey}>
+                                Save Key
+                              </button>
+                              <button className="btn settings-secondary-btn" onClick={useSampleAnthropicKey}>
+                                Use Sample Key
+                              </button>
+                              <button className="btn settings-secondary-btn" onClick={clearAnthropicKey}>
+                                Clear Key
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      </section>
+
+                      <section className="settings-section">
+                        <div className="settings-section-head">
+                          <h3>Models</h3>
+                          <p>Choose the default model for every new chat created inside a workspace.</p>
+                        </div>
+
+                        <div className="settings-section-body">
+                          <label className="settings-field">
+                            <span>Default model</span>
+                            <select
+                              className="settings-select"
+                              value={resolvedDefaultModel}
+                              onChange={(e) => setDefaultModel(e.target.value)}
+                              disabled={!models.length}
+                            >
+                              {models.length ? (
+                                models.map((model) => (
+                                  <option key={model} value={model}>
+                                    {getModelDisplayLabel(model)}
+                                  </option>
+                                ))
+                              ) : (
+                                <option value="">No models available</option>
+                              )}
+                            </select>
+                          </label>
+
+                          <div className="settings-model-group">
+                            <div className="settings-inline-row">
+                              <span className="settings-inline-label">Available now</span>
+                              <span className="settings-inline-note">Providers: {statusLabel}</span>
+                            </div>
+
+                            <div className="settings-model-list">
+                              {models.length ? (
+                                models.map((model) => (
+                                  <span
+                                    key={model}
+                                    className={`settings-model-chip${model === resolvedDefaultModel ? ' active' : ''}`}
+                                  >
+                                    {getModelDisplayLabel(model)}
                                   </span>
-                                </div>
-                                <p>{bucket.note}</p>
-                              </div>
+                                ))
+                              ) : (
+                                <span className="settings-model-empty">No models available right now.</span>
+                              )}
                             </div>
                           </div>
-                        );
-                      })}
+                        </div>
+                      </section>
+
+                    </>
+                  )}
+
+                  {settingsTab === 'storage' && (
+                    <>
+                      <section className="settings-section">
+                        <div className="settings-section-head">
+                          <h3>Storage</h3>
+                          <p>Estimated local app data across IndexedDB and browser storage, shown as a single meter with category breakdown.</p>
+                        </div>
+
+                        <div className="settings-storage">
+
+                          <div className="settings-storage-meter-block">
+                            <div className="settings-storage-meter-head">
+                              <span className="settings-storage-meter-label">Browser Storage</span>
+                              <span className="settings-storage-meter-total">
+                                {browserStorage.supported && browserStorage.quota != null
+                                  ? `${formatStorageSize(appStorageBytes)} of ${formatStorageSize(browserStorage.quota)}`
+                                  : formatStorageSize(appStorageBytes)}
+                              </span>
+                            </div>
+
+                            <div
+                              className="settings-storage-meter-stack"
+                              onMouseEnter={cancelStoragePopupHide}
+                              onMouseLeave={scheduleStoragePopupHide}
+                            >
+                              <div className="settings-storage-meter" role="list" aria-label="Larry AI browser storage breakdown">
+                                {appStorageBytes > 0 ? (
+                                  <div className="settings-storage-meter-used" style={{ width: browserStorageBarWidth }}>
+                                    {storageMeterSegments.map((bucket) => (
+                                      <button
+                                        type="button"
+                                        key={bucket.id}
+                                        className="settings-storage-meter-segment"
+                                        onMouseEnter={() => {
+                                          cancelStoragePopupHide();
+                                          setHoveredStorageBucketId(bucket.id);
+                                        }}
+                                        onFocus={() => setHoveredStorageBucketId(bucket.id)}
+                                        onBlur={scheduleStoragePopupHide}
+                                        aria-label={`${bucket.label}, ${formatStorageSize(bucket.bytes)}, ${formatStoragePercent(bucket.contributionPercent)} of Larry AI storage`}
+                                        style={{
+                                          width: `${bucket.visualPercent}%`,
+                                          background: bucket.color,
+                                        }}
+                                      />
+                                    ))}
+                                  </div>
+                                ) : (
+                                  <span className="settings-storage-meter-empty" />
+                                )}
+                              </div>
+
+                              {hoveredStorageBucket && (
+                                <div
+                                  className="settings-storage-meter-popup"
+                                  role="status"
+                                  aria-live="polite"
+                                  onMouseEnter={cancelStoragePopupHide}
+                                  onMouseLeave={scheduleStoragePopupHide}
+                                >
+                                  <div className="settings-storage-meter-popup-head">
+                                    <span
+                                      className="settings-storage-dot settings-storage-dot-large"
+                                      style={{ background: hoveredStorageBucket.color }}
+                                      aria-hidden="true"
+                                    />
+                                    <strong>{hoveredStorageBucket.label}</strong>
+                                  </div>
+                                  <div className="settings-storage-meter-popup-line">
+                                    <span>Stored</span>
+                                    <strong>{formatStorageSize(hoveredStorageBucket.bytes)}</strong>
+                                  </div>
+                                  <div className="settings-storage-meter-popup-line">
+                                    <span>Contribution</span>
+                                    <strong>{formatStoragePercent(hoveredStorageBucket.contributionPercent)}</strong>
+                                  </div>
+                                  <p>{hoveredStorageBucket.note}</p>
+                                </div>
+                              )}
+                            </div>
+
+                            <div className="settings-storage-meter-caption">
+                              {appQuotaRatio != null
+                                ? `Larry AI is using about ${formatStoragePercent(appQuotaRatio)} of the browser storage limit. Hover a color segment to inspect what each category stores.`
+                                : 'Quota details are not exposed in this environment.'}
+                            </div>
+                          </div>
+
+                          <div className="settings-storage-breakdown">
+                            {storageBuckets.map((bucket) => {
+                              const share = appStorageBytes > 0 ? (bucket.bytes / appStorageBytes) * 100 : 0;
+                              return (
+                                <div key={bucket.id} className="settings-storage-row">
+                                  <div className="settings-storage-row-main">
+                                    <span
+                                      className="settings-storage-dot"
+                                      style={{ background: bucket.color }}
+                                      aria-hidden="true"
+                                    />
+                                    <div className="settings-storage-row-copy">
+                                      <div className="settings-storage-item-head">
+                                        <span className="settings-storage-label">{bucket.label}</span>
+                                        <span className="settings-storage-value">
+                                          {bucket.bytes > 0 ? `${formatStorageSize(bucket.bytes)}` : '0 B'}
+                                        </span>
+                                      </div>
+                                      <p>{bucket.note}</p>
+                                    </div>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+
+                          {!customPresetStorage.count && (
+                            <p className="settings-storage-footnote">
+                              Custom presets are not being saved locally yet, so that category will stay at 0 B until preset persistence is added.
+                            </p>
+                          )}
+                        </div>
+                      </section>
+
+                      <section className="settings-section danger">
+                        <div className="settings-section-head">
+                          <h3>History</h3>
+                          <p>Clear saved conversation history across the app.</p>
+                        </div>
+
+                        <div className="settings-actions">
+                          <button className="btn danger settings-danger-btn" onClick={requestClearAll}>
+                            Clear All Conversation History
+                          </button>
+                        </div>
+                      </section>
+                    </>
+                  )}
+
+                  {settingsTab === 'developerTools' && (
+                    <section className="settings-section">
+                      <div className="settings-section-head">
+                        <h3>Developer tools</h3>
+                        <p>Expose reply timing and pipeline-inspector visibility for deeper loading and orchestration insight.</p>
+                      </div>
+
+                      <div className="settings-developer-tools-card">
+                        <div className="settings-developer-tools-copy">
+                          <span className="settings-developer-tools-icon" aria-hidden="true">
+                            <IconTerminal size={17} />
+                          </span>
+
+                          <div className="settings-developer-tools-text">
+                            <strong>Developer tools</strong>
+                            <p>When enabled, assistant replies show the <code>responded in ...</code> timing label and the <code>i</code> pipeline inspector button.</p>
+                          </div>
+                        </div>
+
+                        <button
+                          type="button"
+                          className={`settings-developer-tools-toggle${developerToolsEnabled ? ' active' : ''}`}
+                          aria-pressed={developerToolsEnabled}
+                          onClick={() => setDeveloperToolsEnabled((current) => !current)}
+                        >
+                          <span className="settings-developer-tools-toggle-track" aria-hidden="true">
+                            <span className="settings-developer-tools-toggle-thumb" />
+                          </span>
+                          <span className="settings-developer-tools-toggle-state">
+                            {developerToolsEnabled ? 'Enabled' : 'Disabled'}
+                          </span>
+                        </button>
+                      </div>
+
+                      <div className="settings-developer-tools-card">
+                        <div className="settings-developer-tools-copy">
+                          <span className="settings-developer-tools-icon" aria-hidden="true">
+                            <IconSettings size={17} />
+                          </span>
+
+                          <div className="settings-developer-tools-text">
+                            <strong>Advanced Use</strong>
+                            <p>Expose in-chat model switching and chat-preset selection for users who need more direct session control.</p>
+                          </div>
+                        </div>
+
+                        <button
+                          type="button"
+                          className={`settings-developer-tools-toggle${advancedUseEnabled ? ' active' : ''}`}
+                          aria-pressed={advancedUseEnabled}
+                          onClick={() => setAdvancedUseEnabled((current) => !current)}
+                        >
+                          <span className="settings-developer-tools-toggle-track" aria-hidden="true">
+                            <span className="settings-developer-tools-toggle-thumb" />
+                          </span>
+                          <span className="settings-developer-tools-toggle-state">
+                            {advancedUseEnabled ? 'Enabled' : 'Disabled'}
+                          </span>
+                        </button>
+                      </div>
+                    </section>
+                  )}
+                </div>
+              </div>
+            </div>
+          ) : route.kind === 'landing' ? (
+            <PromptLibraryView
+              page="landing"
+              chats={chats}
+              folders={projectFolders}
+              defaultModel={resolvedDefaultModel}
+              models={models}
+              onStartChat={handleStartChatFromHome}
+              onOpenChat={handleOpenFromHistory}
+              onCreateChatInFolder={handleCreateCodeThreadInFolder}
+              onOpenWorkspaceLauncher={openWorkspaceLauncher}
+              onDeleteChat={requestDeleteChat}
+              onDeleteWorkspace={requestDeleteWorkspace}
+              onGoToChat={() => navigate('/chat')}
+              onGoToCode={() => navigate('/code')}
+              onGoToDebug={() => navigate('/debug')}
+            />
+          ) : route.kind === 'chat-start' ? (
+            <div id="workspace" className="chat-route-workspace chat-root-workspace">
+              <div id="panels-area" className={`chat-panel-strip panels-${chatDisplayFrameCount}`}>
+                {chatDisplayPanels.map((panel) => (
+                  <ChatPanel
+                    key={panel.id}
+                    panel={panel}
+                    models={models}
+                    showDeveloperTools={developerToolsEnabled}
+                    showAdvancedUse={advancedUseEnabled}
+                    onUpdate={updatePanel}
+                    onClose={closePanel}
+                    onSave={savePanel}
+                    selected={activePanelId === panel.id}
+                    onActivate={activatePanel}
+                    launchPrompt={queuedLaunchPrompts[panel.id] ?? null}
+                    onConsumeLaunchPrompt={consumeLaunchPrompt}
+                    onImportWorkspaceFiles={(files) => {
+                      if (!panel.projectId || !panel.projectLabel) return;
+                      void handleImportDirectory(files, {
+                        id: panel.projectId,
+                        label: panel.projectLabel,
+                      });
+                    }}
+                  />
+                ))}
+
+                {embeddedChatStarterFrame}
+              </div>
+            </div>
+          ) : route.kind === 'code-start' ? (
+            <div className="workbench-route-shell">
+              <Sidebar
+                mode="code"
+                folders={projectFolders}
+                chats={codeSurfaceChats}
+                activeChatId={null}
+                onOpenWorkspaceLauncher={openWorkspaceLauncher}
+                onCreateChatInFolder={handleCreateCodeThreadInFolder}
+                onOpenChat={handleOpenFromHistory}
+                onDeleteChat={requestDeleteChat}
+                onDeleteWorkspace={requestDeleteWorkspace}
+              />
+              <div className="workbench-route-main">
+                <PromptLibraryView
+                  page="code"
+                  chats={codeSurfaceChats}
+                  folders={projectFolders}
+                  defaultModel={resolvedDefaultModel}
+                  models={models}
+                  onStartChat={handleStartChatFromHome}
+                  onOpenChat={handleOpenFromHistory}
+                  onCreateChatInFolder={handleCreateCodeThreadInFolder}
+                  onOpenWorkspaceLauncher={openWorkspaceLauncher}
+                  onDeleteChat={requestDeleteChat}
+                  onDeleteWorkspace={requestDeleteWorkspace}
+                />
+              </div>
+            </div>
+          ) : route.kind === 'debug-start' ? (
+            <div className="workbench-route-shell">
+              <Sidebar
+                mode="debug"
+                folders={projectFolders}
+                chats={debugSurfaceChats}
+                activeChatId={null}
+                onOpenWorkspaceLauncher={openWorkspaceLauncher}
+                onCreateChatInFolder={handleCreateDebugThreadInFolder}
+                onOpenChat={handleOpenFromHistory}
+                onDeleteChat={requestDeleteChat}
+                onDeleteWorkspace={requestDeleteWorkspace}
+              />
+              <div className="workbench-route-main">
+                <PromptLibraryView
+                  page="debug"
+                  chats={debugSurfaceChats}
+                  folders={projectFolders}
+                  defaultModel={resolvedDefaultModel}
+                  models={models}
+                  onStartChat={handleStartChatFromHome}
+                  onOpenChat={handleOpenFromHistory}
+                  onCreateChatInFolder={handleCreateDebugThreadInFolder}
+                  onOpenWorkspaceLauncher={openWorkspaceLauncher}
+                  onDeleteChat={requestDeleteChat}
+                  onDeleteWorkspace={requestDeleteWorkspace}
+                />
+              </div>
+            </div>
+          ) : route.kind === 'not-found' ? (
+            <div id="workspace">
+              <div id="no-panels" className="route-state">
+                <div style={{ fontSize: 56, opacity: 0.12, color: 'var(--accent)' }}>
+                  <IconHexagon size={72} />
+                </div>
+                <h2>Route not found</h2>
+                <p>The path "{route.path}" does not match a local chat route.</p>
+                <button className="btn" onClick={() => navigate('/')}>
+                  Go home
+                </button>
+              </div>
+            </div>
+          ) : explorerMode ? (
+            <div className="workbench-route-shell">
+              <Sidebar
+                mode={explorerMode}
+                folders={projectFolders}
+                chats={explorerChats}
+                activeChatId={activePanel?.id ?? route.chatId}
+                onOpenWorkspaceLauncher={openWorkspaceLauncher}
+                onCreateChatInFolder={explorerMode === 'debug' ? handleCreateDebugThreadInFolder : handleCreateCodeThreadInFolder}
+                onOpenChat={handleOpenFromHistory}
+                onDeleteChat={requestDeleteChat}
+                onDeleteWorkspace={requestDeleteWorkspace}
+              />
+              <div className="workbench-route-main">
+                <div id="workspace" className="chat-route-workspace explorer-chat-workspace">
+                  {activePanel ? (
+                    <div id="panels-area">
+                      <ChatPanel
+                        key={activePanel.id}
+                        panel={activePanel}
+                        models={models}
+                        showDeveloperTools={developerToolsEnabled}
+                        showAdvancedUse={advancedUseEnabled}
+                        onUpdate={updatePanel}
+                        onClose={closePanel}
+                        onSave={savePanel}
+                        selected={activePanelId === activePanel.id}
+                        onActivate={activatePanel}
+                        launchPrompt={queuedLaunchPrompts[activePanel.id] ?? null}
+                        onConsumeLaunchPrompt={consumeLaunchPrompt}
+                        onImportWorkspaceFiles={(files) => {
+                          if (!activePanel.projectId || !activePanel.projectLabel) return;
+                          void handleImportDirectory(files, {
+                            id: activePanel.projectId,
+                            label: activePanel.projectLabel,
+                          });
+                        }}
+                      />
                     </div>
-
-                    {!customPresetStorage.count && (
-                      <p className="settings-storage-footnote">
-                        Custom presets are not being saved locally yet, so that category will stay at 0 B until preset persistence is added.
+                  ) : (
+                    <div id="no-panels" className="route-state">
+                      <div style={{ fontSize: 56, opacity: 0.12, color: 'var(--accent)' }}>
+                        <IconHexagon size={72} />
+                      </div>
+                      <h2>{isMissingChatRoute ? 'Chat not found' : 'Opening chat'}</h2>
+                      <p>
+                        {isMissingChatRoute
+                          ? 'That route does not match a saved local chat. Start a new prompt or open one from the explorer.'
+                          : 'Loading the requested local chat from IndexedDB.'}
                       </p>
-                    )}
-                  </div>
-                </section>
-
-                <section className="settings-section danger">
-                  <div className="settings-section-head">
-                    <h3>History</h3>
-                    <p>Clear saved conversation history across the app.</p>
-                  </div>
-
-                  <div className="settings-actions">
-                    <button className="btn danger settings-danger-btn" onClick={requestClearAll}>
-                      Clear All Conversation History
-                    </button>
-                  </div>
-                </section>
+                      <button className="btn" onClick={() => navigate(buildStartPath(explorerMode))}>
+                        Return to {explorerMode === 'debug' ? 'debug' : 'code'}
+                      </button>
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
           ) : (
-            <div id="workspace">
-              {panels.length === 0 ? (
-                <div id="no-panels">
-                  <div style={{ fontSize: 56, opacity: 0.12, color: 'var(--accent)' }}>
-                    <IconHexagon size={72} />
-                  </div>
-                  <h2>No workspace chats open</h2>
-                  <p>Create a <strong>workspace</strong> from the sidebar, then start a chat inside it.<br />Up to 3 panels side-by-side.</p>
-                </div>
-              ) : (
-                <div id="panels-area">
-                  {panels.map(panel => (
+            <div id="workspace" className="chat-route-workspace">
+              {chatDisplayPanels.length || showEmbeddedChatStarter ? (
+                <div id="panels-area" className={`chat-panel-strip panels-${chatDisplayFrameCount}`}>
+                  {chatDisplayPanels.map((panel) => (
                     <ChatPanel
                       key={panel.id}
                       panel={panel}
                       models={models}
+                      showDeveloperTools={developerToolsEnabled}
+                      showAdvancedUse={advancedUseEnabled}
                       onUpdate={updatePanel}
                       onClose={closePanel}
                       onSave={savePanel}
                       selected={activePanelId === panel.id}
                       onActivate={activatePanel}
+                      launchPrompt={queuedLaunchPrompts[panel.id] ?? null}
+                      onConsumeLaunchPrompt={consumeLaunchPrompt}
                       onImportWorkspaceFiles={(files) => {
                         if (!panel.projectId || !panel.projectLabel) return;
                         void handleImportDirectory(files, {
@@ -1083,12 +2402,64 @@ export default function App() {
                       }}
                     />
                   ))}
+
+                  {embeddedChatStarterFrame}
+                </div>
+              ) : (
+                <div id="no-panels" className="route-state">
+                  <div style={{ fontSize: 56, opacity: 0.12, color: 'var(--accent)' }}>
+                    <IconHexagon size={72} />
+                  </div>
+                  <h2>{isMissingChatRoute ? 'Chat not found' : 'Opening chat'}</h2>
+                  <p>
+                    {isMissingChatRoute
+                      ? 'That route does not match a saved local chat. Start a new prompt or open one from the library.'
+                      : 'Loading the requested local chat from IndexedDB.'}
+                  </p>
+                  <button className="btn" onClick={() => navigate('/')}>
+                    Go home
+                  </button>
                 </div>
               )}
             </div>
           )}
         </div>
       </div>
+
+      {chatLaunchTransition && pendingChatLaunchPanel && (
+        <div className="chat-launch-background-runner" aria-hidden="true">
+          <ChatPanel
+            key={`launch-${pendingChatLaunchPanel.id}`}
+            panel={pendingChatLaunchPanel}
+            models={models}
+            showDeveloperTools={developerToolsEnabled}
+            showAdvancedUse={advancedUseEnabled}
+            onUpdate={updatePanel}
+            onClose={closePanel}
+            onSave={savePanel}
+            backgroundMode={true}
+            launchPrompt={queuedLaunchPrompts[pendingChatLaunchPanel.id] ?? null}
+            onConsumeLaunchPrompt={consumeLaunchPrompt}
+          />
+        </div>
+      )}
+
+      {showChatHistoryDrawer && chatHistoryDrawerOpen && (
+        <ChatHistoryDrawer
+          chats={chatSurfaceChats}
+          openPanelIds={chatSurfaceOpenPanelIds}
+          activeChatId={activeChatHistoryId}
+          anchoredToHeader={true}
+          shortcutLabel={chatOverviewShortcutLabel}
+          onOpen={(chat) => {
+            handleOpenFromHistory(chat);
+            setChatHistoryDrawerOpen(false);
+          }}
+          onCreateNewConversation={handleShowChatStarter}
+          onDelete={requestDeleteChat}
+          onClose={() => setChatHistoryDrawerOpen(false)}
+        />
+      )}
 
       {workspaceLauncherOpen && (
         <div className="workspace-launcher-backdrop" onClick={closeWorkspaceLauncher}>

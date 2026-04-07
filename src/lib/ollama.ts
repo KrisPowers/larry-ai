@@ -1,41 +1,458 @@
-// FILE: src/lib/ollama.ts
-import type { Message } from '../types';
+import type { Message, ModelProvider, ModelProviderState } from '../types';
 
-// Allow the Ollama server URL to be configured via .env / .env.local.
-// Default falls back to the standard local address so zero configuration
-// is needed for the most common setup.
-export const OLLAMA_BASE: string =
+export const DEFAULT_OLLAMA_BASE = 'http://localhost:11434';
+export const OLLAMA_BASE_STORAGE_KEY = 'larry_ollama_base_v1';
+export const OPENAI_API_KEY_STORAGE_KEY = 'larry_openai_api_key_v1';
+export const ANTHROPIC_API_KEY_STORAGE_KEY = 'larry_anthropic_api_key_v1';
+export const OPENAI_UI_SAMPLE_KEY = 'openai-ui-sample-key';
+export const ANTHROPIC_UI_SAMPLE_KEY = 'anthropic-ui-sample-key';
+
+const OPENAI_API_BASE = 'https://api.openai.com/v1';
+const ANTHROPIC_API_BASE = 'https://api.anthropic.com/v1';
+const ANTHROPIC_API_VERSION = '2023-06-01';
+const OPENAI_MODEL_TIMEOUT_MS = 5_000;
+const ANTHROPIC_MODEL_TIMEOUT_MS = 5_000;
+const OLLAMA_MODEL_TIMEOUT_MS = 3_000;
+const PROVIDER_LABELS: Record<ModelProvider, string> = {
+  ollama: 'Ollama',
+  openai: 'OpenAI',
+  anthropic: 'Anthropic',
+};
+const OPENAI_UI_SAMPLE_MODELS = [
+  'gpt-5.4',
+  'gpt-5.4-mini',
+  'gpt-5.4-nano',
+  'gpt-5-mini',
+  'gpt-4.1',
+  'gpt-4.1-mini',
+  'gpt-4o',
+  'gpt-4o-mini',
+  'o3',
+  'o4-mini',
+];
+const ANTHROPIC_UI_SAMPLE_MODELS = [
+  'claude-opus-4-1-20250805',
+  'claude-opus-4-20250514',
+  'claude-sonnet-4-20250514',
+  'claude-3-7-sonnet-20250219',
+  'claude-3-5-sonnet-20241022',
+  'claude-3-5-haiku-20241022',
+  'claude-3-haiku-20240307',
+];
+
+const ENV_OLLAMA_BASE =
   (import.meta.env?.VITE_OLLAMA_BASE as string | undefined)?.replace(/\/$/, '') ??
-  'http://localhost:11434';
+  DEFAULT_OLLAMA_BASE;
 
-export async function fetchModels(): Promise<string[]> {
-  const res = await fetch(`${OLLAMA_BASE}/api/tags`, {
-    signal: AbortSignal.timeout(3000),
-  });
-  const data = await res.json();
-  return (data.models ?? []).map((m: { name: string }) => m.name);
+interface ProviderFetchOptions {
+  ollamaBase?: string;
+  openAIApiKey?: string;
+  anthropicApiKey?: string;
 }
 
-/**
- * Single non-streaming request — used for the planning phase.
- * Returns the full response text once complete.
- */
-export async function chatOnce(
-  model: string,
+interface ModelCatalogResult {
+  models: string[];
+  providers: ModelProviderState[];
+}
+
+interface DecodedModelHandle {
+  provider: ModelProvider;
+  modelId: string;
+}
+
+function getStoredValue(key: string): string {
+  if (typeof window === 'undefined') return '';
+
+  try {
+    return localStorage.getItem(key)?.trim() ?? '';
+  } catch {
+    return '';
+  }
+}
+
+function setStoredValue(key: string, value: string): string {
+  const trimmed = value.trim();
+
+  if (typeof window !== 'undefined') {
+    try {
+      if (trimmed) {
+        localStorage.setItem(key, trimmed);
+      } else {
+        localStorage.removeItem(key);
+      }
+    } catch {
+      // ignore storage failures and still return the trimmed value
+    }
+  }
+
+  return trimmed;
+}
+
+function isLikelyTextModelId(modelId: string): boolean {
+  const id = modelId.toLowerCase();
+  if (!id) return false;
+  if (/^(gpt|o\d|chatgpt|codex)/.test(id) === false) return false;
+  if (
+    /(audio|realtime|transcribe|tts|embedding|whisper|moderation|image|vision-preview|dall-e|search-preview|computer-use|omni-moderation)/.test(id)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function isSampleOpenAIKey(apiKey: string): boolean {
+  return apiKey.trim() === OPENAI_UI_SAMPLE_KEY;
+}
+
+function isSampleAnthropicKey(apiKey: string): boolean {
+  return apiKey.trim() === ANTHROPIC_UI_SAMPLE_KEY;
+}
+
+function parseEventStreamChunk(chunk: string): string[] {
+  return chunk
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith('data:'))
+    .map((line) => line.replace(/^data:\s*/, '').trim())
+    .filter(Boolean);
+}
+
+function extractAnthropicText(content: unknown): string {
+  if (!Array.isArray(content)) return '';
+  return content
+    .filter((item): item is { type?: string; text?: string } => typeof item === 'object' && item !== null)
+    .filter((item) => item.type === 'text' && typeof item.text === 'string')
+    .map((item) => item.text ?? '')
+    .join('');
+}
+
+export function normalizeOllamaBase(value?: string | null): string {
+  const raw = (value ?? '').trim();
+  if (!raw) return ENV_OLLAMA_BASE;
+  if (raw.startsWith('/')) return raw.replace(/\/$/, '') || '/';
+  if (/^https?:\/\//i.test(raw)) return raw.replace(/\/$/, '');
+  return `http://${raw.replace(/\/$/, '')}`;
+}
+
+export function getOllamaBase(): string {
+  if (typeof window === 'undefined') {
+    return normalizeOllamaBase(ENV_OLLAMA_BASE);
+  }
+
+  try {
+    return normalizeOllamaBase(localStorage.getItem(OLLAMA_BASE_STORAGE_KEY) ?? ENV_OLLAMA_BASE);
+  } catch {
+    return normalizeOllamaBase(ENV_OLLAMA_BASE);
+  }
+}
+
+export function setOllamaBase(value: string): string {
+  const normalized = normalizeOllamaBase(value);
+
+  if (typeof window !== 'undefined') {
+    try {
+      localStorage.setItem(OLLAMA_BASE_STORAGE_KEY, normalized);
+    } catch {
+      // ignore storage failures and still return the normalized value
+    }
+  }
+
+  return normalized;
+}
+
+export function getOpenAIApiKey(): string {
+  return getStoredValue(OPENAI_API_KEY_STORAGE_KEY);
+}
+
+export function setOpenAIApiKey(value: string): string {
+  return setStoredValue(OPENAI_API_KEY_STORAGE_KEY, value);
+}
+
+export function getAnthropicApiKey(): string {
+  return getStoredValue(ANTHROPIC_API_KEY_STORAGE_KEY);
+}
+
+export function setAnthropicApiKey(value: string): string {
+  return setStoredValue(ANTHROPIC_API_KEY_STORAGE_KEY, value);
+}
+
+export function buildModelHandle(provider: ModelProvider, modelId: string): string {
+  return `${provider}:${modelId}`;
+}
+
+export function parseModelHandle(handle?: string | null): DecodedModelHandle {
+  const raw = (handle ?? '').trim();
+  const match = raw.match(/^(ollama|openai|anthropic):(.+)$/i);
+  if (match) {
+    return {
+      provider: match[1].toLowerCase() as ModelProvider,
+      modelId: match[2],
+    };
+  }
+
+  return {
+    provider: 'ollama',
+    modelId: raw,
+  };
+}
+
+export function normalizeModelHandle(handle?: string | null): string {
+  const { provider, modelId } = parseModelHandle(handle);
+  return modelId ? buildModelHandle(provider, modelId) : '';
+}
+
+export function resolveModelHandle(
+  handle: string | undefined,
+  availableModels: string[],
+  options: { preserveUnavailable?: boolean } = {},
+): string {
+  const normalized = normalizeModelHandle(handle);
+  if (normalized && availableModels.includes(normalized)) return normalized;
+  if (normalized && options.preserveUnavailable) return normalized;
+  if (!normalized && availableModels.length) return availableModels[0];
+  return normalized || availableModels[0] || '';
+}
+
+export function getModelProvider(handle?: string | null): ModelProvider {
+  return parseModelHandle(handle).provider;
+}
+
+export function getModelProviderLabel(handle?: string | null): string {
+  return PROVIDER_LABELS[getModelProvider(handle)];
+}
+
+export function getModelDisplayName(handle?: string | null): string {
+  const { modelId } = parseModelHandle(handle);
+  return modelId || 'No model detected';
+}
+
+export function getModelDisplayLabel(handle?: string | null): string {
+  const name = getModelDisplayName(handle);
+  if (name === 'No model detected') return name;
+  return `${name} · ${getModelProviderLabel(handle)}`;
+}
+
+async function fetchOllamaModels(base: string): Promise<string[]> {
+  const res = await fetch(`${base}/api/tags`, {
+    signal: AbortSignal.timeout(OLLAMA_MODEL_TIMEOUT_MS),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Ollama error ${res.status}: ${res.statusText}`);
+  }
+
+  const data = await res.json();
+  return (data.models ?? [])
+    .map((model: { name?: string }) => model.name?.trim() ?? '')
+    .filter(Boolean)
+    .map((modelId: string) => buildModelHandle('ollama', modelId));
+}
+
+async function fetchOpenAIModels(apiKey: string): Promise<string[]> {
+  if (isSampleOpenAIKey(apiKey)) {
+    return OPENAI_UI_SAMPLE_MODELS.map((modelId) => buildModelHandle('openai', modelId));
+  }
+
+  const res = await fetch(`${OPENAI_API_BASE}/models`, {
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+    },
+    signal: AbortSignal.timeout(OPENAI_MODEL_TIMEOUT_MS),
+  });
+
+  if (!res.ok) {
+    throw new Error(`OpenAI error ${res.status}: ${res.statusText}`);
+  }
+
+  const data = await res.json();
+  return (data.data ?? [])
+    .map((model: { id?: string }) => model.id?.trim() ?? '')
+    .filter(isLikelyTextModelId)
+    .sort((left: string, right: string) => left.localeCompare(right))
+    .map((modelId: string) => buildModelHandle('openai', modelId));
+}
+
+async function fetchAnthropicModels(apiKey: string): Promise<string[]> {
+  if (isSampleAnthropicKey(apiKey)) {
+    return ANTHROPIC_UI_SAMPLE_MODELS.map((modelId) => buildModelHandle('anthropic', modelId));
+  }
+
+  const res = await fetch(`${ANTHROPIC_API_BASE}/models`, {
+    headers: {
+      'x-api-key': apiKey,
+      'anthropic-version': ANTHROPIC_API_VERSION,
+    },
+    signal: AbortSignal.timeout(ANTHROPIC_MODEL_TIMEOUT_MS),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Anthropic error ${res.status}: ${res.statusText}`);
+  }
+
+  const data = await res.json();
+  return (data.data ?? [])
+    .map((model: { id?: string }) => model.id?.trim() ?? '')
+    .filter((modelId: string) => modelId.toLowerCase().startsWith('claude'))
+    .sort((left: string, right: string) => left.localeCompare(right))
+    .map((modelId: string) => buildModelHandle('anthropic', modelId));
+}
+
+export async function fetchModelCatalog(options: ProviderFetchOptions = {}): Promise<ModelCatalogResult> {
+  const ollamaBase = normalizeOllamaBase(options.ollamaBase ?? getOllamaBase());
+  const openAIApiKey = (options.openAIApiKey ?? getOpenAIApiKey()).trim();
+  const anthropicApiKey = (options.anthropicApiKey ?? getAnthropicApiKey()).trim();
+
+  const providerTasks: Array<Promise<{ models: string[]; state: ModelProviderState }>> = [
+    (async () => {
+      try {
+        const models = await fetchOllamaModels(ollamaBase);
+        return {
+          models,
+          state: {
+            provider: 'ollama',
+            label: PROVIDER_LABELS.ollama,
+            enabled: true,
+            online: true,
+            modelCount: models.length,
+          },
+        };
+      } catch (error) {
+        return {
+          models: [],
+          state: {
+            provider: 'ollama',
+            label: PROVIDER_LABELS.ollama,
+            enabled: true,
+            online: false,
+            modelCount: 0,
+            error: error instanceof Error ? error.message : 'Unable to connect',
+          },
+        };
+      }
+    })(),
+    openAIApiKey
+      ? (async () => {
+          try {
+            const models = await fetchOpenAIModels(openAIApiKey);
+            return {
+              models,
+              state: {
+                provider: 'openai',
+                label: PROVIDER_LABELS.openai,
+                enabled: true,
+                online: true,
+                modelCount: models.length,
+                mode: isSampleOpenAIKey(openAIApiKey) ? 'sample' : 'live',
+              },
+            };
+          } catch (error) {
+            return {
+              models: [],
+              state: {
+                provider: 'openai',
+                label: PROVIDER_LABELS.openai,
+                enabled: true,
+                online: false,
+                modelCount: 0,
+                error: error instanceof Error ? error.message : 'Unable to connect',
+              },
+            };
+          }
+        })()
+      : Promise.resolve({
+          models: [],
+          state: {
+            provider: 'openai' as const,
+            label: PROVIDER_LABELS.openai,
+            enabled: false,
+            online: false,
+            modelCount: 0,
+          },
+        }),
+    anthropicApiKey
+      ? (async () => {
+          try {
+            const models = await fetchAnthropicModels(anthropicApiKey);
+            return {
+              models,
+              state: {
+                provider: 'anthropic',
+                label: PROVIDER_LABELS.anthropic,
+                enabled: true,
+                online: true,
+                modelCount: models.length,
+                mode: isSampleAnthropicKey(anthropicApiKey) ? 'sample' : 'live',
+              },
+            };
+          } catch (error) {
+            return {
+              models: [],
+              state: {
+                provider: 'anthropic',
+                label: PROVIDER_LABELS.anthropic,
+                enabled: true,
+                online: false,
+                modelCount: 0,
+                error: error instanceof Error ? error.message : 'Unable to connect',
+              },
+            };
+          }
+        })()
+      : Promise.resolve({
+          models: [],
+          state: {
+            provider: 'anthropic' as const,
+            label: PROVIDER_LABELS.anthropic,
+            enabled: false,
+            online: false,
+            modelCount: 0,
+          },
+        }),
+  ];
+
+  const providerResults = await Promise.all(providerTasks);
+  const models = providerResults.flatMap((result) => result.models);
+  const providers = providerResults.map((result) => result.state);
+
+  return {
+    models,
+    providers,
+  };
+}
+
+export async function fetchModels(
+  base = getOllamaBase(),
+  options: Pick<ProviderFetchOptions, 'openAIApiKey' | 'anthropicApiKey'> = {},
+): Promise<string[]> {
+  const catalog = await fetchModelCatalog({
+    ollamaBase: base,
+    openAIApiKey: options.openAIApiKey,
+    anthropicApiKey: options.anthropicApiKey,
+  });
+  return catalog.models;
+}
+
+function buildPayloadMessages(messages: Message[], systemPrompt: string) {
+  return [
+    { role: 'system' as const, content: systemPrompt },
+    ...messages.map(({ role, content }) => ({ role, content })),
+  ];
+}
+
+async function chatOnceWithOllama(
+  modelId: string,
   messages: Message[],
   systemPrompt: string,
   signal: AbortSignal,
 ): Promise<string> {
-  const payload = [
-    { role: 'system', content: systemPrompt },
-    ...messages,
-  ];
+  const base = getOllamaBase();
+  const payload = buildPayloadMessages(messages, systemPrompt);
 
-  const res = await fetch(`${OLLAMA_BASE}/api/chat`, {
+  const res = await fetch(`${base}/api/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     signal,
-    body: JSON.stringify({ model, messages: payload, stream: false }),
+    body: JSON.stringify({ model: modelId, messages: payload, stream: false }),
   });
 
   if (!res.ok) {
@@ -46,26 +463,115 @@ export async function chatOnce(
   return data.message?.content ?? '';
 }
 
+async function chatOnceWithOpenAI(
+  modelId: string,
+  messages: Message[],
+  systemPrompt: string,
+  signal: AbortSignal,
+): Promise<string> {
+  const payload = buildPayloadMessages(messages, systemPrompt);
+  const apiKey = getOpenAIApiKey();
+  if (!apiKey) throw new Error('OpenAI API key not configured');
+  if (isSampleOpenAIKey(apiKey)) {
+    throw new Error('The OpenAI sample UI key only unlocks demo models. Add a real API key to send requests.');
+  }
+
+  const res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    signal,
+    body: JSON.stringify({
+      model: modelId,
+      messages: payload,
+      stream: false,
+    }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`OpenAI error ${res.status}: ${res.statusText}`);
+  }
+
+  const data = await res.json();
+  return data.choices?.[0]?.message?.content ?? '';
+}
+
+async function chatOnceWithAnthropic(
+  modelId: string,
+  messages: Message[],
+  systemPrompt: string,
+  signal: AbortSignal,
+): Promise<string> {
+  const apiKey = getAnthropicApiKey();
+  if (!apiKey) throw new Error('Anthropic API key not configured');
+  if (isSampleAnthropicKey(apiKey)) {
+    throw new Error('The Anthropic sample UI key only unlocks demo models. Add a real API key to send requests.');
+  }
+
+  const res = await fetch(`${ANTHROPIC_API_BASE}/messages`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': ANTHROPIC_API_VERSION,
+    },
+    signal,
+    body: JSON.stringify({
+      model: modelId,
+      max_tokens: 4096,
+      system: systemPrompt,
+      messages: messages.map(({ role, content }) => ({ role, content })),
+      stream: false,
+    }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Anthropic error ${res.status}: ${res.statusText}`);
+  }
+
+  const data = await res.json();
+  return extractAnthropicText(data.content);
+}
+
 /**
- * Streaming request — used for implementation phases.
- * Yields text chunks as they arrive.
+ * Single non-streaming request used for the planning phase.
  */
-export async function* streamChat(
+export async function chatOnce(
   model: string,
   messages: Message[],
   systemPrompt: string,
   signal: AbortSignal,
-): AsyncGenerator<string> {
-  const payload = [
-    { role: 'system', content: systemPrompt },
-    ...messages,
-  ];
+): Promise<string> {
+  const { provider, modelId } = parseModelHandle(model);
+  if (!modelId) throw new Error('No model selected');
 
-  const res = await fetch(`${OLLAMA_BASE}/api/chat`, {
+  if (provider === 'openai') {
+    return chatOnceWithOpenAI(modelId, messages, systemPrompt, signal);
+  }
+
+  if (provider === 'anthropic') {
+    return chatOnceWithAnthropic(modelId, messages, systemPrompt, signal);
+  }
+
+  return chatOnceWithOllama(modelId, messages, systemPrompt, signal);
+}
+
+async function* streamWithOllama(
+  modelId: string,
+  messages: Message[],
+  systemPrompt: string,
+  signal: AbortSignal,
+): AsyncGenerator<string> {
+  const base = getOllamaBase();
+  const payload = buildPayloadMessages(messages, systemPrompt);
+
+  const res = await fetch(`${base}/api/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     signal,
-    body: JSON.stringify({ model, messages: payload, stream: true }),
+    body: JSON.stringify({ model: modelId, messages: payload, stream: true }),
   });
 
   if (!res.ok || !res.body) {
@@ -81,11 +587,158 @@ export async function* streamChat(
     const lines = decoder.decode(value).split('\n').filter(Boolean);
     for (const line of lines) {
       try {
-        const j = JSON.parse(line);
-        if (j.message?.content) yield j.message.content as string;
+        const json = JSON.parse(line);
+        if (json.message?.content) yield json.message.content as string;
       } catch {
         // skip malformed lines
       }
     }
   }
+}
+
+async function* streamWithOpenAI(
+  modelId: string,
+  messages: Message[],
+  systemPrompt: string,
+  signal: AbortSignal,
+): AsyncGenerator<string> {
+  const payload = buildPayloadMessages(messages, systemPrompt);
+  const apiKey = getOpenAIApiKey();
+  if (!apiKey) throw new Error('OpenAI API key not configured');
+  if (isSampleOpenAIKey(apiKey)) {
+    throw new Error('The OpenAI sample UI key only unlocks demo models. Add a real API key to send requests.');
+  }
+
+  const res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    signal,
+    body: JSON.stringify({
+      model: modelId,
+      messages: payload,
+      stream: true,
+    }),
+  });
+
+  if (!res.ok || !res.body) {
+    throw new Error(`OpenAI error ${res.status}: ${res.statusText}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split('\n\n');
+    buffer = parts.pop() ?? '';
+
+    for (const part of parts) {
+      const payloadLines = parseEventStreamChunk(part);
+      for (const line of payloadLines) {
+        if (line === '[DONE]') continue;
+        try {
+          const json = JSON.parse(line);
+          const delta = json.choices?.[0]?.delta?.content;
+          if (typeof delta === 'string' && delta) {
+            yield delta;
+          }
+        } catch {
+          // skip malformed event payloads
+        }
+      }
+    }
+  }
+}
+
+async function* streamWithAnthropic(
+  modelId: string,
+  messages: Message[],
+  systemPrompt: string,
+  signal: AbortSignal,
+): AsyncGenerator<string> {
+  const apiKey = getAnthropicApiKey();
+  if (!apiKey) throw new Error('Anthropic API key not configured');
+  if (isSampleAnthropicKey(apiKey)) {
+    throw new Error('The Anthropic sample UI key only unlocks demo models. Add a real API key to send requests.');
+  }
+
+  const res = await fetch(`${ANTHROPIC_API_BASE}/messages`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': ANTHROPIC_API_VERSION,
+    },
+    signal,
+    body: JSON.stringify({
+      model: modelId,
+      max_tokens: 4096,
+      system: systemPrompt,
+      messages: messages.map(({ role, content }) => ({ role, content })),
+      stream: true,
+    }),
+  });
+
+  if (!res.ok || !res.body) {
+    throw new Error(`Anthropic error ${res.status}: ${res.statusText}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split('\n\n');
+    buffer = parts.pop() ?? '';
+
+    for (const part of parts) {
+      const payloadLines = parseEventStreamChunk(part);
+      for (const line of payloadLines) {
+        try {
+          const json = JSON.parse(line);
+          if (json.type === 'content_block_delta' && typeof json.delta?.text === 'string') {
+            yield json.delta.text;
+          }
+        } catch {
+          // skip malformed event payloads
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Streaming request used for implementation and single-pass reply phases.
+ */
+export async function* streamChat(
+  model: string,
+  messages: Message[],
+  systemPrompt: string,
+  signal: AbortSignal,
+): AsyncGenerator<string> {
+  const { provider, modelId } = parseModelHandle(model);
+  if (!modelId) throw new Error('No model selected');
+
+  if (provider === 'openai') {
+    yield* streamWithOpenAI(modelId, messages, systemPrompt, signal);
+    return;
+  }
+
+  if (provider === 'anthropic') {
+    yield* streamWithAnthropic(modelId, messages, systemPrompt, signal);
+    return;
+  }
+
+  yield* streamWithOllama(modelId, messages, systemPrompt, signal);
 }

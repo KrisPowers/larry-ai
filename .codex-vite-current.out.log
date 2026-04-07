@@ -1,0 +1,108 @@
+
+> larry-ai@2026.1.3 dev
+> vite --host 127.0.0.1 --port 5173
+
+
+  [32m[1mVITE[22m v5.4.21[39m  [2mready in [0m[1m358[22m[2m[0m ms[22m
+
+  [32m➜[39m  [1mLocal[22m:   [36mhttp://127.0.0.1:[1m5173[22m/[39m
+[2m5:17:07 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:17:16 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:17:34 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:17:44 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:17:50 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:17:58 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:19:18 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:26:48 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:27:46 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:28:05 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:34:37 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:34:47 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:39:16 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:39:32 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:39:55 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:40:16 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:40:54 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:45:40 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:50:41 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:50:50 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:51:07 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:51:14 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:51:32 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:51:43 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:51:54 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:52:04 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:52:13 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:52:24 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:54:01 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:57:16 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:58:16 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m6:00:25 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m6:00:55 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m6:01:08 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m6:01:26 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m6:01:35 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m6:03:02 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m7:05:59 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m7:06:19 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m7:08:51 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m7:10:10 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m7:11:46 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m7:12:26 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m7:32:05 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/App.tsx[22m
+[2m7:33:41 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m7:34:03 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m7:34:39 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m7:35:35 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m7:36:09 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m7:36:27 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m7:41:43 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m7:42:00 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m7:42:05 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m7:42:12 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m7:45:34 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m7:45:49 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m7:46:01 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m7:48:19 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m7:54:35 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m9:26:03 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m9:26:21 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m9:27:33 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m5:29:41 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/App.tsx, /src/components/ChatPanel.tsx[22m
+[2m5:29:49 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/App.tsx[22m
+[2m5:30:12 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/App.tsx[22m
+[2m5:30:36 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/App.tsx[22m
+[2m5:30:44 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m6:05:53 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/App.tsx, /src/components/ChatPanel.tsx[22m
+[2m6:07:35 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/App.tsx, /src/components/ChatPanel.tsx[22m
+[2m6:07:52 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/App.tsx[22m
+[2m6:08:49 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/App.tsx[22m
+[2m6:08:56 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/App.tsx[22m
+[2m6:09:14 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/App.tsx[22m
+[2m6:09:21 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/App.tsx[22m
+[2m6:09:45 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/App.tsx[22m
+[2m6:10:13 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/PromptLibraryView.tsx[22m
+[2m6:10:44 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m6:10:57 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m6:11:28 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/PromptLibraryView.tsx[22m
+[2m6:12:15 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m6:13:24 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/App.tsx, /src/components/ChatPanel.tsx, /src/components/PromptLibraryView.tsx[22m
+[2m6:13:31 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ChatPanel.tsx[22m
+[2m6:25:44 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/App.tsx, /src/components/ChatPanel.tsx, /src/components/PromptLibraryView.tsx[22m
+[2m6:26:02 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/App.tsx[22m
+[2m6:26:12 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/App.tsx[22m
+[2m6:26:36 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/App.tsx, /src/components/ChatPanel.tsx, /src/components/PromptLibraryView.tsx[22m
+[2m6:29:07 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/App.tsx[22m
+[2m6:29:18 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/App.tsx[22m
+[2m8:58:35 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/PromptLibraryView.tsx[22m
+[2m8:59:21 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m9:02:40 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/PromptLibraryView.tsx[22m
+[2m9:03:19 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m9:10:22 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/PromptLibraryView.tsx[22m
+[2m9:11:19 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/PromptLibraryView.tsx[22m
+[2m9:12:07 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/PromptLibraryView.tsx[22m
+[2m9:13:02 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m9:13:36 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m9:22:16 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/PromptLibraryView.tsx[22m
+[2m9:22:51 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m9:23:07 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m

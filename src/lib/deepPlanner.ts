@@ -67,6 +67,7 @@ export interface DeepPlan {
   projectSummary: string;
   mode: RequestMode;
   steps: DeepStep[];
+  classification?: ClassificationResult;
   /** Resolved latest versions of packages mentioned in the request/plan */
   resolvedPackages?: PackageVersion[];
 }
@@ -589,24 +590,15 @@ export function buildStepUserMessage(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Full Phase 0+1: classify the request, resolve package versions, then plan.
- * Returns a DeepPlan with mode + resolvedPackages attached.
+ * Phase 1 only: build the file plan after request classification.
  */
-export async function buildDeepPlan(
+export async function planRequest(
   userMessage: string,
   conversationHistory: Message[],
+  classification: ClassificationResult,
   model: string,
   signal: AbortSignal,
-): Promise<DeepPlan> {
-
-  // Phase 0: classify
-  const classification = await classifyRequest(userMessage, conversationHistory, model, signal);
-
-  // Resolve package versions in parallel while we could be planning
-  // (fire-and-forget — we await both before building the step executor prompt)
-  const packagesPromise = resolvePackageVersions(classification.mentionedPackages);
-
-  // Phase 1: plan
+): Promise<{ projectSummary: string; steps: DeepStep[] }> {
   const plannerSystem = PLANNER_BY_MODE[classification.mode] ?? PLANNER_COMPLETE_PROJECT;
 
   const raw = await chatOnce(
@@ -619,8 +611,6 @@ export async function buildDeepPlan(
     signal,
   );
 
-  const resolvedPackages = await packagesPromise;
-
   const cleaned = raw
     .replace(/^```(?:json)?\s*/i, '')
     .replace(/\s*```\s*$/, '')
@@ -632,8 +622,6 @@ export async function buildDeepPlan(
   } catch {
     return {
       projectSummary: userMessage,
-      mode: classification.mode,
-      resolvedPackages,
       steps: [{
         stepNumber: 1,
         label: 'implementation',
@@ -658,9 +646,45 @@ export async function buildDeepPlan(
 
   return {
     projectSummary: parsed.projectSummary ?? userMessage,
-    mode: classification.mode,
-    resolvedPackages,
     steps,
+  };
+}
+
+/**
+ * Full Phase 0+1: classify the request, resolve package versions, then plan.
+ * Returns a DeepPlan with mode + resolvedPackages attached.
+ */
+export async function buildDeepPlan(
+  userMessage: string,
+  conversationHistory: Message[],
+  model: string,
+  signal: AbortSignal,
+): Promise<DeepPlan> {
+
+  // Phase 0: classify
+  const classification = await classifyRequest(userMessage, conversationHistory, model, signal);
+
+  // Resolve package versions in parallel while we could be planning
+  // (fire-and-forget — we await both before building the step executor prompt)
+  const packagesPromise = resolvePackageVersions(classification.mentionedPackages);
+
+  // Phase 1: plan
+  const planningResult = await planRequest(
+    userMessage,
+    conversationHistory,
+    classification,
+    model,
+    signal,
+  );
+
+  const resolvedPackages = await packagesPromise;
+
+  return {
+    projectSummary: planningResult.projectSummary,
+    mode: classification.mode,
+    classification,
+    resolvedPackages,
+    steps: planningResult.steps,
   };
 }
 

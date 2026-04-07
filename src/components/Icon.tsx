@@ -124,6 +124,14 @@ export function IconCheck(p: SVGProps) {
   return <Svg {...p}><polyline points="20 6 9 17 4 12"/></Svg>;
 }
 
+export function IconThumbsUp(p: SVGProps) {
+  return <Svg {...p}><path d="M7 10v11"/><path d="M11 5.88 10 10h8.83a2 2 0 0 1 1.97 2.35l-1 7A2 2 0 0 1 17.82 21H5a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.94-1.51L11 5.88a1.8 1.8 0 0 1 3.48.85V7a3 3 0 0 1-.24 1.18L13 10"/></Svg>;
+}
+
+export function IconThumbsDown(p: SVGProps) {
+  return <Svg {...p}><path d="M17 14V3"/><path d="m13 18.12 1-4.12H5.17a2 2 0 0 1-1.97-2.35l1-7A2 2 0 0 1 6.18 3H19a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-2.76a2 2 0 0 0-1.94 1.51L13 18.12a1.8 1.8 0 0 1-3.48-.85V17a3 3 0 0 1 .24-1.18L11 14"/></Svg>;
+}
+
 export function IconPaperclip(p: SVGProps) {
   return <Svg {...p}><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></Svg>;
 }
@@ -170,4 +178,8 @@ export function IconSlidersHorizontal(p: SVGProps) {
 
 export function IconSettings(p: SVGProps) {
   return <Svg {...p}><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 8.92 4.6H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c0 .65.39 1.24 1 1.51H21a2 2 0 1 1 0 4h-.09c-.61.27-1 .86-1 1.49z"/></Svg>;
+}
+
+export function IconInfo(p: SVGProps) {
+  return <Svg {...p}><circle cx="12" cy="12" r="9"/><line x1="12" y1="10" x2="12" y2="16"/><circle cx="12" cy="7" r="1" fill="currentColor" stroke="none"/></Svg>;
 }

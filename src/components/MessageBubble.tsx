@@ -1,11 +1,14 @@
 // FILE: src/components/MessageBubble.tsx
+import { useState } from 'react';
 import { parseContent, renderTextBlock, extractFilePath, stripFileComment } from '../lib/markdown';
 import type { CodeBlock as CodeBlockType } from '../lib/markdown';
 import { CodeBlock } from './CodeBlock';
 import { computeDiff } from '../lib/diffMetrics';
-import { IconFileText, IconRefreshCw } from './Icon';
+import { IconCheck, IconCopy, IconFileText, IconInfo, IconRefreshCw, IconThumbsDown, IconThumbsUp } from './Icon';
 import { NoCodeWarning } from './NoCodeWarning';
-import type { Message } from '../types';
+import { ResponseTracePanel } from './ResponseTracePanel';
+import { MessageSourcesPanel } from './MessageSourcesPanel';
+import type { Message, ReplyFeedback } from '../types';
 import type { FileRegistry } from '../lib/fileRegistry';
 
 interface Props {
@@ -13,6 +16,9 @@ interface Props {
   withDownload?: boolean;
   prevRegistry?: FileRegistry;
   model?: string;
+  showDeveloperTools?: boolean;
+  feedbackValue?: ReplyFeedback | null;
+  onFeedbackChange?: (next: ReplyFeedback | null) => void;
   hideCodeBlocks?: boolean;
   liveReplyLatencyMs?: number;
   /** When true, never show the NoCodeWarning even if the pattern fires.
@@ -31,6 +37,20 @@ function formatResponseDuration(ms: number): string {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   return `${minutes}m ${seconds}s`;
+}
+
+function getSourceHostname(url: string): string {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return '';
+  }
+}
+
+function getSourceFaviconUrl(url: string): string | null {
+  const hostname = getSourceHostname(url);
+  if (!hostname) return null;
+  return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(hostname)}&sz=64`;
 }
 
 function detectFakeCompletion(content: string, fileBlockCount: number): boolean {
@@ -58,6 +78,40 @@ function stripChangelog(text: string): string {
     // Remove any orphan separator rows left over
     .replace(/^\|[-:| ]+\|\s*$/gm, '')
     .trim();
+}
+
+function copyTextToClipboard(text: string): Promise<void> {
+  if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+    return navigator.clipboard.writeText(text);
+  }
+
+  return new Promise((resolve, reject) => {
+    if (typeof document === 'undefined') {
+      reject(new Error('Clipboard unavailable.'));
+      return;
+    }
+
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+
+    try {
+      const copied = document.execCommand('copy');
+      if (!copied) {
+        reject(new Error('Copy command failed.'));
+        return;
+      }
+      resolve();
+    } catch (error) {
+      reject(error instanceof Error ? error : new Error('Copy command failed.'));
+    } finally {
+      document.body.removeChild(textarea);
+    }
+  });
 }
 
 /** Plain inline code block — used for shell/text/plain langs. */
@@ -112,6 +166,9 @@ export function MessageBubble({
   withDownload = false,
   prevRegistry,
   model,
+  showDeveloperTools = false,
+  feedbackValue = null,
+  onFeedbackChange,
   hideCodeBlocks = false,
   liveReplyLatencyMs,
   suppressNoCodeWarning = false,
@@ -174,6 +231,32 @@ export function MessageBubble({
     !suppressNoCodeWarning &&
     withDownload &&
     detectFakeCompletion(cleanedFull, fileBlocks.length);
+  const responseTrace = !isUser ? message.responseTrace : undefined;
+  const developerToolsVisible = !isUser && showDeveloperTools;
+  const [traceOpen, setTraceOpen] = useState(false);
+  const [sourcesOpen, setSourcesOpen] = useState(false);
+  const [replyCopied, setReplyCopied] = useState(false);
+  const traceSources = !isUser
+    ? (responseTrace?.sources ?? []).filter((source) => source.status === 'fetched' && source.url)
+    : [];
+  const messageSources = [...new Map(traceSources.map((source) => [source.url, source])).values()];
+  const sourceButtonIcons = messageSources.slice(0, 3);
+  const copyableReply = !isUser ? cleanedDisplay.trim() : '';
+
+  function handleCopyReply() {
+    if (!copyableReply) return;
+
+    copyTextToClipboard(copyableReply)
+      .then(() => {
+        setReplyCopied(true);
+        window.setTimeout(() => setReplyCopied(false), 1600);
+      })
+      .catch(() => {
+        setReplyCopied(false);
+      });
+  }
+
+  const feedbackEnabled = !isUser && typeof onFeedbackChange === 'function';
 
   return (
     <div className={`msg ${message.role}`}>
@@ -183,10 +266,21 @@ export function MessageBubble({
         ) : (
           <>
             <strong className="msg-label-name">Larry</strong>
-            {replyLatencyLabel && (
+            {developerToolsVisible && replyLatencyLabel && (
               <span className="msg-label-response" title={timingTitle}>
                 responded in {replyLatencyLabel}
               </span>
+            )}
+            {developerToolsVisible && responseTrace && (
+              <button
+                type="button"
+                className="msg-trace-trigger"
+                title="Inspect reply pipeline"
+                aria-label="Inspect reply pipeline"
+                onClick={() => setTraceOpen(true)}
+              >
+                <IconInfo size={13} />
+              </button>
             )}
           </>
         )}
@@ -230,7 +324,91 @@ export function MessageBubble({
         </div>
       </div>
 
+      {!isUser && (
+        <div className="msg-source-actions">
+          <button
+            type="button"
+            className={`msg-source-trigger msg-copy-trigger${replyCopied ? ' copied' : ''}`}
+            onClick={handleCopyReply}
+            aria-label={replyCopied ? 'Reply copied' : 'Copy reply'}
+            title={replyCopied ? 'Copied' : 'Copy reply'}
+            disabled={!copyableReply}
+          >
+            {replyCopied ? <IconCheck size={16} /> : <IconCopy size={16} />}
+          </button>
+
+          {feedbackEnabled && (
+            <>
+              <button
+                type="button"
+                className={`msg-source-trigger msg-feedback-trigger like${feedbackValue === 'liked' ? ' active' : ''}`}
+                onClick={() => onFeedbackChange(feedbackValue === 'liked' ? null : 'liked')}
+                aria-pressed={feedbackValue === 'liked'}
+                aria-label={feedbackValue === 'liked' ? 'Remove valid or accurate rating' : 'Mark reply as valid or accurate'}
+                title={feedbackValue === 'liked' ? 'Remove valid / accurate rating' : 'Mark as valid / accurate'}
+              >
+                <IconThumbsUp size={16} />
+              </button>
+
+              <button
+                type="button"
+                className={`msg-source-trigger msg-feedback-trigger dislike${feedbackValue === 'disliked' ? ' active' : ''}`}
+                onClick={() => onFeedbackChange(feedbackValue === 'disliked' ? null : 'disliked')}
+                aria-pressed={feedbackValue === 'disliked'}
+                aria-label={feedbackValue === 'disliked' ? 'Remove invalid or inaccurate rating' : 'Mark reply as invalid or inaccurate'}
+                title={feedbackValue === 'disliked' ? 'Remove invalid / inaccurate rating' : 'Mark as invalid / inaccurate'}
+              >
+                <IconThumbsDown size={16} />
+              </button>
+            </>
+          )}
+
+          {messageSources.length > 0 && (
+            <button
+              type="button"
+              className="msg-source-trigger msg-source-primary"
+              onClick={() => setSourcesOpen(true)}
+              aria-label="Open sources"
+            >
+              <span className="msg-source-trigger-icons" aria-hidden="true">
+                {sourceButtonIcons.map((source) => (
+                  <span key={source.id} className="msg-source-trigger-icon">
+                    {getSourceFaviconUrl(source.url) ? (
+                      <img
+                        src={getSourceFaviconUrl(source.url) ?? undefined}
+                        alt=""
+                      />
+                    ) : (
+                      <span className="msg-source-trigger-icon-fallback" />
+                    )}
+                  </span>
+                ))}
+              </span>
+              <span className="msg-source-trigger-label">Sources</span>
+            </button>
+          )}
+        </div>
+      )}
+
       {isFakeCompletion && <NoCodeWarning model={model ?? ''} />}
+
+      {!isUser && messageSources.length > 0 && sourcesOpen && (
+        <MessageSourcesPanel
+          sources={messageSources}
+          onClose={() => setSourcesOpen(false)}
+        />
+      )}
+
+      {developerToolsVisible && responseTrace && (
+        traceOpen ? (
+          <ResponseTracePanel
+            trace={responseTrace}
+            firstTokenDurationMs={message.responseFirstTokenMs}
+            totalDurationMs={message.responseTimeMs}
+            onClose={() => setTraceOpen(false)}
+          />
+        ) : null
+      )}
 
       {!isUser && withDownload && fileBlocks.length > 0 && (
         <div className="change-summary">
