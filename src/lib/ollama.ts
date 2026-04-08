@@ -169,6 +169,47 @@ function extractAnthropicText(content: unknown): string {
     .join('');
 }
 
+function extractHttpErrorDetail(bodyText: string): string {
+  const trimmed = bodyText.trim();
+  if (!trimmed) return '';
+
+  try {
+    const parsed = JSON.parse(trimmed) as {
+      error?: string | { message?: string };
+      message?: string;
+    };
+
+    if (typeof parsed.error === 'string' && parsed.error.trim()) {
+      return parsed.error.trim();
+    }
+
+    if (parsed.error && typeof parsed.error === 'object' && typeof parsed.error.message === 'string' && parsed.error.message.trim()) {
+      return parsed.error.message.trim();
+    }
+
+    if (typeof parsed.message === 'string' && parsed.message.trim()) {
+      return parsed.message.trim();
+    }
+  } catch {
+    // Fall back to the raw response body when it is not JSON.
+  }
+
+  return trimmed.replace(/\s+/g, ' ');
+}
+
+async function buildProviderHttpError(provider: ModelProvider, res: Response): Promise<Error> {
+  let detail = '';
+
+  try {
+    detail = extractHttpErrorDetail(await res.text());
+  } catch {
+    // Ignore response parsing failures and fall back to the status text.
+  }
+
+  const label = PROVIDER_LABELS[provider];
+  return new Error(`${label} error ${res.status}: ${detail || res.statusText || 'Request failed'}`);
+}
+
 export function normalizeOllamaBase(value?: string | null): string {
   const raw = (value ?? '').trim();
   if (!raw) return ENV_OLLAMA_BASE;
@@ -377,7 +418,7 @@ async function fetchOllamaModels(base: string): Promise<string[]> {
   });
 
   if (!res.ok) {
-    throw new Error(`Ollama error ${res.status}: ${res.statusText}`);
+    throw await buildProviderHttpError('ollama', res);
   }
 
   const data = await res.json();
@@ -400,7 +441,7 @@ async function fetchOpenAIModels(apiKey: string): Promise<string[]> {
   });
 
   if (!res.ok) {
-    throw new Error(`OpenAI error ${res.status}: ${res.statusText}`);
+    throw await buildProviderHttpError('openai', res);
   }
 
   const data = await res.json();
@@ -425,7 +466,7 @@ async function fetchAnthropicModels(apiKey: string): Promise<string[]> {
   });
 
   if (!res.ok) {
-    throw new Error(`Anthropic error ${res.status}: ${res.statusText}`);
+    throw await buildProviderHttpError('anthropic', res);
   }
 
   const data = await res.json();
@@ -595,7 +636,7 @@ async function chatOnceWithOllama(
   });
 
   if (!res.ok) {
-    throw new Error(`Ollama error ${res.status}: ${res.statusText}`);
+    throw await buildProviderHttpError('ollama', res);
   }
 
   const data = await res.json();
@@ -630,7 +671,7 @@ async function chatOnceWithOpenAI(
   });
 
   if (!res.ok) {
-    throw new Error(`OpenAI error ${res.status}: ${res.statusText}`);
+    throw await buildProviderHttpError('openai', res);
   }
 
   const data = await res.json();
@@ -667,7 +708,7 @@ async function chatOnceWithAnthropic(
   });
 
   if (!res.ok) {
-    throw new Error(`Anthropic error ${res.status}: ${res.statusText}`);
+    throw await buildProviderHttpError('anthropic', res);
   }
 
   const data = await res.json();
@@ -713,8 +754,12 @@ async function* streamWithOllama(
     body: JSON.stringify({ model: modelId, messages: payload, stream: true }),
   });
 
-  if (!res.ok || !res.body) {
-    throw new Error(`Ollama error ${res.status}: ${res.statusText}`);
+  if (!res.ok) {
+    throw await buildProviderHttpError('ollama', res);
+  }
+
+  if (!res.body) {
+    throw new Error('Ollama error: response body missing');
   }
 
   const reader = res.body.getReader();
@@ -762,8 +807,12 @@ async function* streamWithOpenAI(
     }),
   });
 
-  if (!res.ok || !res.body) {
-    throw new Error(`OpenAI error ${res.status}: ${res.statusText}`);
+  if (!res.ok) {
+    throw await buildProviderHttpError('openai', res);
+  }
+
+  if (!res.body) {
+    throw new Error('OpenAI error: response body missing');
   }
 
   const reader = res.body.getReader();
@@ -825,8 +874,12 @@ async function* streamWithAnthropic(
     }),
   });
 
-  if (!res.ok || !res.body) {
-    throw new Error(`Anthropic error ${res.status}: ${res.statusText}`);
+  if (!res.ok) {
+    throw await buildProviderHttpError('anthropic', res);
+  }
+
+  if (!res.body) {
+    throw new Error('Anthropic error: response body missing');
   }
 
   const reader = res.body.getReader();

@@ -21,6 +21,7 @@
 
 import { chatOnce } from './ollama';
 import { fetchUrl } from './fetcher';
+import { appendSharedResponseStylePrompt } from './responseStyle';
 import type { Message } from '../types';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -480,7 +481,7 @@ const PLANNER_BY_MODE: Record<RequestMode, string> = {
 // Phase 2 — Step execution system prompt
 // ─────────────────────────────────────────────────────────────────────────────
 
-const STEP_EXECUTOR_SYSTEM = `You are a senior software engineer implementing one file at a time.
+const STEP_EXECUTOR_SYSTEM = appendSharedResponseStylePrompt(`You are a senior software engineer implementing one file at a time.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RULE 0 — FILE PATH DECLARATION (MANDATORY, NO EXCEPTIONS)
@@ -517,7 +518,7 @@ If a "Live Package Versions" section appears in your context, you MUST use
 those exact version strings in package.json, requirements.txt, Cargo.toml,
 Gemfile, go.mod, or composer.json. Do NOT use versions from your training data.
 
-After the code block, you may write a brief explanation (2-4 sentences).`;
+After the code block, you may write a brief explanation (2-4 sentences).`);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Phase 2 — per-step user message
@@ -696,7 +697,7 @@ export function getStepExecutorSystem(): string {
 // Phase 3 — summary
 // ─────────────────────────────────────────────────────────────────────────────
 
-const SUMMARY_SYSTEM = `You are a senior software engineer who has just finished a coding task.
+const SUMMARY_SYSTEM = appendSharedResponseStylePrompt(`You are a senior software engineer who has just finished a coding task.
 Write a clear, helpful summary for the developer.
 
 Write in plain prose — no code blocks. Adapt the structure to the type of work done:
@@ -706,7 +707,7 @@ Write in plain prose — no code blocks. Adapt the structure to the type of work
 - For a refactor: what changed structurally, what stayed the same, any behaviour differences to watch for.
 - For an edit: summary of the changes made and why.
 
-Be specific — reference actual file names and commands. 3-5 paragraphs.`;
+Be specific — reference actual file names and commands. 3-5 paragraphs.`);
 
 export function buildSummaryUserMessage(
   originalRequest: string,

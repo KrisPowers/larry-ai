@@ -125,6 +125,13 @@ export function removeReplyPreference(id: string): ReplyPreferenceRecord[] {
   return persistReplyPreferences(next);
 }
 
+export function clearReplyPreferences(): ReplyPreferenceRecord[] {
+  if (typeof window === 'undefined') return [];
+  localStorage.removeItem(REPLY_PREFERENCES_STORAGE_KEY);
+  window.dispatchEvent(new Event(REPLY_PREFERENCES_UPDATED_EVENT));
+  return [];
+}
+
 function scorePreference(
   preference: ReplyPreferenceRecord,
   currentPrompt: string,

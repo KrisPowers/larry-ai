@@ -34,6 +34,7 @@ interface QueryAnalysis {
   primaryTerm: string;
   contextTerm: string;
   countries: string[];
+  hasNewsCue: boolean;
   prefersOfficialSources: boolean;
   prefersNewsSources: boolean;
   prefersCommunitySources: boolean;
@@ -123,7 +124,7 @@ const QUESTION_RE = /[?]|^(who|what|when|where|why|how|is|are|can|could|would|wi
 const LOOKUP_RE = /\b(search|look up|lookup|find|research|check|browse|verify|confirm|update me|timeline|plan|schedule|status|latest|current|recent|compare)\b/i;
 const FUTURE_RE = /\b(next|upcoming|future|planned|roadmap|timeline|schedule|scheduled|expected|forecast|target|tomorrow|next year|later this year|coming|next steps)\b/i;
 const RELATIVE_TIME_RE = /\b(today|yesterday|tonight|this week|last week|this month|this year|right now|currently|current|latest|recent|now|live|breaking)\b/i;
-const NEWS_EVENT_RE = /\b(news|headline|headlines|report|reports|reported|reporting|issue|issues|problem|problems|outage|outages|glitch|glitches|disruption|disruptions|controversy|incident|incidents|coverage)\b/i;
+const NEWS_EVENT_RE = /\b(news|headline|headlines|report|reports|reported|reporting|issue|issues|problem|problems|outage|outages|glitch|glitches|disruption|disruptions|controversy|incident|incidents|coverage|announce|announced|announcement|partnership|partnerships|partnered|partnering|deal|deals|agreement|agreements|collaboration|collaborations|launch|launched|release|released|unveil|unveiled|rollout|acquisition|acquired|merger|funding|investment|investments)\b/i;
 const FOLLOW_UP_ENTITY_RE = /\b(it|its|they|them|their|that|this|those|these|mission|program|launch|flight|crew)\b/i;
 const STATUS_UPDATE_RE = /\b(status|timeline|latest|current|today|now|update|updates|what'?s going on|what is going on|happening|what happened|plan|next steps)\b/i;
 const SPACE_RE = /\b(nasa|moon|mars|esa|space|launch|rocket|mission|orbiter|crew|astronaut|lunar|spacex|iss|jaxa|isro|csa)\b/i;
@@ -136,8 +137,10 @@ const COUNTRY_RE = /\b(iran|ukraine|russia|china|israel|gaza|taiwan|north korea|
 const RECENT_YEAR_FLOOR = 2022;
 const MAX_TEXT = 5000;
 const MAX_SEARCH_ITEMS_PER_SOURCE = 20;
-const MAX_SYSTEM_CONTEXTS_STANDARD = 8;
-const MAX_SYSTEM_CONTEXTS_DEEP = 12;
+const MAX_SYSTEM_CONTEXTS_STANDARD = 10;
+const MAX_SYSTEM_CONTEXTS_DEEP = 15;
+const MAX_CONVERSATION_CONTEXTS_STANDARD = 8;
+const MAX_CONVERSATION_CONTEXTS_DEEP = 10;
 const MAX_SYSTEM_CONTEXT_EXCERPT_STANDARD = 640;
 const MAX_SYSTEM_CONTEXT_EXCERPT_DEEP = 920;
 const MAX_CONVERSATION_CONTEXT_EXCERPT_STANDARD = 180;
@@ -146,10 +149,10 @@ const FETCH_PROMPT_URL_TIMEOUT_MS = 6_000;
 const FETCH_SEARCH_TIMEOUT_MS = 4_500;
 const FETCH_SEARCH_SCRAPE_TIMEOUT_MS = 2_400;
 const FETCH_DIRECT_JSON_TIMEOUT_MS = 4_500;
-const GLOBAL_CONTEXT_BUDGET_STANDARD_MS = 15_000;
-const GLOBAL_CONTEXT_BUDGET_DEEP_MS = 24_000;
-const RECOVERY_CONTEXT_BUDGET_STANDARD_MS = 7_500;
-const RECOVERY_CONTEXT_BUDGET_DEEP_MS = 12_000;
+const GLOBAL_CONTEXT_BUDGET_STANDARD_MS = 18_000;
+const GLOBAL_CONTEXT_BUDGET_DEEP_MS = 30_000;
+const RECOVERY_CONTEXT_BUDGET_STANDARD_MS = 9_000;
+const RECOVERY_CONTEXT_BUDGET_DEEP_MS = 15_000;
 const SEARCH_ENGINE_DIAGNOSTIC_VERSION = '2026-04-07-operational-recovery-v6';
 const LOCAL_FETCH_PROXY_PATH = '/__fetch?url=';
 const READER_PROXY = 'https://r.jina.ai/http://';
@@ -732,7 +735,7 @@ function analyzeQuery(currentMessage: string, conversationHistory: Array<{ role:
   const missionKeys = extractMissionKeys(`${currentMessage} ${recentHistory}`);
   const isCrewLookup = /\b(crew|astronaut|pilot|commander|mission specialist|specialist|roster|who is|who are|names?)\b/i.test(cleanedCurrent);
   const missionLead = missionKeys.flatMap((key) => missionKeyToVariants(key)).find(Boolean) ?? '';
-  const hasNewsCue = NEWS_EVENT_RE.test(cleanedCurrent) || NEWS_EVENT_RE.test(currentMessage);
+  const hasNewsCue = NEWS_EVENT_RE.test(cleanedCurrent) || NEWS_EVENT_RE.test(currentMessage) || /\bpress release\b/i.test(combinedText);
   const followUpNeedsHistoryContext = Boolean(
     contextHint && (
       currentTerms.length <= 3
@@ -779,14 +782,29 @@ function analyzeQuery(currentMessage: string, conversationHistory: Array<{ role:
     primaryTerm,
     contextTerm: contextTerm || cleanedCurrent,
     countries,
+    hasNewsCue,
     prefersOfficialSources,
     prefersNewsSources,
     prefersCommunitySources,
     shouldFetch,
-    maxSources: Math.max(3, Math.min(maxSources, 5)),
+    maxSources: Math.max(4, Math.min(maxSources, 8)),
     terms,
     missionKeys,
   };
+}
+
+function isTimelyFocus(analysis: QueryAnalysis): boolean {
+  return analysis.temporalFocus === 'recent' || analysis.temporalFocus === 'current' || analysis.temporalFocus === 'future';
+}
+
+function isTimelyNewsAnalysis(analysis: QueryAnalysis): boolean {
+  return isTimelyFocus(analysis) && analysis.prefersNewsSources;
+}
+
+function resolveRecentNewsWindowDays(analysis: QueryAnalysis): number {
+  if (analysis.temporalFocus === 'current' || analysis.temporalFocus === 'future') return 21;
+  if (analysis.temporalFocus === 'recent') return 45;
+  return 60;
 }
 
 function buildCompactQuery(analysis: QueryAnalysis): string {
@@ -845,8 +863,11 @@ function buildQueryVariants(analysis: QueryAnalysis): string[] {
 
   if (analysis.prefersNewsSources) {
     variants.add(normalizeWhitespace(`${analysis.contextTerm} latest news`));
+    variants.add(normalizeWhitespace(`${analysis.contextTerm} latest coverage`));
     variants.add(normalizeWhitespace(`${analysis.contextTerm} reported issues`));
     variants.add(normalizeWhitespace(`${analysis.contextTerm} latest update`));
+    variants.add(normalizeWhitespace(`${analysis.contextTerm} ${analysis.currentYear} announcement`));
+    variants.add(normalizeWhitespace(`${analysis.contextTerm} press release`));
   }
 
   if (analysis.temporalFocus === 'current' || analysis.temporalFocus === 'recent' || analysis.temporalFocus === 'future') {
@@ -875,18 +896,24 @@ function buildQueryVariants(analysis: QueryAnalysis): string[] {
     }
   }
 
-  return [...variants].filter(Boolean).slice(0, isCrewLookupAnalysis(analysis) ? 6 : 4);
+  return [...variants].filter(Boolean).slice(0, isCrewLookupAnalysis(analysis) ? 6 : isTimelyNewsAnalysis(analysis) ? 7 : 4);
 }
 
 function resolveDesiredSourceCount(
   analysis: QueryAnalysis,
   options: FetchGlobalContextOptions = {},
 ): number {
-  if (options.maxSources) return options.maxSources;
+  const timelyNewsTarget = isTimelyNewsAnalysis(analysis)
+    ? options.depth === 'deep' ? 15 : 12
+    : 0;
+  if (options.maxSources) return Math.max(options.maxSources, timelyNewsTarget);
 
   const breadthBoost = analysis.prefersNewsSources || analysis.prefersOfficialSources ? 2 : 0;
-  const base = analysis.maxSources + (options.depth === 'deep' ? 5 : 3) + breadthBoost;
-  return Math.max(6, Math.min(base, options.depth === 'deep' ? 14 : 10));
+  const base = analysis.maxSources + (options.depth === 'deep' ? 6 : 4) + breadthBoost + (timelyNewsTarget > 0 ? 2 : 0);
+  return Math.max(
+    timelyNewsTarget || (options.depth === 'deep' ? 8 : 6),
+    Math.min(base, options.depth === 'deep' ? 15 : 12),
+  );
 }
 
 function resolveSystemContextLimit(options: ContextFormattingOptions = {}): number {
@@ -899,6 +926,10 @@ function resolveSystemExcerptLimit(options: ContextFormattingOptions = {}): numb
 
 function resolveConversationExcerptLimit(options: ContextFormattingOptions = {}): number {
   return options.depth === 'deep' ? MAX_CONVERSATION_CONTEXT_EXCERPT_DEEP : MAX_CONVERSATION_CONTEXT_EXCERPT_STANDARD;
+}
+
+function resolveConversationContextLimit(options: ContextFormattingOptions = {}): number {
+  return options.depth === 'deep' ? MAX_CONVERSATION_CONTEXTS_DEEP : MAX_CONVERSATION_CONTEXTS_STANDARD;
 }
 
 export function extractUrlsFromText(text: string): string[] {
@@ -3117,7 +3148,9 @@ function selectBestContexts(
 ): FetchedContext[] {
   const desiredSourceCount = resolveDesiredSourceCount(analysis, options);
   const isDeep = options.depth === 'deep';
-  const timelyFocus = analysis.temporalFocus === 'recent' || analysis.temporalFocus === 'current' || analysis.temporalFocus === 'future';
+  const timelyFocus = isTimelyFocus(analysis);
+  const timelyNewsFocus = isTimelyNewsAnalysis(analysis);
+  const recentNewsWindowDays = resolveRecentNewsWindowDays(analysis);
   const rawDeduped = contexts
     .filter((context) => !context.error && context.text.trim().length >= 24)
     .filter((context, index, array) => array.findIndex((entry) => `${(entry.provider ?? '').toLowerCase()}|${entry.url.toLowerCase()}|${entry.title.toLowerCase()}` === `${(context.provider ?? '').toLowerCase()}|${context.url.toLowerCase()}|${context.title.toLowerCase()}`) === index)
@@ -3146,6 +3179,13 @@ function selectBestContexts(
     const ageDays = Math.max(0, (Date.now() - publishedAt) / 86_400_000);
     return score >= (isDeep ? 22 : 26) && ageDays <= 14 && hasCurrentStatusLanguage(context);
   });
+  const recentNewsCandidateCount = deduped.filter(({ context, score }) => {
+    if (context.sourceType !== 'news') return false;
+    const publishedAt = getPublishedTimestamp(context);
+    if (publishedAt == null) return false;
+    const ageDays = Math.max(0, (Date.now() - publishedAt) / 86_400_000);
+    return score >= (isDeep ? 18 : 20) && ageDays <= recentNewsWindowDays;
+  }).length;
   const hasStrongCrewEvidence = isCrewLookupAnalysis(analysis) && deduped.some(({ context, score }) =>
     score >= (isDeep ? 18 : 22) && isCrewEvidenceContext(context) && getMissionAlignmentScore(context, analysis) >= 0,
   );
@@ -3153,12 +3193,14 @@ function selectBestContexts(
     score >= (isDeep ? 22 : 26) && getMissionAlignmentScore(context, analysis) > 0,
   );
   const shouldLockSearchSummariesOut = timelyFocus && (strongEvidenceCount >= 2 || directEvidenceHostCount >= 2);
+  const shouldPreferRecentNewsCoverage = timelyNewsFocus
+    && recentNewsCandidateCount >= Math.min(isDeep ? 8 : 6, Math.max(6, desiredSourceCount - 2));
 
   const maxByType: Record<FetchedSourceType, number> = {
-    official: isDeep ? 4 : analysis.prefersOfficialSources ? 3 : 2,
-    news: isDeep ? 6 : timelyFocus || analysis.prefersNewsSources ? 4 : 3,
+    official: timelyNewsFocus ? (isDeep ? 5 : 4) : isDeep ? 4 : analysis.prefersOfficialSources ? 3 : 2,
+    news: timelyNewsFocus ? (isDeep ? 10 : 8) : isDeep ? 6 : timelyFocus || analysis.prefersNewsSources ? 4 : 3,
     reference: isDeep ? 2 : 1,
-    search: shouldLockSearchSummariesOut ? 0 : isDeep ? 3 : 2,
+    search: shouldLockSearchSummariesOut || timelyNewsFocus ? 0 : isDeep ? 3 : 2,
     community: analysis.prefersCommunitySources ? 1 : 0,
   };
   const providerCounts = new Map<string, number>();
@@ -3176,9 +3218,10 @@ function selectBestContexts(
     if (hasStrongCrewEvidence && !isCrewEvidenceContext(context)) continue;
     if (hasMissionMatchedEvidence && getMissionAlignmentScore(context, analysis) < 0) continue;
     if (hasFreshCurrentStatusEvidence && isStaleScheduleContext(context, analysis)) continue;
+    const publishedAt = getPublishedTimestamp(context);
+    const ageDays = publishedAt != null ? Math.max(0, (Date.now() - publishedAt) / 86_400_000) : null;
+    if (shouldPreferRecentNewsCoverage && context.sourceType === 'news' && (ageDays == null || ageDays > recentNewsWindowDays)) continue;
     if (hasFreshTimelyEvidence) {
-      const publishedAt = getPublishedTimestamp(context);
-      const ageDays = publishedAt != null ? Math.max(0, (Date.now() - publishedAt) / 86_400_000) : null;
       if (ageDays != null && ageDays > 60) continue;
       if (ageDays == null && timelyFocus && context.sourceType === 'official' && !isOfficialReportContext(context) && !isCrewLookupAnalysis(analysis)) continue;
     }
@@ -3207,6 +3250,9 @@ function selectBestContexts(
       if (isHistoricalLiveStatusContext(context, analysis)) continue;
       if (hasMissionMatchedEvidence && getMissionAlignmentScore(context, analysis) < 0) continue;
       if (hasFreshCurrentStatusEvidence && isStaleScheduleContext(context, analysis)) continue;
+      const publishedAt = getPublishedTimestamp(context);
+      const ageDays = publishedAt != null ? Math.max(0, (Date.now() - publishedAt) / 86_400_000) : null;
+      if (shouldPreferRecentNewsCoverage && context.sourceType === 'news' && (ageDays == null || ageDays > recentNewsWindowDays)) continue;
 
       const providerKey = (context.provider ?? context.title).toLowerCase();
       const hostKey = extractHostname(context.url) || providerKey;
@@ -3239,15 +3285,18 @@ function selectBestContexts(
       if (isHistoricalLiveStatusContext(context, analysis)) continue;
       if (hasMissionMatchedEvidence && getMissionAlignmentScore(context, analysis) < 0) continue;
       if (hasFreshCurrentStatusEvidence && isStaleScheduleContext(context, analysis)) continue;
+      const publishedAt = getPublishedTimestamp(context);
+      const ageDays = publishedAt != null ? Math.max(0, (Date.now() - publishedAt) / 86_400_000) : null;
+      if (shouldPreferRecentNewsCoverage && context.sourceType === 'news' && (ageDays == null || ageDays > recentNewsWindowDays)) continue;
 
       const providerKey = (context.provider ?? context.title).toLowerCase();
       const hostKey = extractHostname(context.url) || providerKey;
       const sourceType = context.sourceType ?? 'search';
       const hostCap = resolveHostCapForContext(context, analysis, isDeep);
       const supplementalTypeCap = sourceType === 'news'
-        ? (isDeep ? 6 : 5)
+        ? timelyNewsFocus ? (isDeep ? 10 : 8) : (isDeep ? 6 : 5)
         : sourceType === 'official'
-          ? (isDeep ? 4 : 3)
+          ? timelyNewsFocus ? (isDeep ? 5 : 4) : (isDeep ? 4 : 3)
           : maxByType[sourceType];
 
       if ((hostCounts.get(hostKey) ?? 0) >= hostCap) continue;
@@ -3270,7 +3319,7 @@ function selectBestContexts(
     : deduped.filter(({ context }) => !isSearchSummaryContext(context));
 
   return fallbackPool
-    .slice(0, Math.max(2, Math.min(desiredSourceCount, isDeep ? 8 : 5)))
+    .slice(0, Math.max(2, Math.min(desiredSourceCount, isDeep ? 12 : 10)))
     .map((entry) => entry.context);
 }
 
@@ -3278,11 +3327,14 @@ function minimumRequiredSourceCount(
   analysis: QueryAnalysis,
   options: FetchGlobalContextOptions = {},
 ): number {
-  const timelyFocus = analysis.temporalFocus === 'recent' || analysis.temporalFocus === 'current' || analysis.temporalFocus === 'future';
-  if (options.depth === 'deep') return 3;
-  if (analysis.queryMode === 'research') return 3;
+  const timelyFocus = isTimelyFocus(analysis);
+  if (isTimelyNewsAnalysis(analysis)) {
+    return options.depth === 'deep' ? 10 : 8;
+  }
+  if (options.depth === 'deep') return 4;
+  if (analysis.queryMode === 'research') return 4;
   if (timelyFocus && (analysis.prefersOfficialSources || analysis.prefersNewsSources)) {
-    return 3;
+    return 4;
   }
   return 0;
 }
@@ -3346,17 +3398,18 @@ async function recoverMinimumContexts(
   if (minimumRequired <= 0) return [];
 
   const isDeep = options.depth === 'deep';
+  const timelyNewsFocus = isTimelyNewsAnalysis(analysis);
   const searchFallbackSourceType: FetchedSourceType = analysis.prefersNewsSources ? 'news' : analysis.prefersOfficialSources ? 'official' : 'search';
   const searchFallbackCredibility: FetchedCredibility = analysis.prefersNewsSources ? 'major-news' : analysis.prefersOfficialSources ? 'official' : 'search';
-  const variantLimit = isDeep ? Math.min(queryVariants.length, 3) : Math.min(queryVariants.length, 2);
+  const variantLimit = isDeep ? Math.min(queryVariants.length, 4) : timelyNewsFocus ? Math.min(queryVariants.length, 3) : Math.min(queryVariants.length, 2);
   const variants = uniqueStrings([
     ...exactQueries,
     ...queryVariants,
   ]).slice(0, Math.max(1, variantLimit + exactQueries.length));
   const recoveryBudget = isDeep ? RECOVERY_CONTEXT_BUDGET_DEEP_MS : RECOVERY_CONTEXT_BUDGET_STANDARD_MS;
-  const recoverySearchPageCount = isDeep ? 2 : 1;
-  const recoveryDestinationPageLimit = isDeep ? 4 : 3;
-  const recoverySearchItemLimit = isDeep ? 16 : 12;
+  const recoverySearchPageCount = isDeep ? 2 : timelyNewsFocus ? 2 : 1;
+  const recoveryDestinationPageLimit = isDeep ? 5 : timelyNewsFocus ? 4 : 3;
+  const recoverySearchItemLimit = isDeep ? 18 : timelyNewsFocus ? 14 : 12;
 
   const taskFactories: Array<(signal: AbortSignal) => Promise<FetchedContext | FetchedContext[] | null>> = [];
 
@@ -3400,7 +3453,7 @@ async function recoverMinimumContexts(
   }
 
   const results = await collectContextsWithinBudget(taskFactories, recoveryBudget);
-  return buildNonSearchSourcePool(results, analysis).slice(0, isDeep ? 10 : 6);
+  return buildNonSearchSourcePool(results, analysis).slice(0, isDeep ? 12 : timelyNewsFocus ? 8 : 6);
 }
 
 function wait(ms: number): Promise<void> {
@@ -3463,12 +3516,13 @@ export async function fetchGlobalContext(
   const searchFallbackSourceType: FetchedSourceType = analysis.prefersNewsSources ? 'news' : analysis.prefersOfficialSources ? 'official' : 'search';
   const searchFallbackCredibility: FetchedCredibility = analysis.prefersNewsSources ? 'major-news' : analysis.prefersOfficialSources ? 'official' : 'search';
   const isDeep = options.depth === 'deep';
-  const searchItemLimit = isDeep ? 16 : 12;
-  const primaryResultPageCount = isDeep ? 2 : 1;
-  const secondaryResultPageCount = isDeep ? 1 : 1;
-  const primarySearchPageLimit = isDeep ? 4 : 3;
-  const secondarySearchPageLimit = isDeep ? 3 : 2;
-  const searchVariantLimit = isDeep ? Math.min(queryVariants.length, 5) : Math.min(queryVariants.length, 3);
+  const expansiveFetch = desiredSourceCount >= 12 || isTimelyNewsAnalysis(analysis);
+  const searchItemLimit = isDeep ? 18 : expansiveFetch ? 16 : 12;
+  const primaryResultPageCount = isDeep ? 2 : expansiveFetch ? 2 : 1;
+  const secondaryResultPageCount = isDeep ? 2 : 1;
+  const primarySearchPageLimit = isDeep ? 5 : expansiveFetch ? 4 : 3;
+  const secondarySearchPageLimit = isDeep ? 4 : expansiveFetch ? 3 : 2;
+  const searchVariantLimit = isDeep ? Math.min(queryVariants.length, 6) : Math.min(queryVariants.length, expansiveFetch ? 4 : 3);
   const globalBudgetMs = isDeep ? GLOBAL_CONTEXT_BUDGET_DEEP_MS : GLOBAL_CONTEXT_BUDGET_STANDARD_MS;
   const timelyQuery = needsTimelySources && !/\blatest|current|status|timeline|today\b/i.test(compactQuery)
     ? `${compactQuery} latest status timeline`
@@ -3577,7 +3631,7 @@ export async function fetchGlobalContext(
   }
 
   const fallbackDirectSources = buildNonSearchSourcePool([...results, ...recoveredResults], analysis)
-    .slice(0, Math.max(Math.max(minimumRequired, 2), Math.min(desiredSourceCount, isDeep ? 10 : 6)));
+    .slice(0, Math.max(Math.max(minimumRequired, 2), Math.min(desiredSourceCount, isDeep ? 12 : 10)));
   if (fallbackDirectSources.length && (minimumRequired <= 0 || fallbackDirectSources.length >= minimumRequired)) {
     return fallbackDirectSources;
   }
@@ -3586,7 +3640,7 @@ export async function fetchGlobalContext(
     .filter((context) => !context.error && context.text.trim().length >= 40)
     .filter((context) => !isSearchSummaryContext(context))
     .filter((context, index, array) => array.findIndex((entry) => entry.url === context.url) === index)
-    .slice(0, Math.max(2, Math.min(desiredSourceCount, isDeep ? 10 : 6)));
+    .slice(0, Math.max(2, Math.min(desiredSourceCount, isDeep ? 12 : 10)));
 
   if (fallbackSearchPages.length) {
     return fallbackSearchPages;
@@ -3640,6 +3694,8 @@ export function globalContextToSystemInject(
     '- Treat search summaries and reference material as orientation, not final proof for current or future claims.',
     '- Treat directory pages, agency indexes, and site indexes as discovery aids, not as evidence for mission status, timelines, crew, or outcomes.',
     '- Community or forum material is secondary context only and must never be the sole basis for factual claims.',
+    '- For news-oriented prompts, weight the answer toward very recent reporting and use older coverage only as background or change-over-time context.',
+    '- When several recent reports are available, synthesize across that wider set instead of leaning on a single article or outlet.',
     '- Only make precise status, crew, launch, landing, return, or schedule claims that are explicitly supported by the fetched evidence below.',
     '- When answering name, crew, roster, pilot, commander, or role questions, list only the names and roles explicitly shown in the fetched sources.',
     '- Do not infer a full mission schedule or exact event outcome from a partial excerpt, a search result snippet, or a general mission overview page.',
@@ -3677,7 +3733,7 @@ export function globalContextToConversationInject(
     /\b(snapshot|probe)\b/i.test(context.title) ||
     context.text.toLowerCase().includes('live search probe was issued'),
   );
-  const conversationContextLimit = resolveSystemContextLimit(options);
+  const conversationContextLimit = resolveConversationContextLimit(options);
   const conversationExcerptLimit = resolveConversationExcerptLimit(options);
   const strongest = sortContextsForPrompt(contexts).slice(0, conversationContextLimit).map((context) => {
     const metadata = [
@@ -3694,6 +3750,8 @@ export function globalContextToConversationInject(
       'I already have usable current research in hand and must answer from it directly.',
       'I must not say that I lack real-time access, and I must not deflect to outside search when the evidence below is enough to provide insight.',
       'I should prefer the newest corroborated official and major-news evidence over forum discussion.',
+      'For news-oriented prompts, I should weight the answer toward the freshest reporting and use older coverage only as background context.',
+      'When several recent sources align, I should synthesize across that wider set instead of anchoring the answer on one article alone.',
       'I must treat directory pages, agency indexes, and site indexes as discovery aids, not as evidence for mission status, timelines, crew, or outcomes.',
       'I must only make precise current-status, crew, launch, landing, return, or schedule claims that the retrieved evidence explicitly supports.',
       'If the user asks for people, crew, pilot, commander, or names, I must list only names and roles explicitly present in the retrieved sources.',

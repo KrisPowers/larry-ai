@@ -97,7 +97,7 @@ export function ChatComposer({
     const element = resolvedTextareaRef.current;
     if (!element) return;
     element.style.height = '0px';
-    element.style.height = `${Math.min(Math.max(element.scrollHeight, 54), 140)}px`;
+    element.style.height = `${Math.min(Math.max(element.scrollHeight, 35), 35)}px`;
   }, [resolvedTextareaRef, value]);
 
   useEffect(() => {
@@ -271,7 +271,7 @@ export function ChatComposer({
                 </span>
               </span>
               <span className="chatbar-model-chevron">
-                <IconChevronDown size={14} />
+                <IconChevronDown size={18} />
               </span>
             </button>
 
@@ -302,7 +302,7 @@ export function ChatComposer({
                         }}
                       >
                         <span className="chatbar-menu-item-main">
-                          {option ? <ProviderIcon provider={provider} size={18} className="chatbar-provider-icon" /> : null}
+                          {option ? <ProviderIcon provider={provider} size={24} className="chatbar-provider-icon" /> : null}
                           <span className="chatbar-menu-item-copy">
                             <strong>{label}</strong>
                             <span>{description}</span>

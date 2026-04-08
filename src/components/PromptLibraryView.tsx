@@ -35,6 +35,8 @@ interface Props {
   chats: ChatRecord[];
   folders: ProjectFolder[];
   defaultModel: string;
+  defaultChatPreset: string;
+  defaultReasoningEffort: ChatReasoningEffort;
   models?: string[];
   embedded?: boolean;
   chatLaunchTransition?: {
@@ -139,18 +141,17 @@ const ROUTE_LAUNCHERS = [
 
 const CHAT_START_PRESETS = PRESETS.filter((preset) => preset.id !== 'code');
 const CHAT_STARTER_PLACEHOLDER = "Ask anything... paste a URL and it'll be fetched automatically. Shift+Enter for newline.";
-const DEFAULT_REASONING_EFFORT: ChatReasoningEffort = 'balanced';
 const REASONING_EFFORT_OPTIONS: Array<{ value: ChatReasoningEffort; label: string }> = [
   { value: 'light', label: 'Low' },
   { value: 'balanced', label: 'Balanced' },
   { value: 'high', label: 'High' },
   { value: 'extra-high', label: 'Extra High' },
 ];
-const REASONING_EFFORT_CONFIG: Record<ChatReasoningEffort, { label: string; fetchDepth: 'standard' | 'deep'; minLiveSources: number }> = {
-  light: { label: 'Low', fetchDepth: 'standard', minLiveSources: 3 },
-  balanced: { label: 'Balanced', fetchDepth: 'standard', minLiveSources: 3 },
-  high: { label: 'High', fetchDepth: 'deep', minLiveSources: 4 },
-  'extra-high': { label: 'Extra High', fetchDepth: 'deep', minLiveSources: 5 },
+const REASONING_EFFORT_CONFIG: Record<ChatReasoningEffort, { label: string; fetchDepth: 'standard' | 'deep'; maxSources: number; minLiveSources: number }> = {
+  light: { label: 'Low', fetchDepth: 'standard', maxSources: 10, minLiveSources: 4 },
+  balanced: { label: 'Balanced', fetchDepth: 'standard', maxSources: 12, minLiveSources: 5 },
+  high: { label: 'High', fetchDepth: 'deep', maxSources: 14, minLiveSources: 6 },
+  'extra-high': { label: 'Extra High', fetchDepth: 'deep', maxSources: 15, minLiveSources: 8 },
 };
 
 function describeChatPreset(presetId: string): string {
@@ -198,6 +199,8 @@ export function PromptLibraryView({
   chats,
   folders,
   defaultModel,
+  defaultChatPreset,
+  defaultReasoningEffort,
   models = [],
   embedded = false,
   chatLaunchTransition,
@@ -218,8 +221,8 @@ export function PromptLibraryView({
   const [presetPickerOpen, setPresetPickerOpen] = useState(false);
   const [reasoningPickerOpen, setReasoningPickerOpen] = useState(false);
   const [selectedChatModel, setSelectedChatModel] = useState(defaultModel || models[0] || '');
-  const [selectedChatPreset, setSelectedChatPreset] = useState('auto-chat');
-  const [selectedChatReasoningEffort, setSelectedChatReasoningEffort] = useState<ChatReasoningEffort>(DEFAULT_REASONING_EFFORT);
+  const [selectedChatPreset, setSelectedChatPreset] = useState(defaultChatPreset);
+  const [selectedChatReasoningEffort, setSelectedChatReasoningEffort] = useState<ChatReasoningEffort>(defaultReasoningEffort);
   const [attachedChatFiles, setAttachedChatFiles] = useState<ImportableAttachment[]>([]);
   const modelPickerRef = useRef<HTMLDivElement>(null);
   const presetPickerRef = useRef<HTMLDivElement>(null);
@@ -241,6 +244,18 @@ export function PromptLibraryView({
     setSelectedWorkspaceId(workspaceOptions[0]?.id ?? '');
   }, [definition?.requiresWorkspace, selectedWorkspaceId, workspaceOptions]);
 
+  useEffect(() => {
+    setSelectedChatModel(defaultModel || models[0] || '');
+  }, [defaultModel, models]);
+
+  useEffect(() => {
+    setSelectedChatPreset(defaultChatPreset);
+  }, [defaultChatPreset]);
+
+  useEffect(() => {
+    setSelectedChatReasoningEffort(defaultReasoningEffort);
+  }, [defaultReasoningEffort]);
+
   const stageOpacity = showLibrary ? Math.max(0.24, 1 - scrollTop / 320) : 1;
   const stageTranslate = showLibrary ? Math.min(44, scrollTop / 8) : 0;
   const stageScale = showLibrary ? Math.max(0.97, 1 - scrollTop / 2400) : 1;
@@ -256,7 +271,7 @@ export function PromptLibraryView({
     return {
       value: option.value,
       label: option.label,
-      description: `${optionConfig.minLiveSources} live source${optionConfig.minLiveSources === 1 ? '' : 's'} minimum with a ${optionConfig.fetchDepth === 'deep' ? 'deep' : 'standard'} comparison pass.`,
+      description: `Targets ${optionConfig.maxSources} live sources with a ${optionConfig.fetchDepth === 'deep' ? 'deep' : 'standard'} comparison pass; requires at least ${optionConfig.minLiveSources} verified source${optionConfig.minLiveSources === 1 ? '' : 's'}.`,
     };
   });
   const composerPresetOptions = CHAT_START_PRESETS.map<ChatComposerOption>((preset) => ({

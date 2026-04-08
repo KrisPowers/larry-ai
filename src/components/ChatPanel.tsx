@@ -4,7 +4,7 @@ import { ChatComposer, type ChatComposerOption } from './ChatComposer';
 import { MessageBubble } from './MessageBubble';
 import { FileRegistryPanel } from './FileRegistryPanel';
 import { ChecklistIndicator } from './ChecklistIndicator';
-import { resolveModelHandle, streamChat } from '../lib/ollama';
+import { getModelProvider, resolveModelHandle, streamChat } from '../lib/ollama';
 import { classifyRequest, resolvePackageVersions, planRequest, buildStepUserMessage, getStepExecutorSystem, buildSummaryUserMessage, getSummarySystem, packageVersionsToSystemInject } from '../lib/deepPlanner';
 import type { DeepStep, PackageVersion } from '../lib/deepPlanner';
 import { registryToSystemPrompt, updateRegistry } from '../lib/fileRegistry';
@@ -41,6 +41,10 @@ interface Props {
 }
 
 const activeLaunchPromptRuns = new Set<string>();
+const MESSAGE_OVERSCAN_PX = 640;
+const MESSAGE_STACK_GAP_PX = 12;
+const STICKY_SCROLL_THRESHOLD_PX = 96;
+const MESSAGE_WHEEL_DAMPING = 0.72;
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -87,6 +91,41 @@ function trimPromptLead(text: string): string {
     .trim();
 
   return cleaned || cleanTitleSource(text);
+}
+
+function isLikelyConnectivityError(message: string): boolean {
+  return /(failed to fetch|fetch failed|networkerror|network error|timed out|timeout|econnrefused|unable to connect|connection refused)/i.test(message);
+}
+
+function buildModelErrorHelp(model: string, message: string): string {
+  const provider = getModelProvider(model);
+
+  if (provider === 'ollama') {
+    if (/requires more system memory/i.test(message)) {
+      return 'Ollama is reachable, but the selected model cannot load with the memory currently available. Free RAM, switch to a smaller quantization, or pick a smaller model before retrying.';
+    }
+
+    if (isLikelyConnectivityError(message)) {
+      return [
+        'Make sure Ollama is running and that the configured endpoint is correct:',
+        '```bash',
+        'OLLAMA_ORIGINS=* ollama serve',
+        '```',
+      ].join('\n');
+    }
+
+    return 'Ollama is reachable and returned the error above. Check the selected model and Ollama runtime resources before retrying.';
+  }
+
+  if (provider === 'openai') {
+    return 'Check the saved OpenAI API key, model access, and any quota or permission limits for this request.';
+  }
+
+  if (provider === 'anthropic') {
+    return 'Check the saved Anthropic API key, model access, and any quota or permission limits for this request.';
+  }
+
+  return '';
 }
 
 function trimReplyLead(text: string): string {
@@ -266,8 +305,8 @@ const REASONING_EFFORT_CONFIG: Record<ChatReasoningEffort, {
   light: {
     label: 'Low',
     fetchDepth: 'standard',
-    maxSources: 6,
-    minLiveSources: 3,
+    maxSources: 10,
+    minLiveSources: 4,
     paragraphGuidance: 'Keep the answer compact: usually 1 to 2 tight paragraphs or a short list when that is clearer.',
     citationGuidance: 'Reference the strongest supporting source directly only when it materially helps the answer.',
     comparisonGuidance: 'Note major contradictions only when they materially change the conclusion.',
@@ -275,8 +314,8 @@ const REASONING_EFFORT_CONFIG: Record<ChatReasoningEffort, {
   balanced: {
     label: 'Balanced',
     fetchDepth: 'standard',
-    maxSources: 8,
-    minLiveSources: 3,
+    maxSources: 12,
+    minLiveSources: 5,
     paragraphGuidance: 'Give a clear medium-depth answer: usually 2 to 3 compact paragraphs unless the user asked for more.',
     citationGuidance: 'Name the strongest supporting sources in the reply when the answer depends on fresh evidence.',
     comparisonGuidance: 'Call out important agreement or disagreement across sources without turning the answer into a report.',
@@ -284,8 +323,8 @@ const REASONING_EFFORT_CONFIG: Record<ChatReasoningEffort, {
   high: {
     label: 'High',
     fetchDepth: 'deep',
-    maxSources: 10,
-    minLiveSources: 4,
+    maxSources: 14,
+    minLiveSources: 6,
     paragraphGuidance: 'Give a more complete answer: usually 3 to 5 information-dense paragraphs with concrete dates and implications.',
     citationGuidance: 'Reference the strongest sources directly in the reply and use corroborated details before making precise claims.',
     comparisonGuidance: 'Compare the retrieved sources before answering. Emphasize where the reporting aligns, then explain any material disagreement plainly.',
@@ -293,8 +332,8 @@ const REASONING_EFFORT_CONFIG: Record<ChatReasoningEffort, {
   'extra-high': {
     label: 'Extra High',
     fetchDepth: 'deep',
-    maxSources: 12,
-    minLiveSources: 5,
+    maxSources: 15,
+    minLiveSources: 8,
     paragraphGuidance: 'Give a thorough answer: usually 4 to 6 full paragraphs unless the user explicitly wants a short reply.',
     citationGuidance: 'Directly attribute the main status claims to the strongest sources, and prefer facts repeated across multiple independent sources.',
     comparisonGuidance: 'Actively compare source overlap and source conflict. Surface similarities first, then explain opposing reporting and which version looks newest or best supported.',
@@ -323,6 +362,7 @@ function buildReasoningEffortInject(options: {
   effort: ChatReasoningEffort;
   fetchLiveContext: boolean;
   requiredLiveSourceCount: number;
+  targetLiveSourceCount: number;
 }): string {
   const config = REASONING_EFFORT_CONFIG[options.effort];
   const lines = [
@@ -339,6 +379,7 @@ function buildReasoningEffortInject(options: {
 
   if (options.fetchLiveContext) {
     lines.push(
+      `- Aim to compare roughly ${options.targetLiveSourceCount} live source${options.targetLiveSourceCount === 1 ? '' : 's'} for freshness-sensitive replies when retrieval can support it.`,
       `- When live research is active, do not rely on a single page or a single outlet. Use at least ${options.requiredLiveSourceCount} verified live source${options.requiredLiveSourceCount === 1 ? '' : 's'} before making current factual claims.`,
       '- Prefer the facts repeated across multiple independent sources, especially when official reporting and major news coverage align.',
       '- If sources materially disagree, say that directly and explain which version appears better supported by freshness, specificity, and corroboration.',
@@ -781,6 +822,42 @@ function snapshotTrace(trace: ResponseTrace, completedAt?: number): ResponseTrac
   };
 }
 
+function estimateMessageHeight(
+  message: Message,
+  hideCodeBlocks: boolean,
+  trailingGapPx: number,
+): number {
+  if (message.role === 'assistant' && hideCodeBlocks) {
+    return 248 + trailingGapPx;
+  }
+
+  const newlineCount = (message.content.match(/\n/g)?.length ?? 0) + 1;
+  const codeFenceCount = Math.floor((message.content.match(/```/g)?.length ?? 0) / 2);
+  const sampledLength = Math.min(message.content.length, 4_000);
+  const baseHeight = message.role === 'assistant' ? 132 : 88;
+  const lengthHeight = Math.ceil(sampledLength / 110) * (message.role === 'assistant' ? 16 : 11);
+  const lineHeight = Math.min(newlineCount, 42) * 4;
+  const codeHeight = Math.min(180, codeFenceCount * 64);
+  const minimumHeight = message.role === 'assistant' ? 172 : 104;
+  const estimatedHeight = baseHeight + lengthHeight + lineHeight + codeHeight;
+
+  return Math.max(minimumHeight + trailingGapPx, Math.min(760, estimatedHeight + trailingGapPx));
+}
+
+function normalizeWheelDelta(event: WheelEvent, viewport: HTMLDivElement): number {
+  if (event.deltaMode === WheelEvent.DOM_DELTA_LINE) {
+    const computedLineHeight = Number.parseFloat(window.getComputedStyle(viewport).lineHeight);
+    const lineHeight = Number.isFinite(computedLineHeight) ? computedLineHeight : 16;
+    return event.deltaY * lineHeight;
+  }
+
+  if (event.deltaMode === WheelEvent.DOM_DELTA_PAGE) {
+    return event.deltaY * viewport.clientHeight;
+  }
+
+  return event.deltaY;
+}
+
 export function ChatPanel({
   panel,
   models,
@@ -795,9 +872,9 @@ export function ChatPanel({
   onConsumeLaunchPrompt,
 }: Props) {
   const { replyPreferences, saveReplyPreference, removeReplyPreference } = useReplyPreferences();
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-  const inputRef       = useRef<HTMLTextAreaElement>(null);
-  const abortRef       = useRef<AbortController | null>(null);
+  const messagesViewportRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
   const latestTitleRef = useRef(panel.title);
   const autoTitleRef = useRef<string | null>(null);
   const responseTimingRef = useRef<{
@@ -807,19 +884,129 @@ export function ChatPanel({
     firstTokenPerf?: number;
   } | null>(null);
   const visibleReplyContentRef = useRef('');
+  const rowElementsRef = useRef<Map<number, HTMLDivElement>>(new Map());
+  const rowSeenRef = useRef<Set<number>>(new Set());
+  const rowHeightsRef = useRef<Map<number, number>>(new Map());
+  const rowResizeObserversRef = useRef<Map<number, ResizeObserver>>(new Map());
+  const visibilityObserverRef = useRef<IntersectionObserver | null>(null);
+  const scrollFrameRef = useRef<number | null>(null);
+  const scrollTopRef = useRef(0);
+  const stickToBottomRef = useRef(true);
+  const scrollDirectionRef = useRef<'up' | 'down'>('down');
   const [inputValue, setInputValue] = useState('');
   const [liveResponseMs, setLiveResponseMs] = useState<number | null>(null);
   const [liveReplyLatencyMs, setLiveReplyLatencyMs] = useState<number | null>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(0);
+  const [measurementVersion, setMeasurementVersion] = useState(0);
 
   const [checklistSteps,       setChecklistSteps]       = useState<DeepStep[]>([]);
   const [checklistCurrentStep, setChecklistCurrentStep] = useState(0);
   const [checklistPlanning,    setChecklistPlanning]     = useState(false);
   const [checklistClassifying, setChecklistClassifying] = useState(false);
   const [checklistMode,        setChecklistMode]        = useState<import('../lib/deepPlanner').RequestMode | undefined>();
+  const hasMessages = panel.messages.length > 0;
 
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [panel.messages, panel.streamingContent]);
+  function disconnectResizeObservers() {
+    for (const observer of rowResizeObserversRef.current.values()) {
+      observer.disconnect();
+    }
+    rowResizeObserversRef.current.clear();
+  }
+
+  function disconnectVisibilityObserver() {
+    visibilityObserverRef.current?.disconnect();
+    visibilityObserverRef.current = null;
+  }
+
+  function disconnectVirtualObservers() {
+    disconnectResizeObservers();
+    disconnectVisibilityObserver();
+    rowElementsRef.current.clear();
+  }
+
+  function scrollMessagesToEnd(behavior: ScrollBehavior = 'auto') {
+    const viewport = messagesViewportRef.current;
+    if (!viewport) return;
+    stickToBottomRef.current = true;
+    viewport.scrollTo({
+      top: viewport.scrollHeight,
+      behavior,
+    });
+  }
+
+  function syncViewportMetrics() {
+    const viewport = messagesViewportRef.current;
+    if (!viewport) return;
+
+    const nextScrollTop = viewport.scrollTop;
+    const previousScrollTop = scrollTopRef.current;
+
+    if (nextScrollTop < previousScrollTop) {
+      scrollDirectionRef.current = 'up';
+    } else if (nextScrollTop > previousScrollTop) {
+      scrollDirectionRef.current = 'down';
+    }
+
+    scrollTopRef.current = nextScrollTop;
+    stickToBottomRef.current =
+      viewport.scrollHeight - (nextScrollTop + viewport.clientHeight) <= STICKY_SCROLL_THRESHOLD_PX;
+    setScrollTop(nextScrollTop);
+    setViewportHeight(viewport.clientHeight);
+  }
+
+  function handleVirtualRowRef(index: number, node: HTMLDivElement | null) {
+    const previousNode = rowElementsRef.current.get(index);
+    if (previousNode && previousNode !== node) {
+      visibilityObserverRef.current?.unobserve(previousNode);
+    }
+
+    const resizeObservers = rowResizeObserversRef.current;
+    resizeObservers.get(index)?.disconnect();
+    resizeObservers.delete(index);
+    rowElementsRef.current.delete(index);
+
+    if (!node) return;
+
+    rowElementsRef.current.set(index, node);
+    node.dataset.rowIndex = String(index);
+    node.dataset.enter = scrollDirectionRef.current;
+    if (rowSeenRef.current.has(index)) {
+      node.classList.add('is-visible');
+    } else {
+      node.classList.remove('is-visible');
+    }
+
+    const measure = () => {
+      const nextHeight = Math.ceil(node.getBoundingClientRect().height);
+      const previousHeight = rowHeightsRef.current.get(index);
+
+      if (!nextHeight || previousHeight === nextHeight) return;
+
+      rowHeightsRef.current.set(index, nextHeight);
+      setMeasurementVersion((version) => version + 1);
+    };
+
+    measure();
+
+    if (typeof ResizeObserver !== 'undefined') {
+      const resizeObserver = new ResizeObserver(() => {
+        measure();
+      });
+      resizeObserver.observe(node);
+      resizeObservers.set(index, resizeObserver);
+    }
+
+    if (typeof IntersectionObserver === 'undefined') {
+      node.classList.add('is-visible');
+      rowSeenRef.current.add(index);
+      return;
+    }
+
+    if (!rowSeenRef.current.has(index)) {
+      visibilityObserverRef.current?.observe(node);
+    }
+  }
 
   useEffect(() => {
     latestTitleRef.current = panel.title;
@@ -828,6 +1015,177 @@ export function ChatPanel({
   useEffect(() => {
     autoTitleRef.current = null;
   }, [panel.id]);
+
+  useEffect(() => {
+    rowHeightsRef.current.clear();
+    rowSeenRef.current.clear();
+    disconnectVirtualObservers();
+    scrollTopRef.current = 0;
+    stickToBottomRef.current = true;
+    scrollDirectionRef.current = 'down';
+    setScrollTop(0);
+    setViewportHeight(messagesViewportRef.current?.clientHeight ?? 0);
+    setMeasurementVersion(0);
+  }, [panel.id]);
+
+  useEffect(() => {
+    const resizeObservers = rowResizeObserversRef.current;
+    const heights = rowHeightsRef.current;
+
+    for (const index of [...resizeObservers.keys()]) {
+      if (index < panel.messages.length) continue;
+      resizeObservers.get(index)?.disconnect();
+      resizeObservers.delete(index);
+    }
+
+    for (const index of [...rowElementsRef.current.keys()]) {
+      if (index < panel.messages.length) continue;
+      const node = rowElementsRef.current.get(index);
+      if (node) {
+        visibilityObserverRef.current?.unobserve(node);
+      }
+      rowElementsRef.current.delete(index);
+    }
+
+    for (const index of [...heights.keys()]) {
+      if (index < panel.messages.length) continue;
+      heights.delete(index);
+    }
+
+    for (const index of [...rowSeenRef.current.values()]) {
+      if (index < panel.messages.length) continue;
+      rowSeenRef.current.delete(index);
+    }
+  }, [panel.messages.length]);
+
+  useEffect(() => {
+    const viewport = messagesViewportRef.current;
+    if (!viewport) return undefined;
+
+    const queueSync = () => {
+      if (scrollFrameRef.current != null) return;
+
+      scrollFrameRef.current = window.requestAnimationFrame(() => {
+        scrollFrameRef.current = null;
+        syncViewportMetrics();
+      });
+    };
+
+    syncViewportMetrics();
+
+    const handleScroll = () => {
+      queueSync();
+    };
+
+    const handleWheel = (event: WheelEvent) => {
+      if (event.ctrlKey || event.shiftKey) return;
+      if (Math.abs(event.deltaX) > Math.abs(event.deltaY)) return;
+      if (viewport.scrollHeight <= viewport.clientHeight) return;
+
+      const normalizedDelta = normalizeWheelDelta(event, viewport);
+      if (normalizedDelta === 0) return;
+
+      event.preventDefault();
+      viewport.scrollTop += normalizedDelta * MESSAGE_WHEEL_DAMPING;
+      queueSync();
+    };
+
+    viewport.addEventListener('scroll', handleScroll, { passive: true });
+    viewport.addEventListener('wheel', handleWheel, { passive: false });
+
+    if (typeof IntersectionObserver !== 'undefined') {
+      visibilityObserverRef.current = new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+          const target = entry.target as HTMLDivElement;
+
+          if (entry.isIntersecting) {
+            target.dataset.enter = scrollDirectionRef.current;
+            target.classList.add('is-visible');
+            const rowIndex = Number(target.dataset.rowIndex);
+            if (Number.isFinite(rowIndex)) {
+              rowSeenRef.current.add(rowIndex);
+            }
+            visibilityObserverRef.current?.unobserve(target);
+          }
+        }
+      }, {
+        root: viewport,
+        threshold: 0,
+      });
+
+      for (const node of rowElementsRef.current.values()) {
+        visibilityObserverRef.current.observe(node);
+      }
+    }
+
+    let resizeObserver: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined') {
+      resizeObserver = new ResizeObserver(() => {
+        queueSync();
+      });
+      resizeObserver.observe(viewport);
+    }
+
+    return () => {
+      viewport.removeEventListener('scroll', handleScroll);
+      viewport.removeEventListener('wheel', handleWheel);
+      disconnectVisibilityObserver();
+      resizeObserver?.disconnect();
+      if (scrollFrameRef.current != null) {
+        window.cancelAnimationFrame(scrollFrameRef.current);
+        scrollFrameRef.current = null;
+      }
+    };
+  }, [panel.id]);
+
+  useEffect(() => {
+    return () => {
+      disconnectVirtualObservers();
+      if (scrollFrameRef.current != null) {
+        window.cancelAnimationFrame(scrollFrameRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!hasMessages && !panel.streaming) return;
+
+    const frame = window.requestAnimationFrame(() => {
+      scrollMessagesToEnd('auto');
+    });
+
+    return () => window.cancelAnimationFrame(frame);
+  }, [hasMessages, panel.id, panel.streaming]);
+
+  useEffect(() => {
+    if (!stickToBottomRef.current || !hasMessages) return;
+
+    const frame = window.requestAnimationFrame(() => {
+      scrollMessagesToEnd('smooth');
+    });
+
+    return () => window.cancelAnimationFrame(frame);
+  }, [hasMessages, panel.messages.length]);
+
+  useEffect(() => {
+    if (!stickToBottomRef.current || !panel.streamingContent) return;
+
+    const frame = window.requestAnimationFrame(() => {
+      scrollMessagesToEnd('auto');
+    });
+
+    return () => window.cancelAnimationFrame(frame);
+  }, [panel.streamingContent]);
+
+  useEffect(() => {
+    if (!stickToBottomRef.current || (!hasMessages && !panel.streaming)) return;
+
+    const frame = window.requestAnimationFrame(() => {
+      scrollMessagesToEnd('auto');
+    });
+
+    return () => window.cancelAnimationFrame(frame);
+  }, [hasMessages, measurementVersion, panel.streaming]);
 
   useEffect(() => {
     if (!panel.streaming) {
@@ -1134,6 +1492,7 @@ export function ChatPanel({
         effort: reasoningEffort,
         fetchLiveContext,
         requiredLiveSourceCount,
+        targetLiveSourceCount: reasoningConfig.maxSources,
       });
       const liveResearchFallbackInject = fetchLiveContext && globalContexts.length === 0
         ? [
@@ -1709,9 +2068,13 @@ export function ChatPanel({
         }
       } else {
         trace.orchestrationSummary = `The reply pipeline failed before completion while using ${modelName}.`;
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        const errorHelp = buildModelErrorHelp(modelName, errorMessage);
         const errMsg: Message = {
           role: 'assistant',
-          content: `Error: ${(err as Error).message}\n\nMake sure Ollama is running:\n\`\`\`bash\nOLLAMA_ORIGINS=* ollama serve\n\`\`\``,
+          content: errorHelp
+            ? `Error: ${errorMessage}\n\n${errorHelp}`
+            : `Error: ${errorMessage}`,
           responseTimeMs,
           responseFirstTokenMs,
           responseStartedAt: timing?.startedAt,
@@ -1816,13 +2179,52 @@ export function ChatPanel({
     return {
       value: option.value,
       label: option.label,
-      description: `${optionConfig.minLiveSources} live source${optionConfig.minLiveSources === 1 ? '' : 's'} minimum with a ${optionConfig.fetchDepth === 'deep' ? 'deep' : 'standard'} comparison pass.`,
+      description: `Targets ${optionConfig.maxSources} live sources with a ${optionConfig.fetchDepth === 'deep' ? 'deep' : 'standard'} comparison pass; requires at least ${optionConfig.minLiveSources} verified source${optionConfig.minLiveSources === 1 ? '' : 's'}.`,
     };
   });
   const isCodeStreaming = panel.streaming && currentPreset === 'code';
-  const hasMessages     = panel.messages.length > 0;
   const inputPlaceholder =
     "Ask anything... paste a URL and it'll be fetched automatically. Shift+Enter for newline.";
+  const messageOffsets = new Array<number>(panel.messages.length);
+  const messageHeights = new Array<number>(panel.messages.length);
+  let totalVirtualHeight = 0;
+
+  for (let index = 0; index < panel.messages.length; index += 1) {
+    const message = panel.messages[index];
+    const trailingGapPx = index === panel.messages.length - 1 ? 0 : MESSAGE_STACK_GAP_PX;
+    const hideCodeBlocks = message.role === 'assistant' && currentPreset === 'code';
+    const measuredHeight = rowHeightsRef.current.get(index);
+    const nextHeight = measuredHeight ?? estimateMessageHeight(message, hideCodeBlocks, trailingGapPx);
+
+    messageOffsets[index] = totalVirtualHeight;
+    messageHeights[index] = nextHeight;
+    totalVirtualHeight += nextHeight;
+  }
+
+  let virtualStartIndex = 0;
+  let virtualEndIndex = -1;
+
+  if (hasMessages) {
+    const renderTop = Math.max(0, scrollTop - MESSAGE_OVERSCAN_PX);
+    const renderBottom = scrollTop + Math.max(viewportHeight, 1) + MESSAGE_OVERSCAN_PX;
+
+    while (
+      virtualStartIndex < panel.messages.length
+      && messageOffsets[virtualStartIndex] + messageHeights[virtualStartIndex] < renderTop
+    ) {
+      virtualStartIndex += 1;
+    }
+
+    let endCursor = virtualStartIndex;
+    while (endCursor < panel.messages.length && messageOffsets[endCursor] < renderBottom) {
+      endCursor += 1;
+    }
+
+    virtualEndIndex = Math.min(
+      panel.messages.length - 1,
+      Math.max(endCursor - 1, virtualStartIndex + 5),
+    );
+  }
 
   return (
     <div
@@ -1855,7 +2257,7 @@ export function ChatPanel({
         </button>
       </div>
 
-      <div className="messages">
+      <div className="messages" ref={messagesViewportRef}>
         {!hasMessages && !panel.streaming ? (
           <div className="empty-state">
             <div className="empty-state-icon"><IconHexagon size={52} /></div>
@@ -1863,35 +2265,50 @@ export function ChatPanel({
             <p>Ask me to write code, generate docs, or debug anything.</p>
           </div>
         ) : (
-          <>
-            {panel.messages.map((msg, i) => {
-              const isCodeAssistant = msg.role === 'assistant' && currentPreset === 'code';
-              const replyPreferenceDraft = msg.role === 'assistant'
-                ? buildReplyPreferenceEntry({
-                    chatId: panel.id,
-                    chatTitle: panel.title,
-                    assistantMessage: msg,
-                    assistantIndex: i,
-                    messages: panel.messages,
-                    panel,
-                    feedback: 'liked',
-                  })
-                : null;
-              return (
-                <MessageBubble
-                  key={i}
-                  message={msg}
-                  withDownload={true}
-                  prevRegistry={panel.prevRegistry}
-                  model={panel.model}
-                  showDeveloperTools={showDeveloperTools}
-                  feedbackValue={replyPreferenceDraft ? replyPreferenceFeedbackById.get(replyPreferenceDraft.id) ?? null : null}
-                  onFeedbackChange={replyPreferenceDraft ? (next) => handleReplyFeedbackChange(msg, i, next) : undefined}
-                  hideCodeBlocks={isCodeAssistant}
-                  suppressNoCodeWarning={currentPreset !== 'code'}
-                />
-              );
-            })}
+          <div className="messages-stack">
+            {hasMessages && (
+              <div className="messages-virtual-stage" style={{ height: `${totalVirtualHeight}px` }}>
+                {panel.messages.slice(virtualStartIndex, virtualEndIndex + 1).map((msg, localIndex) => {
+                  const actualIndex = virtualStartIndex + localIndex;
+                  const isCodeAssistant = msg.role === 'assistant' && currentPreset === 'code';
+                  const replyPreferenceDraft = msg.role === 'assistant'
+                    ? buildReplyPreferenceEntry({
+                        chatId: panel.id,
+                        chatTitle: panel.title,
+                        assistantMessage: msg,
+                        assistantIndex: actualIndex,
+                        messages: panel.messages,
+                        panel,
+                        feedback: 'liked',
+                      })
+                    : null;
+                  return (
+                    <div
+                      key={actualIndex}
+                      className="message-virtual-row"
+                      style={{ top: `${messageOffsets[actualIndex]}px` }}
+                    >
+                      <div
+                        ref={(node) => handleVirtualRowRef(actualIndex, node)}
+                        className={`message-virtual-row-shell${actualIndex === panel.messages.length - 1 ? ' is-last' : ''}`}
+                      >
+                        <MessageBubble
+                          message={msg}
+                          withDownload={true}
+                          prevRegistry={panel.prevRegistry}
+                          model={panel.model}
+                          showDeveloperTools={showDeveloperTools}
+                          feedbackValue={replyPreferenceDraft ? replyPreferenceFeedbackById.get(replyPreferenceDraft.id) ?? null : null}
+                          onFeedbackChange={replyPreferenceDraft ? (next) => handleReplyFeedbackChange(msg, actualIndex, next) : undefined}
+                          hideCodeBlocks={isCodeAssistant}
+                          suppressNoCodeWarning={currentPreset !== 'code'}
+                        />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
 
             {panel.streaming && (
               <>
@@ -1939,9 +2356,8 @@ export function ChatPanel({
                 ) : null}
               </>
             )}
-          </>
+          </div>
         )}
-        <div ref={messagesEndRef} />
       </div>
 
       <FileRegistryPanel registry={panel.fileRegistry} chatTitle={panel.title} />

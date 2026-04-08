@@ -15,6 +15,7 @@ export interface ChatWorkflowDecision {
 
 const NOTE_TAKING_RE = /\b(note\s*taking|notetaking|notes?|meeting minutes|minutes|action items?|takeaways|outline|study notes|lecture notes|organize these notes|turn this into notes|bullet points?)\b/i;
 const RESEARCH_RE = /\b(latest|current|recent|today|now|timeline|plan|roadmap|status|announced|reported|reporting|sources?|what's going on|what is going on|investigate|research|verify|confirm|accurate|evidence|brief me)\b/i;
+const NEWS_RE = /\b(news|headline|headlines|coverage|announce|announced|announcement|partnership|partnerships|partnered|partnering|deal|deals|agreement|agreements|collaboration|collaborations|acquisition|acquired|merger|funding|investment|launch|launched|release|released|unveil|unveiled)\b/i;
 const FACTUAL_DOMAIN_RE = /\b(nasa|moon|space|mission|government|election|economy|policy|ceo|company|market|war|conflict|science|study|launch|agency|official)\b/i;
 const CREATIVE_RE = /\b(write a story|poem|lyrics|fiction|roleplay|brainstorm names|tagline|copy ideas|creative)\b/i;
 const EXPLICIT_DEEP_RESEARCH_RE = /\b(deep research|deep dive|investigate|investigation|exhaustive|comprehensive|thorough|full context|full report|detailed breakdown|detailed analysis|cross-check|source disagreement|verify carefully|evidence-backed breakdown)\b/i;
@@ -43,12 +44,14 @@ export function classifyChatWorkflow(
   const cleanPrompt = normalise(prompt);
   const questionCount = (cleanPrompt.match(/\?/g) ?? []).length;
   const currentResearchCueCount = countMatches(cleanPrompt, RESEARCH_RE);
+  const newsCueCount = countMatches(cleanPrompt, NEWS_RE);
   const explicitDeepResearch = EXPLICIT_DEEP_RESEARCH_RE.test(cleanPrompt);
   const noteScore =
     (NOTE_TAKING_RE.test(combined) ? 4 : 0) +
     (/\b(summarize|summarise|organize|capture|convert)\b/i.test(combined) ? 2 : 0);
   const researchScore =
     (RESEARCH_RE.test(combined) ? 4 : 0) +
+    (NEWS_RE.test(combined) ? 2 : 0) +
     (FACTUAL_DOMAIN_RE.test(combined) ? 2 : 0) +
     (questionCount >= 2 ? 2 : questionCount === 1 ? 1 : 0) +
     (cleanPrompt.length >= 120 ? 1 : 0);
@@ -146,18 +149,22 @@ export function classifyChatWorkflow(
 
   if (
     currentResearchCueCount > 0 ||
+    newsCueCount > 0 ||
     (FACTUAL_DOMAIN_RE.test(cleanPrompt) && questionCount >= 1) ||
     /\b(who|what|when|where|which|timeline|status|plan|crew|astronaut|names?)\b/i.test(cleanPrompt)
   ) {
+    const newsDrivenLookup = newsCueCount > 0 || /\bjust\b/i.test(cleanPrompt);
     return {
       mode: 'conversation',
       confidence: researchScore >= 6 ? 'high' : 'medium',
       effectivePresetId: 'chatbot',
-      fetchDepth: 'standard',
+      fetchDepth: newsDrivenLookup ? 'deep' : 'standard',
       forceFetch: true,
       minParagraphs: 0,
       minSentencesPerParagraph: 0,
-      summary: 'Detected a current factual lookup that should use live retrieval but stay concise and clear.',
+      summary: newsDrivenLookup
+        ? 'Detected a news-style lookup that should use a deeper live retrieval pass while keeping the final answer concise.'
+        : 'Detected a current factual lookup that should use live retrieval but stay concise and clear.',
     };
   }
 

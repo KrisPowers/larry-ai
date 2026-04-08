@@ -14,6 +14,7 @@ import chatbotPrompt  from '../presets/chatbot.md?raw';
 import creativePrompt from '../presets/creative.md?raw';
 import deepResearchPrompt from '../presets/deep-research.md?raw';
 import noteTakingPrompt from '../presets/note-taking.md?raw';
+import { appendSharedResponseStylePrompt } from './responseStyle';
 
 export interface Preset {
   id: string;
@@ -23,12 +24,12 @@ export interface Preset {
 }
 
 export const PRESETS: Preset[] = [
-  { id: 'code',     label: 'Code',     icon: 'code',     systemPrompt: codePrompt },
-  { id: 'auto-chat', label: 'Auto',    icon: 'chatbot',  systemPrompt: autoChatPrompt },
-  { id: 'chatbot',  label: 'Chatbot',  icon: 'chatbot',  systemPrompt: chatbotPrompt },
-  { id: 'deep-research', label: 'Deep Research', icon: 'chatbot', systemPrompt: deepResearchPrompt },
-  { id: 'note-taking', label: 'Note Taking', icon: 'chatbot', systemPrompt: noteTakingPrompt },
-  { id: 'creative', label: 'Creative', icon: 'creative', systemPrompt: creativePrompt },
+  { id: 'code',     label: 'Code',     icon: 'code',     systemPrompt: appendSharedResponseStylePrompt(codePrompt) },
+  { id: 'auto-chat', label: 'Auto',    icon: 'chatbot',  systemPrompt: appendSharedResponseStylePrompt(autoChatPrompt) },
+  { id: 'chatbot',  label: 'Chatbot',  icon: 'chatbot',  systemPrompt: appendSharedResponseStylePrompt(chatbotPrompt) },
+  { id: 'deep-research', label: 'Deep Research', icon: 'chatbot', systemPrompt: appendSharedResponseStylePrompt(deepResearchPrompt) },
+  { id: 'note-taking', label: 'Note Taking', icon: 'chatbot', systemPrompt: appendSharedResponseStylePrompt(noteTakingPrompt) },
+  { id: 'creative', label: 'Creative', icon: 'creative', systemPrompt: appendSharedResponseStylePrompt(creativePrompt) },
 ];
 
 export const DEFAULT_PRESET_ID = 'auto-chat';

@@ -11,34 +11,47 @@ import { createRegistry, updateRegistry } from './lib/fileRegistry';
 import { mergeStoredFileEntries } from './lib/chatAttachments';
 import { runDeepResearchSearchEngineTest } from './lib/fetcher';
 import {
+  ANTHROPIC_API_KEY_STORAGE_KEY,
   ANTHROPIC_UI_SAMPLE_KEY,
   DEFAULT_OLLAMA_BASE,
   getAnthropicApiKey,
   getModelDisplayLabel,
   getOpenAIApiKey,
   getOllamaBase,
+  OLLAMA_BASE_STORAGE_KEY,
   OPENAI_UI_SAMPLE_KEY,
+  OPENAI_API_KEY_STORAGE_KEY,
   normalizeModelHandle,
   resolveModelHandle,
   setAnthropicApiKey as persistAnthropicApiKey,
   setOllamaBase as persistOllamaBase,
   setOpenAIApiKey as persistOpenAIApiKey,
 } from './lib/ollama';
-import { DEFAULT_PRESET_ID } from './lib/presets';
-import { REPLY_PREFERENCES_STORAGE_KEY } from './lib/replyPreferences';
+import { DEFAULT_PRESET_ID, PRESETS, describePreset } from './lib/presets';
+import { REPLY_PREFERENCES_STORAGE_KEY, clearReplyPreferences } from './lib/replyPreferences';
 import { IconCheck, IconDownload, IconFolderPlus, IconHexagon, IconMessageSquare, IconRefreshCw, IconSearch, IconSettings, IconTerminal, IconTrash2, IconUpload, IconX } from './components/Icon';
 import { deriveWorkspaceFromChat, normaliseProjectId } from './lib/workspaces';
+import { ProviderIcon } from './components/ProviderIcon';
 import type { ChatReasoningEffort, Panel, ChatRecord, ProjectFolder, ThreadType } from './types';
 import type { FileRegistry } from './lib/fileRegistry';
 import type { DeepResearchSearchEngineTestResult } from './lib/fetcher';
 
 const FOLDERS_STORAGE_KEY = 'larry_project_folders_v1';
 const DEFAULT_MODEL_STORAGE_KEY = 'larry_default_model_v1';
+const DEFAULT_CHAT_PRESET_STORAGE_KEY = 'larry_default_chat_preset_v1';
+const DEFAULT_REASONING_STORAGE_KEY = 'larry_default_reasoning_effort_v1';
 const DEVELOPER_TOOLS_STORAGE_KEY = 'larry_developer_tools_v1';
 const ADVANCED_USE_STORAGE_KEY = 'larry_advanced_use_v1';
 const MAX_VISIBLE_CHAT_PANELS = 3;
 const CHAT_FORM_TRANSITION_MIN_MS = 2000;
 const DEFAULT_REASONING_EFFORT: ChatReasoningEffort = 'balanced';
+const CHAT_DEFAULT_PRESETS = PRESETS.filter((preset) => preset.id !== 'code');
+const REASONING_EFFORT_OPTIONS: Array<{ value: ChatReasoningEffort; label: string }> = [
+  { value: 'light', label: 'Low' },
+  { value: 'balanced', label: 'Balanced' },
+  { value: 'high', label: 'High' },
+  { value: 'extra-high', label: 'Extra High' },
+];
 
 interface BrowserStorageSnapshot {
   supported: boolean;
@@ -55,29 +68,34 @@ type AppRoute =
   | { kind: 'chat'; chatId: string }
   | { kind: 'not-found'; path: string };
 
-type SettingsTabId = 'general' | 'models' | 'storage' | 'developerTools';
+type SettingsTabId = 'workspace' | 'providers' | 'data' | 'advanced';
 
-const SETTINGS_TABS: Array<{
-  id: SettingsTabId;
+const SETTINGS_TAB_META: Record<SettingsTabId, {
   label: string;
-}> = [
-  {
-    id: 'general',
-    label: 'General',
+  title: string;
+  description: string;
+}> = {
+  workspace: {
+    label: 'Workspace',
+    title: 'Workspace defaults',
+    description: 'Set the defaults that shape new chats and keep setup tasks easy to find.',
   },
-  {
-    id: 'models',
-    label: 'Models',
+  providers: {
+    label: 'Providers',
+    title: 'Connections and catalogs',
+    description: 'Manage Ollama, hosted provider keys, and the model catalogs they unlock.',
   },
-  {
-    id: 'storage',
-    label: 'Storage',
+  data: {
+    label: 'Data',
+    title: 'Local data and transfers',
+    description: 'Inspect storage usage, export local app data, and clear saved memory when needed.',
   },
-  {
-    id: 'developerTools',
-    label: 'Developer Tools',
+  advanced: {
+    label: 'Advanced',
+    title: 'Advanced controls and diagnostics',
+    description: 'Expose extra UI controls and run fetch diagnostics when you need deeper visibility.',
   },
-];
+};
 
 function buildStartPath(threadType: ThreadType): string {
   if (threadType === 'code') return '/code';
@@ -166,6 +184,14 @@ function formatDiagnosticFilenameTimestamp(value: string): string {
   const minutes = String(timestamp.getMinutes()).padStart(2, '0');
   const seconds = String(timestamp.getSeconds()).padStart(2, '0');
   return `${year}-${month}-${day}_${hours}-${minutes}-${seconds}`;
+}
+
+function isChatReasoningEffort(value: string | null): value is ChatReasoningEffort {
+  return REASONING_EFFORT_OPTIONS.some((option) => option.value === value);
+}
+
+function getReasoningEffortLabel(value: ChatReasoningEffort): string {
+  return REASONING_EFFORT_OPTIONS.find((option) => option.value === value)?.label ?? 'Balanced';
 }
 
 function buildStorageVisualSegments<T extends { bytes: number }>(buckets: T[]) {
@@ -418,6 +444,8 @@ export default function App() {
   const [queuedLaunchPrompts, setQueuedLaunchPrompts] = useState<Record<string, string>>({});
   const [projectFolders, setProjectFolders] = useState<ProjectFolder[]>([]);
   const [defaultModel, setDefaultModel] = useState('');
+  const [defaultChatPreset, setDefaultChatPreset] = useState(DEFAULT_PRESET_ID);
+  const [defaultReasoningEffort, setDefaultReasoningEffort] = useState<ChatReasoningEffort>(DEFAULT_REASONING_EFFORT);
   const [developerToolsEnabled, setDeveloperToolsEnabled] = useState(false);
   const [advancedUseEnabled, setAdvancedUseEnabled] = useState(false);
   const [deepResearchSearchTestResult, setDeepResearchSearchTestResult] = useState<DeepResearchSearchEngineTestResult | null>(null);
@@ -440,7 +468,7 @@ export default function App() {
   const [chatStarterVisible, setChatStarterVisible] = useState(false);
   const [chatStarterPanelId, setChatStarterPanelId] = useState<string | null>(null);
   const [chatLaunchTransition, setChatLaunchTransition] = useState<ChatLaunchTransitionState | null>(null);
-  const [settingsTab, setSettingsTab] = useState<SettingsTabId>('general');
+  const [settingsTab, setSettingsTab] = useState<SettingsTabId>('workspace');
 
   const resolvedDefaultModel = resolveModelHandle(defaultModel, models);
 
@@ -476,6 +504,28 @@ export default function App() {
     try {
       const raw = localStorage.getItem(DEFAULT_MODEL_STORAGE_KEY);
       if (raw) setDefaultModel(raw);
+    } catch {
+      // ignore malformed local cache
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(DEFAULT_CHAT_PRESET_STORAGE_KEY);
+      if (raw && CHAT_DEFAULT_PRESETS.some((preset) => preset.id === raw)) {
+        setDefaultChatPreset(raw);
+      }
+    } catch {
+      // ignore malformed local cache
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(DEFAULT_REASONING_STORAGE_KEY);
+      if (isChatReasoningEffort(raw)) {
+        setDefaultReasoningEffort(raw);
+      }
     } catch {
       // ignore malformed local cache
     }
@@ -522,8 +572,26 @@ export default function App() {
   useEffect(() => {
     if (defaultModel) {
       localStorage.setItem(DEFAULT_MODEL_STORAGE_KEY, defaultModel);
+    } else {
+      localStorage.removeItem(DEFAULT_MODEL_STORAGE_KEY);
     }
   }, [defaultModel]);
+
+  useEffect(() => {
+    if (defaultChatPreset && defaultChatPreset !== DEFAULT_PRESET_ID) {
+      localStorage.setItem(DEFAULT_CHAT_PRESET_STORAGE_KEY, defaultChatPreset);
+    } else {
+      localStorage.removeItem(DEFAULT_CHAT_PRESET_STORAGE_KEY);
+    }
+  }, [defaultChatPreset]);
+
+  useEffect(() => {
+    if (defaultReasoningEffort !== DEFAULT_REASONING_EFFORT) {
+      localStorage.setItem(DEFAULT_REASONING_STORAGE_KEY, defaultReasoningEffort);
+    } else {
+      localStorage.removeItem(DEFAULT_REASONING_STORAGE_KEY);
+    }
+  }, [defaultReasoningEffort]);
 
   useEffect(() => {
     if (developerToolsEnabled) {
@@ -568,7 +636,19 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [chats, projectFolders, defaultModel]);
+  }, [
+    advancedUseEnabled,
+    anthropicApiKey,
+    chats,
+    defaultChatPreset,
+    defaultModel,
+    defaultReasoningEffort,
+    developerToolsEnabled,
+    ollamaEndpoint,
+    openAIApiKey,
+    projectFolders,
+    replyPreferences.length,
+  ]);
 
   useEffect(() => {
     if (!workspaceLauncherOpen) return undefined;
@@ -691,8 +771,8 @@ export default function App() {
     const panel = createPanel({
       title: options.title ?? 'New chat',
       model: options.model || resolvedDefaultModel,
-      preset: options.preset ?? DEFAULT_PRESET_ID,
-      reasoningEffort: options.reasoningEffort ?? DEFAULT_REASONING_EFFORT,
+      preset: options.preset ?? defaultChatPreset,
+      reasoningEffort: options.reasoningEffort ?? defaultReasoningEffort,
       threadType: options.threadType,
       projectId: options.projectId,
       projectLabel: options.projectLabel,
@@ -727,7 +807,7 @@ export default function App() {
       navigate(buildChatPath(panel.id));
     }
     return panel.id;
-  }, [createPanel, navigate, resolvedDefaultModel, save]);
+  }, [createPanel, defaultChatPreset, defaultReasoningEffort, navigate, resolvedDefaultModel, save]);
 
   const upsertProjectFolder = useCallback((folder: {
     id: string;
@@ -1059,6 +1139,82 @@ export default function App() {
       },
     });
   }, [clearAll, navigate, requestConfirmation, toast]);
+
+  const requestClearReplyMemory = useCallback(() => {
+    requestConfirmation({
+      title: 'Clear saved reply memory?',
+      message: 'This removes every liked and disliked reply preference saved locally for future response shaping.',
+      confirmLabel: 'Clear reply memory',
+      onConfirm: () => {
+        clearReplyPreferences();
+        toast('Reply memory cleared.');
+      },
+    });
+  }, [requestConfirmation, toast]);
+
+  const handleExportAppData = useCallback(() => {
+    const exportedAt = new Date().toISOString();
+    const fileName = `larry-ai-data-export-${formatDiagnosticFilenameTimestamp(exportedAt)}.json`;
+    const payload = {
+      version: 1,
+      exportedAt,
+      defaults: {
+        defaultModel: resolvedDefaultModel,
+        defaultChatPreset,
+        defaultReasoningEffort,
+        developerToolsEnabled,
+        advancedUseEnabled,
+      },
+      connections: {
+        ollamaEndpoint,
+        openAIConfigured: Boolean(openAIApiKey),
+        anthropicConfigured: Boolean(anthropicApiKey),
+      },
+      providers: providers.map((provider) => ({
+        provider: provider.provider,
+        label: provider.label,
+        enabled: provider.enabled,
+        online: provider.online,
+        modelCount: provider.modelCount,
+        mode: provider.mode ?? 'live',
+        error: provider.error ?? null,
+      })),
+      data: {
+        chats,
+        workspaces: projectFolders,
+        replyPreferences,
+      },
+    };
+
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+    const anchor = document.createElement('a');
+    anchor.href = URL.createObjectURL(blob);
+    anchor.download = fileName;
+    anchor.click();
+    URL.revokeObjectURL(anchor.href);
+    toast(`Exported app data to ${fileName}`);
+  }, [
+    advancedUseEnabled,
+    anthropicApiKey,
+    chats,
+    defaultChatPreset,
+    defaultReasoningEffort,
+    developerToolsEnabled,
+    ollamaEndpoint,
+    openAIApiKey,
+    projectFolders,
+    providers,
+    replyPreferences,
+    resolvedDefaultModel,
+    toast,
+  ]);
+
+  const resetWorkspaceDefaults = useCallback(() => {
+    setDefaultModel('');
+    setDefaultChatPreset(DEFAULT_PRESET_ID);
+    setDefaultReasoningEffort(DEFAULT_REASONING_EFFORT);
+    toast('Workspace defaults reset.');
+  }, [toast]);
 
   const handleStartChatFromHome = useCallback((options: {
     prompt: string;
@@ -1395,6 +1551,8 @@ export default function App() {
           chats={chatSurfaceChats}
           folders={projectFolders}
           defaultModel={resolvedDefaultModel}
+          defaultChatPreset={defaultChatPreset}
+          defaultReasoningEffort={defaultReasoningEffort}
           models={models}
           chatLaunchTransition={chatLaunchTransition ? {
             prompt: chatLaunchTransition.prompt,
@@ -1507,6 +1665,60 @@ export default function App() {
       :
     anthropicProvider.error || 'Unable to connect';
 
+  const openAIStatusText = openAIStatusLabel.replace('Â·', '·');
+  const anthropicStatusText = anthropicStatusLabel.replace('Â·', '·');
+  const openAIProviderStatusText =
+    !openAIApiKey ? 'No key saved' :
+    !openAIProvider ? 'checking...' :
+    openAIProvider.online
+      ? `${openAIProvider.mode === 'sample' ? 'Sample catalog' : 'Live catalog'} · ${openAIProvider.modelCount} model${openAIProvider.modelCount !== 1 ? 's' : ''}`
+      :
+    openAIProvider.error || 'Unable to connect';
+  const anthropicProviderStatusText =
+    !anthropicApiKey ? 'No key saved' :
+    !anthropicProvider ? 'checking...' :
+    anthropicProvider.online
+      ? `${anthropicProvider.mode === 'sample' ? 'Sample catalog' : 'Live catalog'} · ${anthropicProvider.modelCount} model${anthropicProvider.modelCount !== 1 ? 's' : ''}`
+      :
+    anthropicProvider.error || 'Unable to connect';
+  void openAIStatusText;
+  void anthropicStatusText;
+  const defaultChatPresetMeta = CHAT_DEFAULT_PRESETS.find((preset) => preset.id === defaultChatPreset) ?? CHAT_DEFAULT_PRESETS[0];
+  const defaultModelLabel = resolvedDefaultModel ? getModelDisplayLabel(resolvedDefaultModel) : 'No model ready';
+  const defaultReasoningLabel = getReasoningEffortLabel(defaultReasoningEffort);
+  const configuredHostedProviders = Number(Boolean(openAIApiKey)) + Number(Boolean(anthropicApiKey));
+  const settingsTabs = [
+    {
+      id: 'workspace' as const,
+      label: SETTINGS_TAB_META.workspace.label,
+      title: SETTINGS_TAB_META.workspace.title,
+      description: SETTINGS_TAB_META.workspace.description,
+      summary: `${defaultChatPresetMeta.label} · ${defaultReasoningLabel}`,
+    },
+    {
+      id: 'providers' as const,
+      label: SETTINGS_TAB_META.providers.label,
+      title: SETTINGS_TAB_META.providers.title,
+      description: SETTINGS_TAB_META.providers.description,
+      summary: `${onlineProviders.length}/${providers.length || 3} online`,
+    },
+    {
+      id: 'data' as const,
+      label: SETTINGS_TAB_META.data.label,
+      title: SETTINGS_TAB_META.data.title,
+      description: SETTINGS_TAB_META.data.description,
+      summary: `${chats.length} chats · ${projectFolders.length} workspaces`,
+    },
+    {
+      id: 'advanced' as const,
+      label: SETTINGS_TAB_META.advanced.label,
+      title: SETTINGS_TAB_META.advanced.title,
+      description: SETTINGS_TAB_META.advanced.description,
+      summary: `${[developerToolsEnabled, advancedUseEnabled].filter(Boolean).length} controls enabled`,
+    },
+  ];
+  const activeSettingsTabMeta = settingsTabs.find((tab) => tab.id === settingsTab) ?? settingsTabs[0];
+
   const applyOllamaEndpoint = useCallback(() => {
     const next = persistOllamaBase(ollamaEndpointDraft);
     setOllamaEndpoint(next);
@@ -1604,7 +1816,6 @@ export default function App() {
     URL.revokeObjectURL(anchor.href);
     toast(`Downloaded ${fileName}`);
   }, [deepResearchSearchTestResult, toast]);
-
   const chatHistoryBytes = ready ? measureJsonBytes(chats) : 0;
   const workspaceStorageBytes = estimateLocalStorageEntryBytes(
     FOLDERS_STORAGE_KEY,
@@ -1613,6 +1824,34 @@ export default function App() {
   const defaultModelStorageBytes = defaultModel
     ? estimateLocalStorageEntryBytes(DEFAULT_MODEL_STORAGE_KEY, defaultModel)
     : 0;
+  const defaultChatPresetStorageBytes = defaultChatPreset !== DEFAULT_PRESET_ID
+    ? estimateLocalStorageEntryBytes(DEFAULT_CHAT_PRESET_STORAGE_KEY, defaultChatPreset)
+    : 0;
+  const defaultReasoningStorageBytes = defaultReasoningEffort !== DEFAULT_REASONING_EFFORT
+    ? estimateLocalStorageEntryBytes(DEFAULT_REASONING_STORAGE_KEY, defaultReasoningEffort)
+    : 0;
+  const developerToolsStorageBytes = developerToolsEnabled
+    ? estimateLocalStorageEntryBytes(DEVELOPER_TOOLS_STORAGE_KEY, '1')
+    : 0;
+  const advancedUseStorageBytes = advancedUseEnabled
+    ? estimateLocalStorageEntryBytes(ADVANCED_USE_STORAGE_KEY, '1')
+    : 0;
+  const providerConnectionStorageBytes =
+    (ollamaEndpoint !== DEFAULT_OLLAMA_BASE
+      ? estimateLocalStorageEntryBytes(OLLAMA_BASE_STORAGE_KEY, ollamaEndpoint)
+      : 0) +
+    (openAIApiKey
+      ? estimateLocalStorageEntryBytes(OPENAI_API_KEY_STORAGE_KEY, openAIApiKey)
+      : 0) +
+    (anthropicApiKey
+      ? estimateLocalStorageEntryBytes(ANTHROPIC_API_KEY_STORAGE_KEY, anthropicApiKey)
+      : 0);
+  const workspaceDefaultStorageBytes =
+    defaultModelStorageBytes +
+    defaultChatPresetStorageBytes +
+    defaultReasoningStorageBytes +
+    developerToolsStorageBytes +
+    advancedUseStorageBytes;
   const replyPreferenceStorageBytes = replyPreferences.length
     ? estimateLocalStorageEntryBytes(
         REPLY_PREFERENCES_STORAGE_KEY,
@@ -1625,7 +1864,8 @@ export default function App() {
   const appStorageBytes =
     chatHistoryBytes +
     workspaceStorageBytes +
-    defaultModelStorageBytes +
+    workspaceDefaultStorageBytes +
+    providerConnectionStorageBytes +
     replyPreferenceStorageBytes +
     customPresetStorage.bytes;
   const storageBuckets = [
@@ -1646,11 +1886,22 @@ export default function App() {
       color: '#6ed7b7',
     },
     {
-      id: 'model',
-      label: 'Default model',
-      bytes: defaultModelStorageBytes,
-      note: defaultModel ? `Saved preference: ${getModelDisplayLabel(defaultModel)}` : 'No explicit default model saved yet',
+      id: 'workspace-defaults',
+      label: 'Workspace defaults',
+      bytes: workspaceDefaultStorageBytes,
+      note: workspaceDefaultStorageBytes
+        ? `${defaultModel ? getModelDisplayLabel(defaultModel) : 'Smart model default'}, ${defaultChatPresetMeta.label}, ${defaultReasoningLabel}${advancedUseEnabled || developerToolsEnabled ? ' plus UI toggles' : ''}`
+        : 'No non-default workspace preferences stored yet',
       color: '#f2b668',
+    },
+    {
+      id: 'connections',
+      label: 'Provider access',
+      bytes: providerConnectionStorageBytes,
+      note: providerConnectionStorageBytes
+        ? `${configuredHostedProviders} hosted provider key${configuredHostedProviders === 1 ? '' : 's'} saved${ollamaEndpoint !== DEFAULT_OLLAMA_BASE ? ' with a custom Ollama endpoint' : ''}`
+        : 'Using the default local Ollama endpoint with no hosted provider keys saved',
+      color: '#6fc0ff',
     },
     {
       id: 'reply-preferences',
@@ -1708,13 +1959,14 @@ export default function App() {
 
     const starterPanelId = openDraftChat({
       title: 'New Chat',
-      preset: 'chatbot',
+      preset: defaultChatPreset,
+      reasoningEffort: defaultReasoningEffort,
       threadType: 'chat',
       navigateOnCreate: false,
     });
     setChatStarterPanelId(starterPanelId);
     navigate(buildChatPath(starterPanelId));
-  }, [chatStarterPanelId, navigate, openDraftChat, panels]);
+  }, [chatStarterPanelId, defaultChatPreset, defaultReasoningEffort, navigate, openDraftChat, panels]);
 
   useEffect(() => {
     if (!showChatHistoryDrawer) return undefined;
@@ -1834,58 +2086,281 @@ export default function App() {
         <div id="main-content">
           {route.kind === 'settings' ? (
             <div id="settings-view">
-              <div className="settings-header">
-                <span className="settings-eyebrow">Settings</span>
-                <h2>Workspace defaults</h2>
-                <p>Keep the sidebar lean, then manage models and imports from here.</p>
-              </div>
+              <div className="settings-stage">
+                <div className="settings-header">
+                    <span className="settings-eyebrow">Settings</span>
+                    <h2>Workspace defaults</h2>
+                    <p>Pick the defaults for new chats, manage providers, and adjust local app behavior without the extra noise.</p>
 
-                <div className="settings-shell">
-                  <div className="settings-tab-bar" role="tablist" aria-label="Settings categories">
-                    {SETTINGS_TABS.map((tab) => (
-                      <button
+                  <div className="settings-overview-grid">
+                    <article className="settings-overview-card">
+                      <span className="settings-overview-icon" aria-hidden="true">
+                        <IconMessageSquare size={18} />
+                      </span>
+                      <span className="settings-overview-label">New chats</span>
+                      <strong>{defaultModelLabel}</strong>
+                      <p>{defaultChatPresetMeta.label} preset · {defaultReasoningLabel} reasoning</p>
+                    </article>
+
+                    <article className="settings-overview-card">
+                      <span className="settings-overview-icon" aria-hidden="true">
+                        <IconSearch size={18} />
+                      </span>
+                      <span className="settings-overview-label">Providers</span>
+                      <strong>{onlineProviders.length} online</strong>
+                      <p>{statusLabel}</p>
+                    </article>
+
+                    <article className="settings-overview-card">
+                      <span className="settings-overview-icon" aria-hidden="true">
+                        <IconDownload size={18} />
+                      </span>
+                      <span className="settings-overview-label">Local data</span>
+                      <strong>{formatStorageSize(appStorageBytes)}</strong>
+                      <p>{chats.length} chats, {projectFolders.length} workspaces, {replyPreferences.length} reply memories</p>
+                    </article>
+                  </div>
+                </div>
+
+                <div className="settings-tab-strip" role="tablist" aria-label="Settings categories">
+                  {settingsTabs.map((tab) => (
+                    <button
                       key={tab.id}
                       type="button"
                       role="tab"
                       aria-selected={settingsTab === tab.id}
-                        className={`settings-tab${settingsTab === tab.id ? ' active' : ''}`}
-                        onClick={() => setSettingsTab(tab.id)}
-                      >
-                        {tab.label}
-                      </button>
-                    ))}
+                      className={`settings-tab-pill${settingsTab === tab.id ? ' active' : ''}`}
+                      onClick={() => setSettingsTab(tab.id)}
+                    >
+                      <span className="settings-tab-pill-label">{tab.label}</span>
+                      <span className="settings-tab-pill-summary">{tab.summary}</span>
+                    </button>
+                  ))}
+                </div>
+
+                <section className="settings-panel">
+                  <div className="settings-panel-head">
+                    <div>
+                      <span className="settings-panel-kicker">{activeSettingsTabMeta.label}</span>
+                      <h3>{activeSettingsTabMeta.title}</h3>
+                    </div>
+                    <p>{activeSettingsTabMeta.description}</p>
                   </div>
 
-                  <div className="settings-sections">
-                  {settingsTab === 'general' && (
+                  <div className="settings-panel-body">
+                  {settingsTab === 'workspace' && (
                     <>
-                      <section className="settings-section">
-                        <div className="settings-section-head">
-                          <h3>Imports</h3>
-                          <p>Chat log imports live here. Workspace file folders stay behind the workspace menus.</p>
+                      <div className="settings-card-grid settings-card-grid-two">
+                        <section className="settings-card settings-card-spacious">
+                          <div className="settings-card-head">
+                            <div>
+                              <span className="settings-card-kicker">Defaults</span>
+                              <h4>New session defaults</h4>
+                            </div>
+                            <span className="settings-badge settings-badge-soft">{defaultModelLabel}</span>
+                          </div>
+
+                          <div className="settings-control-grid">
+                            <label className="settings-field settings-control-card">
+                              <span>Default model</span>
+                              <select
+                                className="settings-select"
+                                value={resolvedDefaultModel}
+                                onChange={(e) => setDefaultModel(e.target.value)}
+                                disabled={!models.length}
+                              >
+                                {models.length ? (
+                                  models.map((model) => (
+                                    <option key={model} value={model}>
+                                      {getModelDisplayLabel(model)}
+                                    </option>
+                                  ))
+                                ) : (
+                                  <option value="">No models available</option>
+                                )}
+                              </select>
+                              <p className="settings-inline-note">Used whenever you start a new session and do not pick a model manually.</p>
+                            </label>
+
+                            <label className="settings-field settings-control-card">
+                              <span>Default chat preset</span>
+                              <select
+                                className="settings-select"
+                                value={defaultChatPreset}
+                                onChange={(e) => setDefaultChatPreset(e.target.value)}
+                              >
+                                {CHAT_DEFAULT_PRESETS.map((preset) => (
+                                  <option key={preset.id} value={preset.id}>
+                                    {preset.label}
+                                  </option>
+                                ))}
+                              </select>
+                              <p className="settings-inline-note">{describePreset(defaultChatPreset)}</p>
+                            </label>
+
+                            <label className="settings-field settings-control-card">
+                              <span>Default reasoning</span>
+                              <select
+                                className="settings-select"
+                                value={defaultReasoningEffort}
+                                onChange={(e) => {
+                                  if (isChatReasoningEffort(e.target.value)) {
+                                    setDefaultReasoningEffort(e.target.value);
+                                  }
+                                }}
+                              >
+                                {REASONING_EFFORT_OPTIONS.map((option) => (
+                                  <option key={option.value} value={option.value}>
+                                    {option.label}
+                                  </option>
+                                ))}
+                              </select>
+                              <p className="settings-inline-note">Applies to new sessions before you change the reasoning control in the composer.</p>
+                            </label>
+                          </div>
+
+                          <div className="settings-actions">
+                            <button className="btn settings-secondary-btn" onClick={resetWorkspaceDefaults}>
+                              Reset Defaults
+                            </button>
+                          </div>
+                        </section>
+
+                        <section className="settings-card settings-card-spacious">
+                          <div className="settings-card-head">
+                            <div>
+                              <span className="settings-card-kicker">Setup</span>
+                              <h4>Import and workspace shortcuts</h4>
+                            </div>
+                            <span className="settings-badge settings-badge-soft">{projectFolders.length} workspaces</span>
+                          </div>
+
+                          <div className="settings-split">
+                            <div className="settings-stack">
+                              <strong>Chat logs</strong>
+                              <p className="settings-inline-note">Bring exported Markdown chats back into the app whenever you need to restore or merge history.</p>
+                              <div className="settings-actions">
+                                <button className="btn" onClick={() => importLogsSettingsRef.current?.click()}>
+                                  <IconUpload size={14} />
+                                  Import Logs
+                                </button>
+                              </div>
+                            </div>
+
+                            <div className="settings-stack">
+                              <strong>Workspaces</strong>
+                              <p className="settings-inline-note">Create a blank workspace or import a local folder before starting code or debug threads.</p>
+                              <div className="settings-actions">
+                                <button className="btn" onClick={() => openWorkspaceLauncher('create')}>
+                                  <IconFolderPlus size={14} />
+                                  New Workspace
+                                </button>
+                                <button className="btn settings-secondary-btn" onClick={() => openWorkspaceLauncher('import')}>
+                                  <IconUpload size={14} />
+                                  Import Folder
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        </section>
+                      </div>
+
+                      <section className="settings-card settings-card-spacious">
+                        <div className="settings-card-head">
+                          <div>
+                            <span className="settings-card-kicker">Catalog</span>
+                            <h4>Available models right now</h4>
+                          </div>
+                          <span className="settings-badge settings-badge-soft">
+                            {models.length ? `${models.length} ready` : 'No models'}
+                          </span>
                         </div>
 
-                        <div className="settings-actions">
-                          <button className="btn" onClick={() => importLogsSettingsRef.current?.click()}>
-                            Import Logs
-                          </button>
+                        <p className="settings-inline-note">
+                          {models.length
+                            ? `Current provider state: ${statusLabel}. Code and debug threads still use the fixed Code preset.`
+                            : 'Connect Ollama or add hosted provider keys to populate the model catalog.'}
+                        </p>
+
+                        <div className="settings-model-list">
+                          {models.length ? (
+                            models.map((model) => (
+                              <span
+                                key={model}
+                                className={`settings-model-chip${model === resolvedDefaultModel ? ' active' : ''}`}
+                              >
+                                {getModelDisplayLabel(model)}
+                              </span>
+                            ))
+                          ) : (
+                            <span className="settings-model-empty">No models available right now.</span>
+                          )}
                         </div>
                       </section>
-
                     </>
                   )}
 
-                  {settingsTab === 'models' && (
+                  {settingsTab === 'providers' && (
                     <>
-                      <section className="settings-section">
-                        <div className="settings-section-head">
-                          <h3>Connection</h3>
-                          <p>Point the frontend at the Ollama host you want to use. The default local endpoint uses the standard Ollama port.</p>
+                      <section className="settings-card settings-card-spacious">
+                        <div className="settings-card-head">
+                          <div>
+                            <span className="settings-card-kicker">Readiness</span>
+                            <h4>Provider status</h4>
+                          </div>
+                          <span className="settings-badge settings-badge-soft">
+                            {onlineProviders.length} online
+                          </span>
                         </div>
 
-                        <div className="settings-section-body">
+                        <div className="settings-provider-status-grid">
+                          {providers.map((provider) => {
+                            const providerSummary = provider.online
+                              ? `${provider.modelCount} model${provider.modelCount !== 1 ? 's' : ''} available`
+                              : provider.enabled
+                                ? provider.error || 'Configured but currently unavailable'
+                                : provider.provider === 'ollama'
+                                  ? 'Local endpoint not reachable yet'
+                                  : 'No key saved';
+
+                            return (
+                              <article
+                                key={provider.provider}
+                                className={`settings-provider-status-card${provider.online ? ' is-online' : provider.enabled ? ' is-enabled' : ''}`}
+                              >
+                                <div className="settings-provider-status-head">
+                                  <span className="settings-provider-status-icon" aria-hidden="true">
+                                    <ProviderIcon provider={provider.provider} size={20} />
+                                  </span>
+
+                                  <div className="settings-provider-status-copy">
+                                    <strong>{provider.label}</strong>
+                                    <span>{providerSummary}</span>
+                                  </div>
+
+                                  <span className={`settings-badge ${provider.online ? 'settings-badge-success' : provider.enabled ? 'settings-badge-warning' : 'settings-badge-soft'}`}>
+                                    {provider.online ? 'Online' : provider.enabled ? 'Issue' : 'Inactive'}
+                                  </span>
+                                </div>
+
+                                {provider.mode === 'sample' && (
+                                  <p className="settings-inline-note">Using sample catalog mode for UI-only testing.</p>
+                                )}
+                              </article>
+                            );
+                          })}
+                        </div>
+                      </section>
+
+                      <div className="settings-provider-grid">
+                        <div className="settings-provider-card">
+                          <div className="settings-provider-card-head">
+                            <strong>Ollama</strong>
+                            <span className="settings-inline-note">{ollamaStatusLabel}</span>
+                          </div>
+
                           <label className="settings-field">
-                            <span>Ollama endpoint</span>
+                            <span>Endpoint</span>
                             <input
                               className="settings-select settings-input"
                               type="text"
@@ -1904,17 +2379,8 @@ export default function App() {
                             />
                           </label>
 
-                          <div className="settings-inline-row">
-                            <span className="settings-inline-note">
-                              Current endpoint: <code>{ollamaEndpoint}</code>
-                            </span>
-                            <span className="settings-inline-note">
-                              Ollama: {ollamaStatusLabel}
-                            </span>
-                          </div>
-
                           <p className="settings-inline-note">
-                            Use a full hosted URL for remote instances, or leave it on <code>{DEFAULT_OLLAMA_BASE}</code> for the standard local Ollama setup.
+                            Use a hosted URL for remote instances, or keep <code>{DEFAULT_OLLAMA_BASE}</code> for the standard local setup.
                           </p>
 
                           <div className="settings-actions">
@@ -1926,167 +2392,132 @@ export default function App() {
                             </button>
                           </div>
                         </div>
-                      </section>
 
-                      <section className="settings-section">
-                        <div className="settings-section-head">
-                          <h3>API providers</h3>
-                          <p>Add provider keys locally so OpenAI and Anthropic models become available alongside Ollama.</p>
-                        </div>
-
-                        <div className="settings-provider-grid">
-                          <div className="settings-provider-card">
-                            <div className="settings-provider-card-head">
-                              <strong>OpenAI</strong>
-                              <span className="settings-inline-note">{openAIStatusLabel}</span>
-                            </div>
-
-                            <label className="settings-field">
-                              <span>API key</span>
-                              <input
-                                className="settings-select settings-input"
-                                type="password"
-                                value={openAIApiKeyDraft}
-                                onChange={(e) => setOpenAIApiKeyDraft(e.target.value)}
-                                onKeyDown={(e) => {
-                                  if (e.key === 'Enter') {
-                                    e.preventDefault();
-                                    applyOpenAIKey();
-                                  }
-                                }}
-                                placeholder="sk-..."
-                                spellCheck={false}
-                                autoCapitalize="off"
-                                autoCorrect="off"
-                              />
-                            </label>
-
-                            <p className="settings-inline-note">
-                              Saved locally in this browser. OpenAI models only appear when a key is present. For UI-only testing, the sample key <code>{OPENAI_UI_SAMPLE_KEY}</code> unlocks the chat-capable OpenAI catalog without making live API calls.
-                            </p>
-
-                            <div className="settings-actions">
-                              <button className="btn" onClick={applyOpenAIKey}>
-                                Save Key
-                              </button>
-                              <button className="btn settings-secondary-btn" onClick={useSampleOpenAIKey}>
-                                Use Sample Key
-                              </button>
-                              <button className="btn settings-secondary-btn" onClick={clearOpenAIKey}>
-                                Clear Key
-                              </button>
-                            </div>
+                        <div className="settings-provider-card">
+                          <div className="settings-provider-card-head">
+                            <strong>OpenAI</strong>
+                            <span className="settings-inline-note">{openAIProviderStatusText}</span>
                           </div>
 
-                          <div className="settings-provider-card">
-                            <div className="settings-provider-card-head">
-                              <strong>Anthropic</strong>
-                              <span className="settings-inline-note">{anthropicStatusLabel}</span>
-                            </div>
-
-                            <label className="settings-field">
-                              <span>API key</span>
-                              <input
-                                className="settings-select settings-input"
-                                type="password"
-                                value={anthropicApiKeyDraft}
-                                onChange={(e) => setAnthropicApiKeyDraft(e.target.value)}
-                                onKeyDown={(e) => {
-                                  if (e.key === 'Enter') {
-                                    e.preventDefault();
-                                    applyAnthropicKey();
-                                  }
-                                }}
-                                placeholder="sk-ant-..."
-                                spellCheck={false}
-                                autoCapitalize="off"
-                                autoCorrect="off"
-                              />
-                            </label>
-
-                            <p className="settings-inline-note">
-                              Saved locally in this browser. Anthropic models only appear when a key is present. For UI-only testing, the sample key <code>{ANTHROPIC_UI_SAMPLE_KEY}</code> unlocks the Claude catalog without making live API calls.
-                            </p>
-
-                            <div className="settings-actions">
-                              <button className="btn" onClick={applyAnthropicKey}>
-                                Save Key
-                              </button>
-                              <button className="btn settings-secondary-btn" onClick={useSampleAnthropicKey}>
-                                Use Sample Key
-                              </button>
-                              <button className="btn settings-secondary-btn" onClick={clearAnthropicKey}>
-                                Clear Key
-                              </button>
-                            </div>
-                          </div>
-                        </div>
-                      </section>
-
-                      <section className="settings-section">
-                        <div className="settings-section-head">
-                          <h3>Models</h3>
-                          <p>Choose the default model for every new chat created inside a workspace.</p>
-                        </div>
-
-                        <div className="settings-section-body">
                           <label className="settings-field">
-                            <span>Default model</span>
-                            <select
-                              className="settings-select"
-                              value={resolvedDefaultModel}
-                              onChange={(e) => setDefaultModel(e.target.value)}
-                              disabled={!models.length}
-                            >
-                              {models.length ? (
-                                models.map((model) => (
-                                  <option key={model} value={model}>
-                                    {getModelDisplayLabel(model)}
-                                  </option>
-                                ))
-                              ) : (
-                                <option value="">No models available</option>
-                              )}
-                            </select>
+                            <span>API key</span>
+                            <input
+                              className="settings-select settings-input"
+                              type="password"
+                              value={openAIApiKeyDraft}
+                              onChange={(e) => setOpenAIApiKeyDraft(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') {
+                                  e.preventDefault();
+                                  applyOpenAIKey();
+                                }
+                              }}
+                              placeholder="sk-..."
+                              spellCheck={false}
+                              autoCapitalize="off"
+                              autoCorrect="off"
+                            />
                           </label>
 
-                          <div className="settings-model-group">
-                            <div className="settings-inline-row">
-                              <span className="settings-inline-label">Available now</span>
-                              <span className="settings-inline-note">Providers: {statusLabel}</span>
-                            </div>
+                          <p className="settings-inline-note">
+                            Saved locally in this browser. Use <code>{OPENAI_UI_SAMPLE_KEY}</code> if you only need the catalog visible for UI testing.
+                          </p>
 
-                            <div className="settings-model-list">
-                              {models.length ? (
-                                models.map((model) => (
-                                  <span
-                                    key={model}
-                                    className={`settings-model-chip${model === resolvedDefaultModel ? ' active' : ''}`}
-                                  >
-                                    {getModelDisplayLabel(model)}
-                                  </span>
-                                ))
-                              ) : (
-                                <span className="settings-model-empty">No models available right now.</span>
-                              )}
-                            </div>
+                          <div className="settings-actions">
+                            <button className="btn" onClick={applyOpenAIKey}>
+                              Save Key
+                            </button>
+                            <button className="btn settings-secondary-btn" onClick={useSampleOpenAIKey}>
+                              Use Sample Key
+                            </button>
+                            <button className="btn settings-secondary-btn" onClick={clearOpenAIKey}>
+                              Clear Key
+                            </button>
                           </div>
                         </div>
-                      </section>
 
+                        <div className="settings-provider-card">
+                          <div className="settings-provider-card-head">
+                            <strong>Anthropic</strong>
+                            <span className="settings-inline-note">{anthropicProviderStatusText}</span>
+                          </div>
+
+                          <label className="settings-field">
+                            <span>API key</span>
+                            <input
+                              className="settings-select settings-input"
+                              type="password"
+                              value={anthropicApiKeyDraft}
+                              onChange={(e) => setAnthropicApiKeyDraft(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') {
+                                  e.preventDefault();
+                                  applyAnthropicKey();
+                                }
+                              }}
+                              placeholder="sk-ant-..."
+                              spellCheck={false}
+                              autoCapitalize="off"
+                              autoCorrect="off"
+                            />
+                          </label>
+
+                          <p className="settings-inline-note">
+                            Saved locally in this browser. Use <code>{ANTHROPIC_UI_SAMPLE_KEY}</code> if you only need the Claude catalog unlocked for UI testing.
+                          </p>
+
+                          <div className="settings-actions">
+                            <button className="btn" onClick={applyAnthropicKey}>
+                              Save Key
+                            </button>
+                            <button className="btn settings-secondary-btn" onClick={useSampleAnthropicKey}>
+                              Use Sample Key
+                            </button>
+                            <button className="btn settings-secondary-btn" onClick={clearAnthropicKey}>
+                              Clear Key
+                            </button>
+                          </div>
+                        </div>
+                      </div>
                     </>
                   )}
 
-                  {settingsTab === 'storage' && (
+                  {settingsTab === 'data' && (
                     <>
-                      <section className="settings-section">
-                        <div className="settings-section-head">
-                          <h3>Storage</h3>
-                          <p>Estimated local app data across IndexedDB and browser storage, shown as a single meter with category breakdown.</p>
+                      <div className="settings-card-grid settings-card-grid-three">
+                        <article className="settings-card settings-summary-card">
+                          <span className="settings-card-kicker">Chats</span>
+                          <strong>{chats.length}</strong>
+                          <p>Saved conversations in IndexedDB.</p>
+                        </article>
+
+                        <article className="settings-card settings-summary-card">
+                          <span className="settings-card-kicker">Workspaces</span>
+                          <strong>{projectFolders.length}</strong>
+                          <p>Workspace entries stored locally.</p>
+                        </article>
+
+                        <article className="settings-card settings-summary-card">
+                          <span className="settings-card-kicker">Reply memory</span>
+                          <strong>{replyPreferences.length}</strong>
+                          <p>Liked and disliked response examples saved for future prompts.</p>
+                        </article>
+                      </div>
+
+                      <section className="settings-card settings-card-spacious">
+                        <div className="settings-card-head">
+                          <div>
+                            <span className="settings-card-kicker">Storage</span>
+                            <h4>Local app footprint</h4>
+                          </div>
+                          <span className="settings-badge settings-badge-soft">
+                            {browserStorage.supported && browserStorage.quota != null
+                              ? `${formatStorageSize(appStorageBytes)} of ${formatStorageSize(browserStorage.quota)}`
+                              : formatStorageSize(appStorageBytes)}
+                          </span>
                         </div>
 
                         <div className="settings-storage">
-
                           <div className="settings-storage-meter-block">
                             <div className="settings-storage-meter-head">
                               <span className="settings-storage-meter-label">Browser Storage</span>
@@ -2166,28 +2597,26 @@ export default function App() {
                           </div>
 
                           <div className="settings-storage-breakdown">
-                            {storageBuckets.map((bucket) => {
-                              return (
-                                <div key={bucket.id} className="settings-storage-row">
-                                  <div className="settings-storage-row-main">
-                                    <span
-                                      className="settings-storage-dot"
-                                      style={{ background: bucket.color }}
-                                      aria-hidden="true"
-                                    />
-                                    <div className="settings-storage-row-copy">
-                                      <div className="settings-storage-item-head">
-                                        <span className="settings-storage-label">{bucket.label}</span>
-                                        <span className="settings-storage-value">
-                                          {bucket.bytes > 0 ? `${formatStorageSize(bucket.bytes)}` : '0 B'}
-                                        </span>
-                                      </div>
-                                      <p>{bucket.note}</p>
+                            {storageBuckets.map((bucket) => (
+                              <div key={bucket.id} className="settings-storage-row">
+                                <div className="settings-storage-row-main">
+                                  <span
+                                    className="settings-storage-dot"
+                                    style={{ background: bucket.color }}
+                                    aria-hidden="true"
+                                  />
+                                  <div className="settings-storage-row-copy">
+                                    <div className="settings-storage-item-head">
+                                      <span className="settings-storage-label">{bucket.label}</span>
+                                      <span className="settings-storage-value">
+                                        {bucket.bytes > 0 ? `${formatStorageSize(bucket.bytes)}` : '0 B'}
+                                      </span>
                                     </div>
+                                    <p>{bucket.note}</p>
                                   </div>
                                 </div>
-                              );
-                            })}
+                              </div>
+                            ))}
                           </div>
 
                           {!customPresetStorage.count && (
@@ -2198,26 +2627,86 @@ export default function App() {
                         </div>
                       </section>
 
-                      <section className="settings-section danger">
-                        <div className="settings-section-head">
-                          <h3>History</h3>
-                          <p>Clear saved conversation history across the app.</p>
-                        </div>
+                      <div className="settings-card-grid settings-card-grid-three">
+                        <section className="settings-card">
+                          <div className="settings-card-head">
+                            <div>
+                              <span className="settings-card-kicker">Transfer</span>
+                              <h4>Import or export app data</h4>
+                            </div>
+                          </div>
 
-                        <div className="settings-actions">
-                          <button className="btn danger settings-danger-btn" onClick={requestClearAll}>
-                            Clear All Conversation History
-                          </button>
-                        </div>
-                      </section>
+                          <p className="settings-inline-note">Export includes chats, workspaces, reply memory, and defaults, but intentionally leaves provider keys out.</p>
+
+                          <div className="settings-actions">
+                            <button className="btn" onClick={() => importLogsSettingsRef.current?.click()}>
+                              <IconUpload size={14} />
+                              Import Logs
+                            </button>
+                            <button className="btn settings-secondary-btn" onClick={handleExportAppData}>
+                              <IconDownload size={14} />
+                              Export All Data
+                            </button>
+                          </div>
+                        </section>
+
+                        <section className="settings-card">
+                          <div className="settings-card-head">
+                            <div>
+                              <span className="settings-card-kicker">Reply memory</span>
+                              <h4>Manage learned preferences</h4>
+                            </div>
+                          </div>
+
+                          <p className="settings-inline-note">
+                            {replyPreferences.length
+                              ? `${likedReplyPreferenceCount} liked and ${dislikedReplyPreferenceCount} disliked examples are stored locally for better future replies.`
+                              : 'No reply memory is stored yet.'}
+                          </p>
+
+                          <div className="settings-actions">
+                            <button
+                              className="btn settings-secondary-btn"
+                              onClick={requestClearReplyMemory}
+                              disabled={!replyPreferences.length}
+                            >
+                              <IconTrash2 size={14} />
+                              Clear Reply Memory
+                            </button>
+                          </div>
+                        </section>
+
+                        <section className="settings-card settings-card-danger">
+                          <div className="settings-card-head">
+                            <div>
+                              <span className="settings-card-kicker">History</span>
+                              <h4>Clear conversation history</h4>
+                            </div>
+                          </div>
+
+                          <p className="settings-inline-note">Remove every saved conversation from this browser. This cannot be undone.</p>
+
+                          <div className="settings-actions">
+                            <button className="btn danger settings-danger-btn" onClick={requestClearAll}>
+                              <IconTrash2 size={14} />
+                              Clear All Conversation History
+                            </button>
+                          </div>
+                        </section>
+                      </div>
                     </>
                   )}
 
-                  {settingsTab === 'developerTools' && (
-                    <section className="settings-section">
-                      <div className="settings-section-head">
-                        <h3>Developer tools</h3>
-                        <p>Expose reply timing and pipeline-inspector visibility for deeper loading and orchestration insight.</p>
+                  {settingsTab === 'advanced' && (
+                    <section className="settings-card settings-card-spacious">
+                      <div className="settings-card-head">
+                        <div>
+                          <span className="settings-card-kicker">Advanced</span>
+                          <h4>Controls and diagnostics</h4>
+                        </div>
+                        <span className="settings-badge settings-badge-soft">
+                          {[developerToolsEnabled, advancedUseEnabled].filter(Boolean).length} enabled
+                        </span>
                       </div>
 
                       <div className="settings-developer-tools-card">
@@ -2228,7 +2717,7 @@ export default function App() {
 
                           <div className="settings-developer-tools-text">
                             <strong>Developer tools</strong>
-                            <p>When enabled, assistant replies show the <code>responded in ...</code> timing label and the <code>i</code> pipeline inspector button.</p>
+                            <p>Show reply timing and the pipeline inspector so loading and orchestration issues are easier to trace.</p>
                           </div>
                         </div>
 
@@ -2254,8 +2743,8 @@ export default function App() {
                           </span>
 
                           <div className="settings-developer-tools-text">
-                            <strong>Advanced Use</strong>
-                            <p>Expose in-chat model switching and chat-preset selection for users who need more direct session control.</p>
+                            <strong>Session controls</strong>
+                            <p>Expose in-chat model, reasoning, and preset controls for people who want direct session-level control.</p>
                           </div>
                         </div>
 
@@ -2282,7 +2771,7 @@ export default function App() {
 
                           <div className="settings-developer-tools-text">
                             <strong>Deep Research Search Engine Test</strong>
-                            <p>Runs DuckDuckGo and Google Search through the live deep-research fetch pipeline. The test only passes if each engine can fetch search results, parse them, scrape destination pages, and verify known information.</p>
+                            <p>Runs DuckDuckGo and Google Search through the live deep-research fetch pipeline and only passes if search, scrape, and verification all succeed.</p>
                           </div>
                         </div>
 
@@ -2399,7 +2888,8 @@ export default function App() {
                     </section>
                   )}
                 </div>
-              </div>
+              </section>
+            </div>
             </div>
           ) : route.kind === 'landing' ? (
             <PromptLibraryView
@@ -2407,6 +2897,8 @@ export default function App() {
               chats={chats}
               folders={projectFolders}
               defaultModel={resolvedDefaultModel}
+              defaultChatPreset={defaultChatPreset}
+              defaultReasoningEffort={defaultReasoningEffort}
               models={models}
               onStartChat={handleStartChatFromHome}
               onOpenChat={handleOpenFromHistory}
@@ -2467,6 +2959,8 @@ export default function App() {
                   chats={codeSurfaceChats}
                   folders={projectFolders}
                   defaultModel={resolvedDefaultModel}
+                  defaultChatPreset={defaultChatPreset}
+                  defaultReasoningEffort={defaultReasoningEffort}
                   models={models}
                   onStartChat={handleStartChatFromHome}
                   onOpenChat={handleOpenFromHistory}
@@ -2496,6 +2990,8 @@ export default function App() {
                   chats={debugSurfaceChats}
                   folders={projectFolders}
                   defaultModel={resolvedDefaultModel}
+                  defaultChatPreset={defaultChatPreset}
+                  defaultReasoningEffort={defaultReasoningEffort}
                   models={models}
                   onStartChat={handleStartChatFromHome}
                   onOpenChat={handleOpenFromHistory}
