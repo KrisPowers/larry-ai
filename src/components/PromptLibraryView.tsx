@@ -12,12 +12,11 @@ import {
   IconFolder,
   IconFolderPlus,
   IconMessageSquare,
-  IconTerminal,
   IconTrash2,
   IconUpload,
 } from './Icon';
 
-type PromptPage = 'landing' | 'chat' | 'code' | 'debug';
+type PromptPage = 'landing' | 'chat' | 'code';
 
 interface StartOptions {
   prompt: string;
@@ -51,7 +50,6 @@ interface Props {
   onDeleteWorkspace: (workspace: { id: string; label: string }) => void;
   onGoToChat?: () => void;
   onGoToCode?: () => void;
-  onGoToDebug?: () => void;
 }
 
 interface PageDefinition {
@@ -86,35 +84,19 @@ const PAGE_DEFINITIONS: Record<Exclude<PromptPage, 'landing'>, PageDefinition> =
   },
   code: {
     kicker: 'Code',
-    title: 'Start a project thread.',
-    description: 'Code threads belong to a workspace so the project explorer can hold files and implementation threads together.',
-    promptLabel: 'Build brief',
-    placeholder: 'Describe the feature, stack, constraints, and output you want built...',
-    launchLabel: 'Start code thread',
+    title: 'Start inside a workspace.',
+    description: 'Each workspace now holds the project files plus the code chats that belong to that directory.',
+    promptLabel: 'What should we build or inspect?',
+    placeholder: 'Describe the feature, bug, repo area, constraints, files, or output you want help with...',
+    launchLabel: 'Start workspace chat',
     preset: 'code',
     threadType: 'code',
     requiresWorkspace: true,
-    workspaceLabel: 'Project workspace',
-    workspaceHint: 'Choose the workspace this build belongs to. New code threads stay attached to that project.',
-    emptyWorkspaceTitle: 'No project workspace yet',
-    emptyWorkspaceHint: 'Create a workspace or import a folder before starting a code thread.',
+    workspaceLabel: 'Workspace',
+    workspaceHint: 'Pick the project directory that should own this code chat.',
+    emptyWorkspaceTitle: 'Create or import a workspace first.',
+    emptyWorkspaceHint: 'A workspace acts as the project directory and groups the codebase with the chats that belong to it.',
     icon: IconCode2,
-  },
-  debug: {
-    kicker: 'Debug',
-    title: 'Start a debugging thread.',
-    description: 'Debug threads stay under the affected project so repro notes, fixes, and follow-up checks remain grouped in one place.',
-    promptLabel: 'Bug report',
-    placeholder: 'Describe the bug, expected behavior, reproduction steps, logs, and what you already tried...',
-    launchLabel: 'Start debug thread',
-    preset: 'code',
-    threadType: 'debug',
-    requiresWorkspace: true,
-    workspaceLabel: 'Affected workspace',
-    workspaceHint: 'Pick the workspace that owns the bug so the explorer keeps the troubleshooting threads under the right project.',
-    emptyWorkspaceTitle: 'No affected workspace yet',
-    emptyWorkspaceHint: 'Create a workspace or import a folder before starting a debug thread.',
-    icon: IconTerminal,
   },
 };
 
@@ -128,18 +110,17 @@ const ROUTE_LAUNCHERS = [
   {
     id: 'code',
     label: 'Code',
-    description: 'Project-based build threads with a workspace explorer.',
+    description: 'Code generation, audits, and debugging in one IDE-style workspace.',
     icon: IconCode2,
-  },
-  {
-    id: 'debug',
-    label: 'Debug',
-    description: 'Troubleshooting threads grouped by project workspace.',
-    icon: IconTerminal,
   },
 ] as const;
 
 const CHAT_START_PRESETS = PRESETS.filter((preset) => preset.id !== 'code');
+const CODE_START_PRESET: ChatComposerOption = {
+  value: 'code',
+  label: 'Code Workspace',
+  description: 'Generation, debugging, and auditing currently share the same code-focused preset.',
+};
 const CHAT_STARTER_PLACEHOLDER = "Ask anything... paste a URL and it'll be fetched automatically. Shift+Enter for newline.";
 const REASONING_EFFORT_OPTIONS: Array<{ value: ChatReasoningEffort; label: string }> = [
   { value: 'light', label: 'Low' },
@@ -212,7 +193,6 @@ export function PromptLibraryView({
   onDeleteWorkspace,
   onGoToChat,
   onGoToCode,
-  onGoToDebug,
 }: Props) {
   const [prompt, setPrompt] = useState('');
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState('');
@@ -229,7 +209,9 @@ export function PromptLibraryView({
   const reasoningPickerRef = useRef<HTMLDivElement>(null);
 
   const showLibrary = page === 'landing';
-  const currentPage = page as PromptPage;
+  const currentPage = page;
+  const isCodeStarter = page === 'code';
+  const usesAdvancedComposer = page === 'chat' || page === 'code';
   const definition = PAGE_DEFINITIONS[showLibrary ? 'chat' : page];
   const workspaceGroups = useMemo(() => buildWorkspaceGroups(chats, folders), [chats, folders]);
   const workspaceOptions = useMemo(
@@ -281,10 +263,10 @@ export function PromptLibraryView({
   }));
 
   useEffect(() => {
-    if (page !== 'chat') return;
+    if (!usesAdvancedComposer) return;
     if (selectedChatModel && models.includes(selectedChatModel)) return;
     setSelectedChatModel(defaultModel || models[0] || '');
-  }, [defaultModel, models, page, selectedChatModel]);
+  }, [defaultModel, models, selectedChatModel, usesAdvancedComposer]);
 
   useEffect(() => {
     if (page !== 'chat') return;
@@ -337,20 +319,22 @@ export function PromptLibraryView({
     if (definition.requiresWorkspace && !selectedWorkspace) return;
 
     const title = definition.requiresWorkspace && selectedWorkspace
-      ? `${selectedWorkspace.label} ${definition.threadType === 'debug' ? 'Debug' : 'Code'}`
-      : selectedChatPreset === 'deep-research'
+      ? `${selectedWorkspace.label} Chat`
+      : isCodeStarter
+        ? 'New Code Chat'
+        : selectedChatPreset === 'deep-research'
         ? 'New Deep Research Chat'
         : 'New Chat';
 
     const started = onStartChat({
       prompt: cleanPrompt,
-      preset: page === 'chat' ? selectedChatPreset : definition.preset,
+      preset: isCodeStarter ? 'code' : page === 'chat' ? selectedChatPreset : definition.preset,
       title,
-      threadType: definition.threadType,
-      model: page === 'chat' ? resolvedChatModel : undefined,
+      threadType: isCodeStarter ? 'code' : definition.threadType,
+      model: usesAdvancedComposer ? resolvedChatModel : undefined,
       reasoningEffort: page === 'chat' ? selectedChatReasoningEffort : undefined,
       workspace: definition.requiresWorkspace ? selectedWorkspace : undefined,
-      fileEntries: page === 'chat' ? attachmentsToStoredEntries(attachedChatFiles) : undefined,
+      fileEntries: usesAdvancedComposer ? attachmentsToStoredEntries(attachedChatFiles) : undefined,
     });
 
     if (started) {
@@ -378,16 +362,14 @@ export function PromptLibraryView({
             <span className="launch-kicker">Workspace Home</span>
             <h1>Choose the workflow first, then drop into saved local threads.</h1>
             <p>
-              Chat stays lightweight. Code and debug live in project workspaces with a proper explorer so threads behave like tracked work, not loose prompts.
+              Chat stays lightweight. Code now absorbs debugging and auditing so implementation work keeps one focused surface instead of splitting across routes.
             </p>
             <div className="landing-route-grid" role="navigation" aria-label="Start routes">
               {ROUTE_LAUNCHERS.map((route) => {
                 const RouteIcon = route.icon;
                 const handler = route.id === 'chat'
                   ? onGoToChat
-                  : route.id === 'code'
-                    ? onGoToCode
-                    : onGoToDebug;
+                  : onGoToCode;
                 return (
                   <button
                     key={route.id}
@@ -413,7 +395,7 @@ export function PromptLibraryView({
             </div>
             <div className="landing-stage-note">
               <span className="landing-note-label">Routing</span>
-              <strong>`/chat`, `/code`, `/debug`</strong>
+              <strong>`/chat`, `/code`</strong>
             </div>
             <div className="landing-stage-note">
               <span className="landing-note-label">Storage</span>
@@ -614,6 +596,130 @@ export function PromptLibraryView({
               onModelChange={setSelectedChatModel}
               onSend={handleStartChat}
               sendDisabled={!prompt.trim()}
+            />
+          </div>
+        </section>
+      </div>
+    );
+  }
+
+  if (page === 'code') {
+    return (
+      <div className={`route-starter route-starter-${page} route-starter-code-workbench${embedded ? ' route-starter-embedded' : ''}`}>
+        <section className="code-workbench-starter">
+          <div className="code-workbench-starter-head">
+            <span className="launch-kicker">{definition.kicker}</span>
+            <h1>{definition.title}</h1>
+            <p>{definition.description}</p>
+          </div>
+
+          <div className="code-workbench-starter-grid">
+            <article className="code-workbench-note code-workbench-note-primary">
+              <span className="code-workbench-note-label">Workspace model</span>
+              <strong>Files and chats stay together</strong>
+              <p>Pick a workspace first, then keep every code chat tied to that project directory and file map.</p>
+            </article>
+
+            <article className="code-workbench-note">
+              <span className="code-workbench-note-label">Good launch prompts</span>
+              <ul className="code-workbench-note-list">
+                <li>Name the file, feature, or bug first.</li>
+                <li>Call out constraints, stack, and expected output.</li>
+                <li>Upload a zip or files when local context will help.</li>
+              </ul>
+            </article>
+          </div>
+
+          {workspaceOptions.length ? (
+            <section className="route-starter-section" aria-label="Workspace selection">
+              <div className="route-starter-section-head">
+                <strong>{definition.workspaceLabel}</strong>
+                <p>{definition.workspaceHint}</p>
+              </div>
+
+              <div className="starter-workspace-block">
+                <div className="route-starter-workspace-row">
+                  <select
+                    className="starter-workspace-select"
+                    value={selectedWorkspaceId}
+                    onChange={(event) => setSelectedWorkspaceId(event.target.value)}
+                  >
+                    {workspaceOptions.map((workspace) => (
+                      <option key={workspace.id} value={workspace.id}>
+                        {workspace.label}
+                      </option>
+                    ))}
+                  </select>
+
+                  <button className="btn" type="button" onClick={() => onOpenWorkspaceLauncher('create')}>
+                    <IconFolderPlus size={14} />
+                    <span>New workspace</span>
+                  </button>
+
+                  <button className="btn settings-secondary-btn" type="button" onClick={() => onOpenWorkspaceLauncher('import')}>
+                    <IconUpload size={14} />
+                    <span>Import folder</span>
+                  </button>
+                </div>
+
+                {selectedWorkspace ? (
+                  <article className="code-workbench-note">
+                    <span className="code-workbench-note-label">Selected workspace</span>
+                    <strong>{selectedWorkspace.label}</strong>
+                    <p>
+                      {selectedWorkspace.fileCount} file{selectedWorkspace.fileCount === 1 ? '' : 's'} in the workspace
+                      {' · '}
+                      {selectedWorkspace.chats.length} saved code chat{selectedWorkspace.chats.length === 1 ? '' : 's'} already tied to it.
+                    </p>
+                  </article>
+                ) : null}
+              </div>
+            </section>
+          ) : (
+            <div className="route-starter-empty">
+              <strong>{definition.emptyWorkspaceTitle}</strong>
+              <p>{definition.emptyWorkspaceHint}</p>
+              <div className="route-starter-workspace-row">
+                <button className="btn" type="button" onClick={() => onOpenWorkspaceLauncher('create')}>
+                  <IconFolderPlus size={14} />
+                  <span>New workspace</span>
+                </button>
+                <button className="btn settings-secondary-btn" type="button" onClick={() => onOpenWorkspaceLauncher('import')}>
+                  <IconUpload size={14} />
+                  <span>Import folder</span>
+                </button>
+              </div>
+            </div>
+          )}
+
+          <div className="panel-input code-workbench-composer">
+            <ChatComposer
+              value={prompt}
+              onValueChange={setPrompt}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+                  event.preventDefault();
+                  handleStartChat();
+                }
+              }}
+              placeholder={definition.placeholder}
+              ariaLabel={definition.promptLabel}
+              uploadTitle="Upload files or a zip before starting this workspace chat"
+              uploadActive={attachedChatFiles.length > 0}
+              onUploadFiles={handleChatUploads}
+              reasoningValue={selectedChatReasoningEffort}
+              reasoningOptions={composerReasoningOptions}
+              onReasoningChange={(value) => setSelectedChatReasoningEffort(value as ChatReasoningEffort)}
+              reasoningDisabled={true}
+              presetValue={CODE_START_PRESET.value}
+              presetOptions={[CODE_START_PRESET]}
+              onPresetChange={() => undefined}
+              presetDisabled={true}
+              modelValue={resolvedChatModel}
+              modelOptions={models}
+              onModelChange={setSelectedChatModel}
+              onSend={handleStartChat}
+              sendDisabled={!canLaunch}
             />
           </div>
         </section>

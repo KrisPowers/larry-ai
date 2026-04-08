@@ -67,8 +67,24 @@ export function IconPlus(p: SVGProps) {
   return <Svg {...p}><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></Svg>;
 }
 
+export function IconSquarePen(p: SVGProps) {
+  return <Svg {...p}><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 1 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></Svg>;
+}
+
+export function IconClock3(p: SVGProps) {
+  return <Svg {...p}><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></Svg>;
+}
+
+export function IconDotsGrid(p: SVGProps) {
+  return <Svg {...p}><circle cx="8" cy="8" r="1.2" fill="currentColor" stroke="none"/><circle cx="16" cy="8" r="1.2" fill="currentColor" stroke="none"/><circle cx="8" cy="16" r="1.2" fill="currentColor" stroke="none"/><circle cx="16" cy="16" r="1.2" fill="currentColor" stroke="none"/></Svg>;
+}
+
 export function IconArrowUp(p: SVGProps) {
   return <Svg {...p}><line x1="12" y1="19" x2="12" y2="5"/><polyline points="6 11 12 5 18 11"/></Svg>;
+}
+
+export function IconArrowUpRight(p: SVGProps) {
+  return <Svg {...p}><path d="M7 17 17 7"/><path d="M7 7h10v10"/></Svg>;
 }
 
 export function IconFolderPlus(p: SVGProps) {

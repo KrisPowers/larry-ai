@@ -1,187 +1,126 @@
-import { useEffect, useMemo, useState } from 'react';
-import { buildWorkspaceGroups } from '../lib/workspaces';
-import type { ChatRecord, ProjectFolder } from '../types';
+import { useMemo } from 'react';
+import type { WorkspaceGroup } from '../lib/workspaces';
 import {
+  IconDotsGrid,
   IconFolder,
-  IconFolderOpen,
   IconFolderPlus,
-  IconMessageSquare,
-  IconTrash2,
-  IconUpload,
+  IconSettings,
+  IconSlidersHorizontal,
+  IconSquarePen,
 } from './Icon';
 
 interface Props {
-  mode: 'code' | 'debug';
-  folders: ProjectFolder[];
-  chats: ChatRecord[];
-  activeChatId: string | null;
-  onOpenWorkspaceLauncher: (mode?: 'create' | 'import') => void;
-  onCreateChatInFolder: (folder: { id: string; label: string }) => void;
-  onOpenChat: (chat: ChatRecord) => void;
-  onDeleteChat: (id: string) => void;
-  onDeleteWorkspace: (workspace: { id: string; label: string }) => void;
-}
-
-function formatSidebarAge(updatedAt: number): string {
-  const deltaMinutes = Math.max(1, Math.floor((Date.now() - updatedAt) / 60000));
-  if (deltaMinutes < 60) return `${deltaMinutes}m`;
-
-  const deltaHours = Math.floor(deltaMinutes / 60);
-  if (deltaHours < 24) return `${deltaHours}h`;
-
-  const deltaDays = Math.floor(deltaHours / 24);
-  if (deltaDays < 7) return `${deltaDays}d`;
-
-  return new Date(updatedAt).toLocaleDateString([], { month: 'short', day: 'numeric' });
+  workspaces: WorkspaceGroup[];
+  activeWorkspaceId: string | null;
+  onCreateWorkspace: () => void;
+  onCreateChat: () => void;
+  onOpenWorkspace: (workspace: WorkspaceGroup) => void;
+  onOpenSettings: () => void;
 }
 
 export function Sidebar({
-  mode,
-  folders,
-  chats,
-  activeChatId,
-  onOpenWorkspaceLauncher,
-  onCreateChatInFolder,
-  onOpenChat,
-  onDeleteChat,
-  onDeleteWorkspace,
+  workspaces,
+  activeWorkspaceId,
+  onCreateWorkspace,
+  onCreateChat,
+  onOpenWorkspace,
+  onOpenSettings,
 }: Props) {
-  const [activeWorkspaceId, setActiveWorkspaceId] = useState<string | null>(null);
-
-  const groups = useMemo(
-    () => buildWorkspaceGroups(chats, folders).filter((group) => group.id !== 'project:general'),
-    [chats, folders],
+  const sortedWorkspaces = useMemo(
+    () => [...workspaces].sort((left, right) => right.updatedAt - left.updatedAt),
+    [workspaces],
   );
-  const modeLabel = mode === 'debug' ? 'Debug Explorer' : 'Code Explorer';
-  const threadLabel = mode === 'debug' ? 'debug' : 'code';
-
-  useEffect(() => {
-    if (activeChatId) {
-      const workspace = groups.find((group) => group.chats.some((chat) => chat.id === activeChatId));
-      if (workspace) {
-        setActiveWorkspaceId(workspace.id);
-        return;
-      }
-    }
-
-    setActiveWorkspaceId((current) => {
-      if (current && groups.some((group) => group.id === current)) return current;
-      return groups[0]?.id ?? null;
-    });
-  }, [activeChatId, groups]);
 
   return (
-    <aside className="workspace-sidebar">
-      <div className="workspace-sidebar-head">
-        <span className="workspace-sidebar-eyebrow">{modeLabel}</span>
-        <h2>Project threads</h2>
-        <p>Workspaces hold folders and saved {threadLabel} threads.</p>
-      </div>
+    <aside className="workbench-sidebar" aria-label="Code sidebar">
+      <div className="workbench-sidebar-main">
+        <nav className="workbench-sidebar-utilities" aria-label="Sidebar actions">
+          <button
+            type="button"
+            className="workbench-sidebar-utility"
+            onClick={onCreateWorkspace}
+          >
+            <IconFolderPlus size={15} />
+            <span>New workspace</span>
+          </button>
 
-      <div className="workspace-sidebar-actions">
-        <button
-          type="button"
-          className="workspace-sidebar-btn primary"
-          onClick={() => onOpenWorkspaceLauncher('create')}
-        >
-          <IconFolderPlus size={14} />
-          <span>New workspace</span>
-        </button>
-        <button
-          type="button"
-          className="workspace-sidebar-btn"
-          onClick={() => onOpenWorkspaceLauncher('import')}
-        >
-          <IconUpload size={14} />
-          <span>Import folder</span>
-        </button>
-      </div>
+          <button
+            type="button"
+            className="workbench-sidebar-utility"
+            title="Skills coming soon"
+          >
+            <IconDotsGrid size={15} />
+            <span>Skills</span>
+          </button>
+        </nav>
 
-      <div className="workspace-sidebar-list">
-        {groups.length === 0 ? (
-          <div className="workspace-sidebar-empty">
-            Create or import a workspace to start keeping {threadLabel} threads in the explorer.
+        <section className="workbench-thread-section" aria-label="Workspaces">
+          <div className="workbench-thread-section-head">
+            <span className="workbench-thread-section-title">Workspaces</span>
+            <div className="workbench-thread-section-tools">
+              <button
+                type="button"
+                className="workbench-thread-section-tool"
+                onClick={onCreateChat}
+                title="New code chat"
+              >
+                <IconSquarePen size={15} />
+              </button>
+              <button
+                type="button"
+                className="workbench-thread-section-tool"
+                title="Filters coming soon"
+              >
+                <IconSlidersHorizontal size={15} />
+              </button>
+            </div>
           </div>
-        ) : (
-          groups.map((group) => {
-            const isActive = activeWorkspaceId === group.id;
-            return (
-              <section key={group.id} className={`workspace-tree${isActive ? ' active' : ''}`}>
-                <div className="workspace-tree-head">
+
+          <div className="workbench-thread-list">
+            {sortedWorkspaces.length === 0 ? (
+              <div className="workbench-thread-empty">
+                No workspaces yet
+              </div>
+            ) : (
+              sortedWorkspaces.map((workspace) => {
+                const isActive = activeWorkspaceId === workspace.id;
+                const fileLabel = workspace.fileCount === 1 ? '1 file' : `${workspace.fileCount} files`;
+                const chatLabel = workspace.chats.length === 1 ? '1 chat' : `${workspace.chats.length} chats`;
+
+                return (
                   <button
+                    key={workspace.id}
                     type="button"
-                    className={`workspace-tree-toggle${isActive ? ' active' : ''}`}
-                    aria-expanded={isActive}
-                    onClick={() => setActiveWorkspaceId((current) => (current === group.id ? null : group.id))}
-                    title={group.label}
+                    className={`workbench-thread-item${isActive ? ' active' : ''}`}
+                    onClick={() => onOpenWorkspace(workspace)}
+                    title={workspace.label || 'Untitled workspace'}
                   >
-                    <span className="workspace-tree-icon">
-                      {isActive ? <IconFolderOpen size={14} /> : <IconFolder size={14} />}
+                    <span className="workbench-thread-item-icon">
+                      <IconFolder size={15} />
                     </span>
-                    <span className="workspace-tree-label">{group.label}</span>
-                    <span className="workspace-tree-count">{group.chats.length}</span>
+                    <span className="workbench-thread-item-label">{workspace.label || 'Untitled workspace'}</span>
+                    {isActive ? (
+                      <span className="workbench-thread-item-meta">
+                        <span className="workbench-thread-item-project">{fileLabel} · {chatLabel}</span>
+                      </span>
+                    ) : null}
                   </button>
+                );
+              })
+            )}
+          </div>
+        </section>
+      </div>
 
-                  <div className="workspace-tree-tools">
-                    <button
-                      type="button"
-                      className="workspace-tree-tool primary"
-                      onClick={() => onCreateChatInFolder({ id: group.id, label: group.label })}
-                      title={`New ${threadLabel} thread`}
-                    >
-                      <IconMessageSquare size={13} />
-                    </button>
-                    <button
-                      type="button"
-                      className="workspace-tree-tool danger"
-                      onClick={() => onDeleteWorkspace({ id: group.id, label: group.label })}
-                      title="Delete workspace"
-                    >
-                      <IconTrash2 size={12} />
-                    </button>
-                  </div>
-                </div>
-
-                {isActive && (
-                  <div className="workspace-tree-body">
-                    {group.chats.length ? (
-                      <div className="workspace-thread-list">
-                        {group.chats.map((chat) => {
-                          const isOpen = activeChatId === chat.id;
-                          return (
-                            <div key={chat.id} className={`workspace-thread-row${isOpen ? ' open' : ''}`}>
-                              <button
-                                type="button"
-                                className="workspace-thread-open"
-                                onClick={() => onOpenChat(chat)}
-                                title={chat.title || 'Untitled'}
-                              >
-                                <span className="workspace-thread-title">{chat.title || 'Untitled'}</span>
-                                <span className="workspace-thread-time">{formatSidebarAge(chat.updatedAt)}</span>
-                              </button>
-                              <button
-                                type="button"
-                                className="workspace-thread-delete"
-                                title="Delete chat"
-                                onClick={() => onDeleteChat(chat.id)}
-                              >
-                                <IconTrash2 size={11} />
-                              </button>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    ) : (
-                      <div className="workspace-tree-empty">
-                        This workspace does not have any saved {threadLabel} threads yet.
-                      </div>
-                    )}
-                  </div>
-                )}
-              </section>
-            );
-          })
-        )}
+      <div className="workbench-sidebar-footer">
+        <button
+          type="button"
+          className="workbench-sidebar-utility"
+          onClick={onOpenSettings}
+        >
+          <IconSettings size={15} />
+          <span>Settings</span>
+        </button>
       </div>
     </aside>
   );

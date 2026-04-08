@@ -30,7 +30,7 @@ import {
 import { DEFAULT_PRESET_ID, PRESETS, describePreset } from './lib/presets';
 import { REPLY_PREFERENCES_STORAGE_KEY, clearReplyPreferences } from './lib/replyPreferences';
 import { IconCheck, IconDownload, IconFolderPlus, IconHexagon, IconMessageSquare, IconRefreshCw, IconSearch, IconSettings, IconTerminal, IconTrash2, IconUpload, IconX } from './components/Icon';
-import { deriveWorkspaceFromChat, normaliseProjectId } from './lib/workspaces';
+import { buildWorkspaceGroups, deriveWorkspaceFromChat, normaliseProjectId, type WorkspaceGroup } from './lib/workspaces';
 import { ProviderIcon } from './components/ProviderIcon';
 import type { ChatReasoningEffort, Panel, ChatRecord, ProjectFolder, ThreadType } from './types';
 import type { FileRegistry } from './lib/fileRegistry';
@@ -63,7 +63,6 @@ type AppRoute =
   | { kind: 'landing' }
   | { kind: 'chat-start' }
   | { kind: 'code-start' }
-  | { kind: 'debug-start' }
   | { kind: 'settings' }
   | { kind: 'chat'; chatId: string }
   | { kind: 'not-found'; path: string };
@@ -98,17 +97,20 @@ const SETTINGS_TAB_META: Record<SettingsTabId, {
 };
 
 function buildStartPath(threadType: ThreadType): string {
-  if (threadType === 'code') return '/code';
-  if (threadType === 'debug') return '/debug';
+  if (threadType === 'code' || threadType === 'debug') return '/code';
   return '/chat';
 }
 
 function resolveThreadSurface(record?: Partial<Pick<ChatRecord, 'threadType' | 'preset' | 'projectId' | 'projectLabel'>> | null): ThreadType {
-  if (record?.threadType === 'chat' || record?.threadType === 'code' || record?.threadType === 'debug') {
-    return record.threadType;
+  if (record?.threadType === 'chat') {
+    return 'chat';
   }
 
-  if (record?.preset === 'code' && record.projectId && record.projectLabel) {
+  if (record?.threadType === 'code' || record?.threadType === 'debug') {
+    return 'code';
+  }
+
+  if (record?.preset === 'code') {
     return 'code';
   }
 
@@ -281,7 +283,7 @@ function parseAppRoute(pathname: string): AppRoute {
   }
 
   if (cleanPath === '/debug') {
-    return { kind: 'debug-start' };
+    return { kind: 'code-start' };
   }
 
   if (cleanPath === '/settings') {
@@ -488,6 +490,12 @@ export default function App() {
     window.addEventListener('popstate', handlePopState);
     return () => window.removeEventListener('popstate', handlePopState);
   }, []);
+
+  useEffect(() => {
+    if (window.location.pathname === '/debug' && route.kind === 'code-start') {
+      navigate('/code', true);
+    }
+  }, [navigate, route.kind]);
 
   useEffect(() => {
     try {
@@ -859,7 +867,7 @@ export default function App() {
     );
     upsertProjectFolder({ id: folder.id, label: folder.label });
     openDraftChat({
-      title: `${folder.label} ${threadType === 'debug' ? 'Debug' : 'Code'}`,
+      title: `${folder.label} ${threadType === 'debug' ? 'Debug' : 'Chat'}`,
       preset: 'code',
       threadType,
       projectId: folder.id,
@@ -1512,26 +1520,26 @@ export default function App() {
     () => chats.filter((chat) => resolveThreadSurface(chat) === 'code'),
     [chats],
   );
-  const debugSurfaceChats = useMemo(
-    () => chats.filter((chat) => resolveThreadSurface(chat) === 'debug'),
-    [chats],
+  const codeWorkspaceGroups = useMemo(
+    () => buildWorkspaceGroups(codeSurfaceChats, projectFolders),
+    [codeSurfaceChats, projectFolders],
   );
-  const explorerMode = route.kind === 'code-start'
-    ? 'code'
-    : route.kind === 'debug-start'
-      ? 'debug'
-      : route.kind === 'chat' && activeThreadSurface !== 'chat'
-        ? activeThreadSurface
-        : null;
-  const explorerChats = explorerMode === 'debug' ? debugSurfaceChats : codeSurfaceChats;
   const handleCreateCodeThreadInFolder = useCallback(
     (folder: { id: string; label: string }) => handleCreateChatInFolder(folder, 'code'),
     [handleCreateChatInFolder],
   );
-  const handleCreateDebugThreadInFolder = useCallback(
-    (folder: { id: string; label: string }) => handleCreateChatInFolder(folder, 'debug'),
-    [handleCreateChatInFolder],
-  );
+  const handleOpenCodeWorkspace = useCallback((workspace: WorkspaceGroup) => {
+    const latestChat = [...workspace.chats].sort((left, right) => right.updatedAt - left.updatedAt)[0];
+    if (latestChat) {
+      handleOpenFromHistory(latestChat);
+      return;
+    }
+
+    handleCreateCodeThreadInFolder({ id: workspace.id, label: workspace.label });
+  }, [handleCreateCodeThreadInFolder, handleOpenFromHistory]);
+  const handleShowCodeStarter = useCallback(() => {
+    navigate('/code');
+  }, [navigate]);
   const embeddedChatStarterFrame = showEmbeddedChatStarter ? (
     <section className="chat-starter-frame">
       <div className="chat-starter-frame-head">
@@ -1568,9 +1576,31 @@ export default function App() {
       </div>
     </section>
   ) : null;
+  const isCodeSurfaceRoute =
+    route.kind === 'code-start' || (route.kind === 'chat' && activeThreadSurface === 'code');
+  const activeCodePanel = route.kind === 'chat' && activeThreadSurface === 'code'
+    ? activePanel
+    : null;
+  const activeCodeWorkspaceId = useMemo(() => {
+    if (route.kind !== 'chat' || activeThreadSurface !== 'code') return null;
+    const persistedChat = chats.find((chat) => chat.id === route.chatId);
+    if (persistedChat) return deriveWorkspaceFromChat(persistedChat).id;
+    return activeCodePanel?.projectId ?? null;
+  }, [activeCodePanel?.projectId, activeThreadSurface, chats, route]);
+  const handleCreateCodeChat = useCallback(() => {
+    const activeWorkspace = activeCodeWorkspaceId
+      ? codeWorkspaceGroups.find((workspace) => workspace.id === activeCodeWorkspaceId)
+      : null;
+
+    if (activeWorkspace) {
+      handleCreateCodeThreadInFolder({ id: activeWorkspace.id, label: activeWorkspace.label });
+      return;
+    }
+
+    handleShowCodeStarter();
+  }, [activeCodeWorkspaceId, codeWorkspaceGroups, handleCreateCodeThreadInFolder, handleShowCodeStarter]);
   const isChatRouteActive = route.kind === 'chat-start' || (route.kind === 'chat' && activeThreadSurface === 'chat');
-  const isCodeRouteActive = route.kind === 'code-start' || (route.kind === 'chat' && activeThreadSurface === 'code');
-  const isDebugRouteActive = route.kind === 'debug-start' || (route.kind === 'chat' && activeThreadSurface === 'debug');
+  const isCodeRouteActive = isCodeSurfaceRoute;
   const showChatHistoryDrawer =
     !chatLaunchTransition &&
     isChatSurfaceRoute;
@@ -2039,12 +2069,6 @@ export default function App() {
               onClick={() => navigate('/code')}
             >
               Code
-            </button>
-            <button
-              className={`route-link${isDebugRouteActive ? ' active' : ''}`}
-              onClick={() => navigate('/debug')}
-            >
-              Debug
             </button>
           </div>
 
@@ -2908,7 +2932,6 @@ export default function App() {
               onDeleteWorkspace={requestDeleteWorkspace}
               onGoToChat={() => navigate('/chat')}
               onGoToCode={() => navigate('/code')}
-              onGoToDebug={() => navigate('/debug')}
             />
           ) : route.kind === 'chat-start' ? (
             <div id="workspace" className="chat-route-workspace chat-root-workspace">
@@ -2941,65 +2964,33 @@ export default function App() {
               </div>
             </div>
           ) : route.kind === 'code-start' ? (
-            <div className="workbench-route-shell">
+            <div className="workbench-route-shell code-route-shell">
               <Sidebar
-                mode="code"
-                folders={projectFolders}
-                chats={codeSurfaceChats}
-                activeChatId={null}
-                onOpenWorkspaceLauncher={openWorkspaceLauncher}
-                onCreateChatInFolder={handleCreateCodeThreadInFolder}
-                onOpenChat={handleOpenFromHistory}
-                onDeleteChat={requestDeleteChat}
-                onDeleteWorkspace={requestDeleteWorkspace}
+                workspaces={codeWorkspaceGroups}
+                activeWorkspaceId={null}
+                onCreateWorkspace={() => openWorkspaceLauncher('create')}
+                onCreateChat={handleCreateCodeChat}
+                onOpenWorkspace={handleOpenCodeWorkspace}
+                onOpenSettings={() => navigate('/settings')}
               />
               <div className="workbench-route-main">
-                <PromptLibraryView
-                  page="code"
-                  chats={codeSurfaceChats}
-                  folders={projectFolders}
-                  defaultModel={resolvedDefaultModel}
-                  defaultChatPreset={defaultChatPreset}
-                  defaultReasoningEffort={defaultReasoningEffort}
-                  models={models}
-                  onStartChat={handleStartChatFromHome}
-                  onOpenChat={handleOpenFromHistory}
-                  onCreateChatInFolder={handleCreateCodeThreadInFolder}
-                  onOpenWorkspaceLauncher={openWorkspaceLauncher}
-                  onDeleteChat={requestDeleteChat}
-                  onDeleteWorkspace={requestDeleteWorkspace}
-                />
-              </div>
-            </div>
-          ) : route.kind === 'debug-start' ? (
-            <div className="workbench-route-shell">
-              <Sidebar
-                mode="debug"
-                folders={projectFolders}
-                chats={debugSurfaceChats}
-                activeChatId={null}
-                onOpenWorkspaceLauncher={openWorkspaceLauncher}
-                onCreateChatInFolder={handleCreateDebugThreadInFolder}
-                onOpenChat={handleOpenFromHistory}
-                onDeleteChat={requestDeleteChat}
-                onDeleteWorkspace={requestDeleteWorkspace}
-              />
-              <div className="workbench-route-main">
-                <PromptLibraryView
-                  page="debug"
-                  chats={debugSurfaceChats}
-                  folders={projectFolders}
-                  defaultModel={resolvedDefaultModel}
-                  defaultChatPreset={defaultChatPreset}
-                  defaultReasoningEffort={defaultReasoningEffort}
-                  models={models}
-                  onStartChat={handleStartChatFromHome}
-                  onOpenChat={handleOpenFromHistory}
-                  onCreateChatInFolder={handleCreateDebugThreadInFolder}
-                  onOpenWorkspaceLauncher={openWorkspaceLauncher}
-                  onDeleteChat={requestDeleteChat}
-                  onDeleteWorkspace={requestDeleteWorkspace}
-                />
+                <div className="code-workbench-stage">
+                  <PromptLibraryView
+                    page="code"
+                    chats={codeSurfaceChats}
+                    folders={projectFolders}
+                    defaultModel={resolvedDefaultModel}
+                    defaultChatPreset={defaultChatPreset}
+                    defaultReasoningEffort={defaultReasoningEffort}
+                    models={models}
+                    onStartChat={handleStartChatFromHome}
+                    onOpenChat={handleOpenFromHistory}
+                    onCreateChatInFolder={handleCreateCodeThreadInFolder}
+                    onOpenWorkspaceLauncher={openWorkspaceLauncher}
+                    onDeleteChat={requestDeleteChat}
+                    onDeleteWorkspace={requestDeleteWorkspace}
+                  />
+                </div>
               </div>
             </div>
           ) : route.kind === 'not-found' ? (
@@ -3015,58 +3006,55 @@ export default function App() {
                 </button>
               </div>
             </div>
-          ) : explorerMode ? (
-            <div className="workbench-route-shell">
+          ) : isCodeSurfaceRoute ? (
+            <div className="workbench-route-shell code-route-shell">
               <Sidebar
-                mode={explorerMode}
-                folders={projectFolders}
-                chats={explorerChats}
-                activeChatId={activePanel?.id ?? route.chatId}
-                onOpenWorkspaceLauncher={openWorkspaceLauncher}
-                onCreateChatInFolder={explorerMode === 'debug' ? handleCreateDebugThreadInFolder : handleCreateCodeThreadInFolder}
-                onOpenChat={handleOpenFromHistory}
-                onDeleteChat={requestDeleteChat}
-                onDeleteWorkspace={requestDeleteWorkspace}
+                workspaces={codeWorkspaceGroups}
+                activeWorkspaceId={activeCodeWorkspaceId}
+                onCreateWorkspace={() => openWorkspaceLauncher('create')}
+                onCreateChat={handleCreateCodeChat}
+                onOpenWorkspace={handleOpenCodeWorkspace}
+                onOpenSettings={() => navigate('/settings')}
               />
               <div className="workbench-route-main">
-                <div id="workspace" className="chat-route-workspace explorer-chat-workspace">
-                  {activePanel ? (
-                    <div id="panels-area">
+                <div id="workspace" className="chat-route-workspace explorer-chat-workspace code-workbench-workspace">
+                  {activeCodePanel ? (
+                    <div id="panels-area" className="code-workbench-panel-area">
                       <ChatPanel
-                        key={activePanel.id}
-                        panel={activePanel}
+                        key={activeCodePanel.id}
+                        panel={activeCodePanel}
                         models={models}
                         showDeveloperTools={developerToolsEnabled}
                         showAdvancedUse={advancedUseEnabled}
                         onUpdate={updatePanel}
                         onClose={closePanel}
                         onSave={savePanel}
-                        selected={activePanelId === activePanel.id}
+                        selected={activePanelId === activeCodePanel.id}
                         onActivate={activatePanel}
-                        launchPrompt={queuedLaunchPrompts[activePanel.id] ?? null}
+                        launchPrompt={queuedLaunchPrompts[activeCodePanel.id] ?? null}
                         onConsumeLaunchPrompt={consumeLaunchPrompt}
                         onImportWorkspaceFiles={(files) => {
-                          if (!activePanel.projectId || !activePanel.projectLabel) return;
+                          if (!activeCodePanel.projectId || !activeCodePanel.projectLabel) return;
                           void handleImportDirectory(files, {
-                            id: activePanel.projectId,
-                            label: activePanel.projectLabel,
+                            id: activeCodePanel.projectId,
+                            label: activeCodePanel.projectLabel,
                           });
                         }}
                       />
                     </div>
                   ) : (
-                    <div id="no-panels" className="route-state">
+                    <div id="no-panels" className="route-state code-workbench-empty">
                       <div style={{ fontSize: 56, opacity: 0.12, color: 'var(--accent)' }}>
                         <IconHexagon size={72} />
                       </div>
                       <h2>{isMissingChatRoute ? 'Chat not found' : 'Opening chat'}</h2>
                       <p>
                         {isMissingChatRoute
-                          ? 'That route does not match a saved local chat. Start a new prompt or open one from the explorer.'
+                          ? 'That route does not match a saved code chat. Start a new prompt or reopen one from the sidebar.'
                           : 'Loading the requested local chat from IndexedDB.'}
                       </p>
-                      <button className="btn" onClick={() => navigate(buildStartPath(explorerMode))}>
-                        Return to {explorerMode === 'debug' ? 'debug' : 'code'}
+                      <button className="btn" onClick={() => navigate('/code')}>
+                        Return to code
                       </button>
                     </div>
                   )}
