@@ -163,6 +163,17 @@ function isProjectFolder(entry: unknown): entry is ProjectFolder {
   );
 }
 
+function sanitizeWorkspaceForPersistence(workspace: ProjectFolder): ProjectFolder {
+  if (!workspace.rootPath && !workspace.browserHandleId) {
+    return workspace;
+  }
+
+  return {
+    ...workspace,
+    fileEntries: undefined,
+  };
+}
+
 function isReplyPreference(entry: unknown): entry is ReplyPreferenceRecord {
   return Boolean(
     entry &&
@@ -347,13 +358,15 @@ export async function saveAppSettings(settings: AppSettings): Promise<void> {
 export async function saveWorkspaces(workspaces: ProjectFolder[]): Promise<void> {
   await initializePersistence();
 
+  const sanitizedWorkspaces = workspaces.map(sanitizeWorkspaceForPersistence);
+
   const desktopBridge = getDesktopBridge();
   if (desktopBridge) {
-    await desktopBridge.SaveWorkspaces(workspaces);
+    await desktopBridge.SaveWorkspaces(sanitizedWorkspaces);
     return;
   }
 
-  writeLocalStorageValue(FOLDERS_STORAGE_KEY, JSON.stringify(workspaces));
+  writeLocalStorageValue(FOLDERS_STORAGE_KEY, JSON.stringify(sanitizedWorkspaces));
 }
 
 export async function loadChats(): Promise<ChatRecord[]> {

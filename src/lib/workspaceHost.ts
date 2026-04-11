@@ -2,6 +2,7 @@ import type { WorkspaceSelection, WorkspaceSnapshot } from '../types';
 
 interface WorkspaceHostBridge {
   PickWorkspaceDirectory(): Promise<WorkspaceSelection>;
+  CreateManagedWorkspaceDirectory(label: string): Promise<WorkspaceSelection>;
   ScanWorkspace(rootPath: string): Promise<WorkspaceSnapshot>;
   OpenWorkspaceInExplorer(rootPath: string): Promise<void>;
   CreateWorkspaceDirectory(rootPath: string, relativePath: string): Promise<WorkspaceSnapshot>;
@@ -17,6 +18,7 @@ function getWorkspaceBridge(): WorkspaceHostBridge | null {
 
   const requiredMethods: Array<keyof WorkspaceHostBridge> = [
     'PickWorkspaceDirectory',
+    'CreateManagedWorkspaceDirectory',
     'ScanWorkspace',
     'OpenWorkspaceInExplorer',
     'CreateWorkspaceDirectory',
@@ -50,6 +52,10 @@ export async function pickWorkspaceDirectory(): Promise<WorkspaceSelection | nul
   const selection = await bridge.PickWorkspaceDirectory();
   if (!selection?.rootPath) return null;
   return selection;
+}
+
+export async function createManagedWorkspaceDirectory(label: string): Promise<WorkspaceSelection> {
+  return requireWorkspaceBridge().CreateManagedWorkspaceDirectory(label);
 }
 
 export async function scanWorkspace(rootPath: string): Promise<WorkspaceSnapshot> {

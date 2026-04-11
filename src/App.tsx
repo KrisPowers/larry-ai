@@ -10,6 +10,7 @@ import { useToast } from './hooks/useToast';
 import { createRegistry, updateRegistry } from './lib/fileRegistry';
 import { mergeStoredFileEntries } from './lib/chatAttachments';
 import { runDeepResearchSearchEngineTest } from './lib/fetcher';
+import { isBrowserWorkspacePickerAvailable, pickBrowserWorkspaceDirectory, scanBrowserWorkspace } from './lib/browserWorkspaceHost';
 import {
   ANTHROPIC_UI_SAMPLE_KEY,
   DEFAULT_OLLAMA_BASE,
@@ -22,9 +23,9 @@ import {
 import { DEFAULT_PRESET_ID, PRESETS, describePreset } from './lib/presets';
 import { clearReplyPreferences } from './lib/replyPreferences';
 import { isDesktopRuntime, loadStorageSnapshot, saveAppSettings, saveChat as persistChatRecord, saveWorkspaces } from './lib/persistence';
-import { isWorkspaceHostAvailable, openWorkspaceInExplorer, pickWorkspaceDirectory, scanWorkspace } from './lib/workspaceHost';
+import { createManagedWorkspaceDirectory, isWorkspaceHostAvailable, openWorkspaceInExplorer, pickWorkspaceDirectory, scanWorkspace } from './lib/workspaceHost';
 import { IconCheck, IconDownload, IconFolderPlus, IconHexagon, IconMessageSquare, IconRefreshCw, IconSearch, IconSettings, IconTerminal, IconTrash2, IconUpload, IconX } from './components/Icon';
-import { applyWorkspaceSnapshot, buildWorkspaceGroups, buildWorkspaceIdFromPath, deriveWorkspaceFromChat, findWorkspaceGroup, normaliseProjectId, type WorkspaceGroup } from './lib/workspaces';
+import { applyWorkspaceSnapshot, buildWorkspaceGroups, buildWorkspaceIdFromPath, deriveWorkspaceFromChat, findWorkspaceGroup, normaliseProjectId, workspaceHasLinkedSource, type WorkspaceGroup } from './lib/workspaces';
 import { ProviderIcon } from './components/ProviderIcon';
 import type { AppSettings, ChatReasoningEffort, Panel, ChatRecord, ProjectFolder, ThreadType, WorkspaceSnapshot } from './types';
 import type { FileRegistry } from './lib/fileRegistry';
@@ -46,8 +47,6 @@ interface BrowserStorageSnapshot {
   usage?: number;
   quota?: number;
 }
-
-const DESKTOP_RUNTIME = isDesktopRuntime();
 
 type AppRoute =
   | { kind: 'landing' }
@@ -249,8 +248,8 @@ function buildStorageVisualSegments<T extends { bytes: number }>(buckets: T[]) {
   }));
 }
 
-function getCustomPresetStorageUsage(): { bytes: number; count: number } {
-  if (DESKTOP_RUNTIME) {
+function getCustomPresetStorageUsage(desktopRuntime: boolean): { bytes: number; count: number } {
+  if (desktopRuntime) {
     return { bytes: 0, count: 0 };
   }
 
@@ -372,6 +371,19 @@ function langFromPath(path: string): string {
   return map[ext] ?? ext ?? 'text';
 }
 
+function deriveUploadedFolderLabel(files: File[], fallback?: string): string {
+  const preferred = fallback?.trim();
+  if (preferred) return preferred;
+
+  for (const file of files) {
+    const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath ?? '';
+    const rootSegment = relativePath.split('/').find(Boolean)?.trim();
+    if (rootSegment) return rootSegment;
+  }
+
+  return 'Workspace';
+}
+
 function parseChatLog(md: string, filename: string): ChatRecord | null {
   try {
     const lines = md.split('\n');
@@ -429,6 +441,7 @@ interface ChatLaunchTransitionState {
 }
 
 export default function App() {
+  const desktopRuntime = isDesktopRuntime();
   const [ollamaEndpoint, setOllamaEndpoint] = useState(DEFAULT_OLLAMA_BASE);
   const [ollamaEndpointDraft, setOllamaEndpointDraft] = useState(DEFAULT_OLLAMA_BASE);
   const [openAIApiKey, setOpenAIApiKey] = useState('');
@@ -471,6 +484,39 @@ export default function App() {
   const [settingsTab, setSettingsTab] = useState<SettingsTabId>('workspace');
   const [settingsReady, setSettingsReady] = useState(false);
   const workspaceMergeInFlightRef = useRef(false);
+
+  const findProjectFolderById = useCallback((projectId?: string | null) => (
+    projectId
+      ? projectFolders.find((folder) => folder.id === projectId) ?? null
+      : null
+  ), [projectFolders]);
+
+  const buildPersistedChatRecord = useCallback((
+    chat: Omit<ChatRecord, 'updatedAt'> & { updatedAt?: number },
+  ): ChatRecord => {
+    const linkedWorkspace = findProjectFolderById(chat.projectId);
+
+    return {
+      ...chat,
+      reasoningEffort: chat.reasoningEffort ?? DEFAULT_REASONING_EFFORT,
+      updatedAt: chat.updatedAt ?? Date.now(),
+      fileEntries: linkedWorkspace && workspaceHasLinkedSource(linkedWorkspace)
+        ? undefined
+        : cloneFileEntries(chat.fileEntries),
+    };
+  }, [findProjectFolderById]);
+
+  const persistWorkspaceChat = useCallback(async (
+    chat: Omit<ChatRecord, 'updatedAt'> & { updatedAt?: number },
+  ) => {
+    await save(buildPersistedChatRecord(chat));
+  }, [buildPersistedChatRecord, save]);
+
+  const persistWorkspaceChatDirect = useCallback(async (
+    chat: Omit<ChatRecord, 'updatedAt'> & { updatedAt?: number },
+  ) => {
+    await persistChatRecord(buildPersistedChatRecord(chat));
+  }, [buildPersistedChatRecord]);
 
   const resolvedDefaultModel = resolveModelHandle(defaultModel, models);
 
@@ -548,11 +594,11 @@ export default function App() {
 
     const normalizeLabel = (value: string) => value.trim().toLowerCase();
     const merges = projectFolders.flatMap((linkedFolder) => {
-      if (!linkedFolder.rootPath) return [];
+      if (!workspaceHasLinkedSource(linkedFolder)) return [];
 
       const legacyFolder = projectFolders.find((candidate) =>
         candidate.id !== linkedFolder.id &&
-        !candidate.rootPath &&
+        !workspaceHasLinkedSource(candidate) &&
         normalizeLabel(candidate.label) === normalizeLabel(linkedFolder.label),
       );
       if (!legacyFolder) return [];
@@ -579,7 +625,11 @@ export default function App() {
 
         for (const { canonicalFolder, linkedFolder, legacyFolder } of merges) {
           const otherFolder = canonicalFolder.id === linkedFolder.id ? legacyFolder : linkedFolder;
-          const sourceFolder = linkedFolder.rootPath ? linkedFolder : canonicalFolder.rootPath ? canonicalFolder : linkedFolder;
+          const sourceFolder = workspaceHasLinkedSource(linkedFolder)
+            ? linkedFolder
+            : workspaceHasLinkedSource(canonicalFolder)
+              ? canonicalFolder
+              : linkedFolder;
           const fallbackEntries = sourceFolder.fileEntries?.length ? sourceFolder.fileEntries : canonicalFolder.fileEntries;
 
           remap.set(otherFolder.id, canonicalFolder.id);
@@ -589,6 +639,7 @@ export default function App() {
             label: canonicalFolder.label || sourceFolder.label,
             createdAt: Math.min(canonicalFolder.createdAt, sourceFolder.createdAt),
             rootPath: sourceFolder.rootPath,
+            browserHandleId: sourceFolder.browserHandleId,
             fileTree: sourceFolder.fileTree,
             fileEntries: fallbackEntries,
             fileCount: sourceFolder.fileCount ?? fallbackEntries?.length ?? canonicalFolder.fileCount,
@@ -624,14 +675,14 @@ export default function App() {
           }));
 
         if (chatsToPersist.length) {
-          await Promise.all(chatsToPersist.map((chat) => persistChatRecord(chat)));
+          await Promise.all(chatsToPersist.map((chat) => persistWorkspaceChatDirect(chat)));
           await refresh();
         }
       } finally {
         workspaceMergeInFlightRef.current = false;
       }
     })();
-  }, [chats, projectFolders, ready, refresh, settingsReady]);
+  }, [chats, persistWorkspaceChatDirect, projectFolders, ready, refresh, settingsReady]);
 
   useEffect(() => {
     if (!settingsReady) return;
@@ -664,7 +715,7 @@ export default function App() {
     let cancelled = false;
 
     async function loadBrowserStorageEstimate() {
-      if (DESKTOP_RUNTIME || typeof navigator === 'undefined' || !navigator.storage?.estimate) {
+      if (desktopRuntime || typeof navigator === 'undefined' || !navigator.storage?.estimate) {
         if (!cancelled) setBrowserStorage({ supported: false });
         return;
       }
@@ -691,6 +742,7 @@ export default function App() {
     advancedUseEnabled,
     anthropicApiKey,
     chats,
+    desktopRuntime,
     defaultChatPreset,
     defaultModel,
     defaultReasoningEffort,
@@ -805,7 +857,7 @@ export default function App() {
       updatedAt: Date.now(),
     });
 
-    void save({
+    void persistWorkspaceChat({
       id: panel.id,
       title: panel.title,
       model: panel.model,
@@ -831,13 +883,14 @@ export default function App() {
       navigate(buildChatPath(panel.id));
     }
     return panel.id;
-  }, [createPanel, defaultChatPreset, defaultReasoningEffort, navigate, resolvedDefaultModel, save]);
+  }, [createPanel, defaultChatPreset, defaultReasoningEffort, navigate, persistWorkspaceChat, resolvedDefaultModel]);
 
   const upsertProjectFolder = useCallback((folder: {
     id: string;
     label: string;
     createdAt?: number;
     rootPath?: string;
+    browserHandleId?: string;
     fileTree?: ProjectFolder['fileTree'];
     fileCount?: number;
     directoryCount?: number;
@@ -856,6 +909,7 @@ export default function App() {
             label: folder.label,
             createdAt: folder.createdAt ?? Date.now(),
             rootPath: folder.rootPath,
+            browserHandleId: folder.browserHandleId,
             fileTree: folder.fileTree,
             fileCount: folder.fileCount,
             directoryCount: folder.directoryCount,
@@ -872,6 +926,7 @@ export default function App() {
           ...candidate,
           label: folder.label,
           rootPath: folder.rootPath ?? candidate.rootPath,
+          browserHandleId: folder.browserHandleId ?? candidate.browserHandleId,
           fileTree: folder.fileTree ?? candidate.fileTree,
           fileCount: folder.fileCount ?? candidate.fileCount,
           directoryCount: folder.directoryCount ?? candidate.directoryCount,
@@ -884,7 +939,7 @@ export default function App() {
   }, []);
 
   const applyWorkspaceSnapshotToState = useCallback((
-    workspace: Pick<ProjectFolder, 'id' | 'label' | 'createdAt' | 'rootPath'>,
+    workspace: Pick<ProjectFolder, 'id' | 'label' | 'createdAt' | 'rootPath' | 'browserHandleId'>,
     snapshot: WorkspaceSnapshot,
     options: { unarchive?: boolean } = {},
   ) => {
@@ -893,6 +948,7 @@ export default function App() {
       label: workspace.label,
       createdAt: workspace.createdAt,
       rootPath: workspace.rootPath ?? snapshot.rootPath,
+      browserHandleId: workspace.browserHandleId,
       archivedAt: options.unarchive ? 0 : undefined,
     }, snapshot);
 
@@ -909,10 +965,10 @@ export default function App() {
   }, [upsertProjectFolder]);
 
   const syncWorkspaceFolder = useCallback(async (
-    workspace: Pick<ProjectFolder, 'id' | 'label' | 'createdAt' | 'rootPath'>,
+    workspace: Pick<ProjectFolder, 'id' | 'label' | 'createdAt' | 'rootPath' | 'browserHandleId'>,
     options: { silent?: boolean } = {},
   ) => {
-    if (!workspace.rootPath) {
+    if (!workspaceHasLinkedSource(workspace)) {
       if (!options.silent) {
         toast('This workspace is not linked to a local folder yet.');
       }
@@ -920,7 +976,9 @@ export default function App() {
     }
 
     try {
-      const snapshot = await scanWorkspace(workspace.rootPath);
+      const snapshot = workspace.rootPath
+        ? await scanWorkspace(workspace.rootPath)
+        : await scanBrowserWorkspace(workspace.browserHandleId!);
       applyWorkspaceSnapshotToState(workspace, snapshot, { unarchive: true });
       if (!options.silent) {
         toast(`Refreshed "${workspace.label}".`);
@@ -935,53 +993,106 @@ export default function App() {
     }
   }, [applyWorkspaceSnapshotToState, toast]);
 
+  const ensureWorkspaceContext = useCallback((workspaceId?: string | null) => {
+    const workspace = findProjectFolderById(workspaceId);
+    if (!workspace?.rootPath) return;
+
+    void syncWorkspaceFolder({
+      id: workspace.id,
+      label: workspace.label,
+      createdAt: workspace.createdAt,
+      rootPath: workspace.rootPath,
+      browserHandleId: workspace.browserHandleId,
+    }, { silent: true });
+  }, [findProjectFolderById, syncWorkspaceFolder]);
+
   const openWorkspaceLauncher = useCallback(async () => {
-    if (!DESKTOP_RUNTIME || !isWorkspaceHostAvailable()) {
-      importWorkspaceLauncherRef.current?.click();
-      return;
-    }
-
     try {
-      const selection = await pickWorkspaceDirectory();
-      if (!selection) return;
-
       const normalizeLabel = (value: string) => value.trim().toLowerCase();
-      const duplicate = projectFolders.find((folder) => (
-        folder.rootPath?.toLowerCase() === selection.rootPath.toLowerCase()
-      )) ?? (
-        selectedCodeWorkspaceId
-          ? projectFolders.find((folder) => (
-            folder.id === selectedCodeWorkspaceId &&
-            !folder.rootPath &&
+
+      if (isWorkspaceHostAvailable()) {
+        const selection = await pickWorkspaceDirectory();
+        if (!selection) return;
+
+        const duplicate = projectFolders.find((folder) => (
+          folder.rootPath?.toLowerCase() === selection.rootPath.toLowerCase()
+        )) ?? (
+          selectedCodeWorkspaceId
+            ? projectFolders.find((folder) => (
+              folder.id === selectedCodeWorkspaceId &&
+              !workspaceHasLinkedSource(folder) &&
+              normalizeLabel(folder.label) === normalizeLabel(selection.label)
+            ))
+            : undefined
+        ) ?? projectFolders.find((folder) => (
+          !workspaceHasLinkedSource(folder) &&
+          (
+            folder.id === normaliseProjectId(selection.label) ||
             normalizeLabel(folder.label) === normalizeLabel(selection.label)
-          ))
-          : undefined
-      ) ?? projectFolders.find((folder) => (
-        !folder.rootPath &&
-        (
-          folder.id === normaliseProjectId(selection.label) ||
-          normalizeLabel(folder.label) === normalizeLabel(selection.label)
-        )
-      ));
-      const workspaceId = duplicate?.id ?? buildWorkspaceIdFromPath(selection.rootPath, selection.label);
-      const workspaceLabel = duplicate?.label ?? selection.label;
-      const createdAt = duplicate?.createdAt ?? Date.now();
+          )
+        ));
+        const workspaceId = duplicate?.id ?? buildWorkspaceIdFromPath(selection.rootPath, selection.label);
+        const workspaceLabel = duplicate?.label ?? selection.label;
+        const createdAt = duplicate?.createdAt ?? Date.now();
 
-      applyWorkspaceSnapshotToState({
-        id: workspaceId,
-        label: workspaceLabel,
-        createdAt,
-        rootPath: selection.rootPath,
-      }, selection.snapshot, { unarchive: true });
+        applyWorkspaceSnapshotToState({
+          id: workspaceId,
+          label: workspaceLabel,
+          createdAt,
+          rootPath: selection.rootPath,
+        }, selection.snapshot, { unarchive: true });
 
-      setSelectedCodeWorkspaceId(workspaceId);
-      navigate('/code');
-      toast(duplicate ? `Refreshed workspace "${workspaceLabel}".` : `Linked workspace "${workspaceLabel}".`);
+        setSelectedCodeWorkspaceId(workspaceId);
+        navigate('/code');
+        toast(duplicate ? `Refreshed workspace "${workspaceLabel}".` : `Created workspace "${workspaceLabel}".`);
+        return;
+      }
+
+      if (isBrowserWorkspacePickerAvailable()) {
+        const selection = await pickBrowserWorkspaceDirectory(projectFolders);
+        if (!selection) return;
+
+        const duplicate = selection.existingWorkspaceId
+          ? projectFolders.find((folder) => folder.id === selection.existingWorkspaceId)
+          : (
+            selectedCodeWorkspaceId
+              ? projectFolders.find((folder) => (
+                folder.id === selectedCodeWorkspaceId &&
+                !workspaceHasLinkedSource(folder) &&
+                normalizeLabel(folder.label) === normalizeLabel(selection.label)
+              ))
+              : undefined
+          ) ?? projectFolders.find((folder) => (
+            !workspaceHasLinkedSource(folder) &&
+            (
+              folder.id === normaliseProjectId(selection.label) ||
+              normalizeLabel(folder.label) === normalizeLabel(selection.label)
+            )
+          ));
+        const workspaceId = duplicate?.id ?? selection.existingWorkspaceId ?? selection.browserHandleId;
+        const workspaceLabel = duplicate?.label ?? selection.label;
+        const createdAt = duplicate?.createdAt ?? Date.now();
+
+        applyWorkspaceSnapshotToState({
+          id: workspaceId,
+          label: workspaceLabel,
+          createdAt,
+          browserHandleId: selection.browserHandleId,
+        }, selection.snapshot, { unarchive: true });
+
+        setSelectedCodeWorkspaceId(workspaceId);
+        navigate('/code');
+        toast(duplicate ? `Refreshed workspace "${workspaceLabel}".` : `Created workspace "${workspaceLabel}".`);
+        return;
+      }
+
+      importWorkspaceLauncherRef.current?.click();
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unable to link that workspace.';
-      toast(message);
+      const rawMessage = error instanceof Error ? error.message : 'Unable to link that workspace.';
+      if (/aborted|cancelled|canceled/i.test(rawMessage)) return;
+      toast(rawMessage);
     }
-  }, [applyWorkspaceSnapshotToState, navigate, projectFolders, toast]);
+  }, [applyWorkspaceSnapshotToState, navigate, projectFolders, selectedCodeWorkspaceId, toast]);
 
   const handleSelectCodeWorkspace = useCallback((workspace: WorkspaceGroup) => {
     setSelectedCodeWorkspaceId(workspace.id);
@@ -991,6 +1102,7 @@ export default function App() {
       label: workspace.label,
       createdAt: workspace.createdAt,
       rootPath: workspace.rootPath,
+      browserHandleId: workspace.browserHandleId,
     }, { silent: true });
   }, [navigate, syncWorkspaceFolder]);
 
@@ -1019,13 +1131,13 @@ export default function App() {
     )));
 
     const relatedChats = chats.filter((chat) => chat.projectId === workspace.id);
-    await Promise.all(relatedChats.map((chat) => save({
+    await Promise.all(relatedChats.map((chat) => persistWorkspaceChat({
       ...chat,
       projectLabel: clean,
     })));
 
     toast(`Renamed workspace to "${clean}".`);
-  }, [chats, save, toast, upsertProjectFolder]);
+  }, [chats, persistWorkspaceChat, toast, upsertProjectFolder]);
 
   const requestArchiveWorkspace = useCallback((workspace: WorkspaceGroup) => {
     requestConfirmation({
@@ -1072,6 +1184,7 @@ export default function App() {
       label: workspace.label,
       createdAt: workspace.createdAt,
       rootPath: workspace.rootPath,
+      browserHandleId: workspace.browserHandleId,
     });
   }, [syncWorkspaceFolder]);
 
@@ -1088,7 +1201,8 @@ export default function App() {
       projectLabel: folder.label,
       fileEntries: workspaceEntries,
     });
-  }, [openDraftChat, projectFolders, upsertProjectFolder]);
+    ensureWorkspaceContext(folder.id);
+  }, [ensureWorkspaceContext, openDraftChat, projectFolders, upsertProjectFolder]);
 
   const closePanel = useCallback((id: string) => {
     const closingRecord = panels.find((panel) => panel.id === id) ?? chats.find((chat) => chat.id === id);
@@ -1142,14 +1256,16 @@ export default function App() {
 
   const savePanel = useCallback((panel: Panel) => {
     const fileEntries = entriesFromRegistry(panel.fileRegistry);
+    const linkedWorkspace = findProjectFolderById(panel.projectId);
+
     if (panel.projectId && panel.projectLabel) {
       upsertProjectFolder({
         id: panel.projectId,
         label: panel.projectLabel,
-        fileEntries,
+        fileEntries: linkedWorkspace && workspaceHasLinkedSource(linkedWorkspace) ? undefined : fileEntries,
       });
     }
-    save({
+    void persistWorkspaceChat({
       id: panel.id,
       title: panel.title,
       model: panel.model,
@@ -1162,7 +1278,7 @@ export default function App() {
       updatedAt: Date.now(),
       fileEntries,
     });
-  }, [save, upsertProjectFolder]);
+  }, [findProjectFolderById, persistWorkspaceChat, upsertProjectFolder]);
 
   function handleOpenFromHistory(chat: ChatRecord) {
     const existing = panels.find((panel) => panel.id === chat.id);
@@ -1178,6 +1294,7 @@ export default function App() {
       setActivePanelId(existing.id);
     }
 
+    ensureWorkspaceContext(chat.projectId);
     navigate(buildChatPath(chat.id));
   }
 
@@ -1189,7 +1306,7 @@ export default function App() {
         fileEntries: chat.fileEntries ?? [],
       });
     }
-    save({
+    void persistWorkspaceChat({
       id: chat.id,
       title: chat.title,
       model: chat.model,
@@ -1224,58 +1341,98 @@ export default function App() {
     targetFolder?: { id: string; label: string },
     labelOverride?: string,
   ) {
-    let added = 0;
-    const targetWorkspace = targetFolder
-      ? projectFolders.find((folder) => folder.id === targetFolder.id)
-      : undefined;
-    let reg: FileRegistry = registryFromEntries(targetWorkspace?.fileEntries);
-    let importedRoot = targetFolder?.label || targetWorkspace?.label || '';
+    try {
+      if (!targetFolder && isWorkspaceHostAvailable()) {
+        const requestedLabel = deriveUploadedFolderLabel(files, labelOverride);
+        const selection = await createManagedWorkspaceDirectory(requestedLabel);
+        const normalizeLabel = (value: string) => value.trim().toLowerCase();
+        const duplicate = projectFolders.find((folder) => (
+          folder.rootPath?.toLowerCase() === selection.rootPath.toLowerCase()
+        )) ?? projectFolders.find((folder) => (
+          !workspaceHasLinkedSource(folder) &&
+          (
+            folder.id === normaliseProjectId(requestedLabel) ||
+            normalizeLabel(folder.label) === normalizeLabel(requestedLabel)
+          )
+        ));
+        const workspaceId = duplicate?.id ?? buildWorkspaceIdFromPath(selection.rootPath, requestedLabel);
+        const workspaceLabel = duplicate?.label ?? requestedLabel;
+        const createdAt = duplicate?.createdAt ?? Date.now();
 
-    for (const file of files) {
-      const rel = (file as File & { webkitRelativePath?: string }).webkitRelativePath ?? file.name;
-      const parts = rel.split('/');
-      if (!importedRoot && parts[0]) importedRoot = parts[0];
-      const cleanPath = parts.length > 1 ? parts.slice(1).join('/') : rel;
-      if (/\.(png|jpg|jpeg|gif|webp|ico|woff|woff2|ttf|eot|mp4|mp3|pdf|zip|tar|gz|lock)$/.test(cleanPath)) continue;
-      if (/node_modules|\.git|\.next|dist\/|build\//.test(cleanPath)) continue;
-      const fileText = await file.text();
-      if (fileText.includes('\0')) continue;
-      reg = updateRegistry(reg, [{ path: cleanPath, content: fileText, lang: langFromPath(cleanPath) }], 0);
-      added++;
-    }
+        applyWorkspaceSnapshotToState({
+          id: workspaceId,
+          label: workspaceLabel,
+          createdAt,
+          rootPath: selection.rootPath,
+        }, selection.snapshot, { unarchive: true });
 
-    if (!added) {
-      toast('No importable source files found.');
-      return;
-    }
+        setSelectedCodeWorkspaceId(workspaceId);
+        navigate('/code');
+        toast(duplicate ? `Refreshed workspace "${workspaceLabel}".` : `Created workspace "${workspaceLabel}".`);
+        return;
+      }
 
-    const projectLabel = targetFolder?.label || labelOverride?.trim() || importedRoot || 'Project';
-    const projectId = targetFolder?.id || normaliseProjectId(projectLabel);
-    const workspaceEntries = entriesFromRegistry(reg);
+      let added = 0;
+      const targetWorkspace = targetFolder
+        ? projectFolders.find((folder) => folder.id === targetFolder.id)
+        : undefined;
+      let reg: FileRegistry = registryFromEntries(targetWorkspace?.fileEntries);
+      let importedRoot = targetFolder?.label || targetWorkspace?.label || '';
 
-    upsertProjectFolder({
-      id: projectId,
-      label: projectLabel,
-      fileEntries: workspaceEntries,
-    });
+      for (const file of files) {
+        const rel = (file as File & { webkitRelativePath?: string }).webkitRelativePath ?? file.name;
+        const parts = rel.split('/');
+        if (!importedRoot && parts[0]) importedRoot = parts[0];
+        const cleanPath = parts.length > 1 ? parts.slice(1).join('/') : rel;
+        if (/\.(png|jpg|jpeg|gif|webp|ico|woff|woff2|ttf|eot|mp4|mp3|pdf|zip|tar|gz|lock)$/i.test(cleanPath)) continue;
+        if (/node_modules|\.git|\.next|dist\/|build\//.test(cleanPath)) continue;
+        const fileText = await file.text();
+        if (fileText.includes('\0')) continue;
+        reg = updateRegistry(reg, [{ path: cleanPath, content: fileText, lang: langFromPath(cleanPath) }], 0);
+        added++;
+      }
 
-    setPanels((prev) =>
-      prev.map((panel) =>
-        panel.projectId !== projectId
-          ? panel
-          : {
-              ...panel,
-              projectId,
-              projectLabel,
-              fileRegistry: registryFromEntries(workspaceEntries),
-            },
-      ),
-    );
+      const projectLabel = targetFolder?.label || labelOverride?.trim() || importedRoot || 'Project';
+      const projectId = targetFolder?.id || normaliseProjectId(projectLabel);
+      const workspaceEntries = entriesFromRegistry(reg);
 
-    if (targetFolder) {
-      toast(`Updated workspace "${projectLabel}" with ${added} file${added !== 1 ? 's' : ''}.`);
-    } else {
-      toast(`Created workspace "${projectLabel}" with ${added} file${added !== 1 ? 's' : ''}.`);
+      upsertProjectFolder({
+        id: projectId,
+        label: projectLabel,
+        fileEntries: added ? workspaceEntries : undefined,
+      });
+
+      if (!targetFolder) {
+        setSelectedCodeWorkspaceId(projectId);
+        navigate('/code');
+      }
+
+      if (!added) {
+        toast(`Added workspace "${projectLabel}", but no importable source files were indexed.`);
+        return;
+      }
+
+      setPanels((prev) =>
+        prev.map((panel) =>
+          panel.projectId !== projectId
+            ? panel
+            : {
+                ...panel,
+                projectId,
+                projectLabel,
+                fileRegistry: registryFromEntries(workspaceEntries),
+              },
+        ),
+      );
+
+      if (targetFolder) {
+        toast(`Updated workspace "${projectLabel}" with ${added} file${added !== 1 ? 's' : ''}.`);
+      } else {
+        toast(`Created workspace "${projectLabel}" with ${added} file${added !== 1 ? 's' : ''}.`);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to import that folder.';
+      toast(message);
     }
   }
 
@@ -1381,7 +1538,7 @@ export default function App() {
     const payload = {
       version: 1,
       exportedAt,
-      storageMode: DESKTOP_RUNTIME ? 'desktop-sql' : 'browser',
+      storageMode: desktopRuntime ? 'desktop-sql' : 'browser',
       defaults: {
         defaultModel: resolvedDefaultModel,
         defaultChatPreset,
@@ -1421,6 +1578,7 @@ export default function App() {
     advancedUseEnabled,
     anthropicApiKey,
     chats,
+    desktopRuntime,
     defaultChatPreset,
     defaultReasoningEffort,
     developerToolsEnabled,
@@ -1495,7 +1653,7 @@ export default function App() {
             fileRegistry: updatedStarterPanel.fileRegistry,
           }
         : panel));
-      void save({
+      void persistWorkspaceChat({
         id: updatedStarterPanel.id,
         title: updatedStarterPanel.title,
         model: updatedStarterPanel.model,
@@ -1529,6 +1687,8 @@ export default function App() {
       });
     }
 
+    ensureWorkspaceContext(options.workspace?.id);
+
     if (shouldUseChatLaunchTransition) {
       setChatStarterVisible(true);
       setChatLaunchTransition({
@@ -1539,7 +1699,7 @@ export default function App() {
     }
 
     return true;
-  }, [chatStarterPanelId, chatStarterVisible, openDraftChat, panels, projectFolders, resolvedDefaultModel, route.kind, save, upsertProjectFolder]);
+  }, [chatStarterPanelId, chatStarterVisible, ensureWorkspaceContext, openDraftChat, panels, persistWorkspaceChat, projectFolders, resolvedDefaultModel, route.kind, upsertProjectFolder]);
 
   useEffect(() => {
     if (route.kind !== 'chat') return;
@@ -1565,7 +1725,8 @@ export default function App() {
       ...chat,
       fileEntries: workspaceEntries?.length ? cloneFileEntries(workspaceEntries) : chat.fileEntries,
     });
-  }, [activePanelId, chats, createPanel, panels, projectFolders, ready, route]);
+    ensureWorkspaceContext(chat.projectId);
+  }, [activePanelId, chats, createPanel, ensureWorkspaceContext, panels, projectFolders, ready, route]);
 
   const activePanel = useMemo(
     () => (route.kind === 'chat' ? panels.find((panel) => panel.id === route.chatId) ?? null : null),
@@ -2038,9 +2199,9 @@ export default function App() {
     },
   ];
   const activeSettingsTabMeta = settingsTabs.find((tab) => tab.id === settingsTab) ?? settingsTabs[0];
-  const localPersistenceLabel = DESKTOP_RUNTIME ? 'local app database' : 'browser';
-  const storageSystemLabel = DESKTOP_RUNTIME ? 'local SQL database' : 'IndexedDB';
-  const storageMeterLabel = DESKTOP_RUNTIME ? 'Local SQL database' : 'Browser storage';
+  const localPersistenceLabel = desktopRuntime ? 'local app database' : 'browser';
+  const storageSystemLabel = desktopRuntime ? 'local SQL database' : 'IndexedDB';
+  const storageMeterLabel = desktopRuntime ? 'Local SQL database' : 'Browser storage';
 
   const applyOllamaEndpoint = useCallback(() => {
     const next = normalizeOllamaBase(ollamaEndpointDraft);
@@ -2154,7 +2315,7 @@ export default function App() {
   const replyPreferenceStorageBytes = measurePersistedBytes(replyPreferences);
   const likedReplyPreferenceCount = replyPreferences.filter((entry) => entry.feedback === 'liked').length;
   const dislikedReplyPreferenceCount = replyPreferences.filter((entry) => entry.feedback === 'disliked').length;
-  const customPresetStorage = getCustomPresetStorageUsage();
+  const customPresetStorage = getCustomPresetStorageUsage(desktopRuntime);
   const appStorageBytes =
     chatHistoryBytes +
     workspaceStorageBytes +
@@ -2217,7 +2378,7 @@ export default function App() {
     },
   ];
   const appQuotaRatio =
-    !DESKTOP_RUNTIME &&
+    !desktopRuntime &&
     browserStorage.supported &&
     browserStorage.quota != null &&
     browserStorage.quota > 0
@@ -2832,7 +2993,7 @@ export default function App() {
                             <div className="settings-storage-meter-caption">
                               {appQuotaRatio != null
                                 ? `Larry AI is using about ${formatStoragePercent(appQuotaRatio)} of the browser storage limit. Hover a color segment to inspect what each category stores.`
-                                : DESKTOP_RUNTIME
+                                : desktopRuntime
                                   ? 'Storage is tracked in the desktop database file, so browser quota limits do not apply here.'
                                   : 'Quota details are not exposed in this environment.'}
                             </div>
@@ -3203,7 +3364,6 @@ export default function App() {
                         key={panel.id}
                         panel={panel}
                         models={models}
-                        showDeveloperTools={developerToolsEnabled}
                         showAdvancedUse={advancedUseEnabled}
                         onUpdate={updatePanel}
                         onClose={closePanel}
@@ -3306,7 +3466,6 @@ export default function App() {
                         key={activeCodePanel.id}
                         panel={activeCodePanel}
                         models={models}
-                        showDeveloperTools={developerToolsEnabled}
                         showAdvancedUse={advancedUseEnabled}
                         onUpdate={updatePanel}
                         onClose={closePanel}
@@ -3355,7 +3514,6 @@ export default function App() {
                           key={panel.id}
                           panel={panel}
                           models={models}
-                          showDeveloperTools={developerToolsEnabled}
                           showAdvancedUse={advancedUseEnabled}
                           onUpdate={updatePanel}
                           onClose={closePanel}
@@ -3405,7 +3563,6 @@ export default function App() {
             key={`launch-${pendingChatLaunchPanel.id}`}
             panel={pendingChatLaunchPanel}
             models={models}
-            showDeveloperTools={developerToolsEnabled}
             showAdvancedUse={advancedUseEnabled}
             onUpdate={updatePanel}
             onClose={closePanel}

@@ -32,6 +32,8 @@ Then open [http://localhost:5173](http://localhost:5173) in your browser.
 npm run desktop:dev
 ```
 
+Desktop mode routes Ollama requests through the Go backend, so it can talk to a local Ollama instance without browser CORS setup.
+
 The Wails backend stores chats, settings, workspaces, and reply memory in a local SQLite database file under your user config directory.
 
 ## Build for production

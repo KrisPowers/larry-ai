@@ -1,4 +1,4 @@
-import type { WorkspaceGroup } from '../lib/workspaces';
+import { workspaceHasLinkedSource, type WorkspaceGroup } from '../lib/workspaces';
 import type { ChatRecord } from '../types';
 import {
   IconArrowUpRight,
@@ -61,6 +61,10 @@ export function CodeWorkspaceStage({
   }
 
   const recentChats = [...workspace.chats].sort((left, right) => right.updatedAt - left.updatedAt).slice(0, 5);
+  const linkedSourceCopy = workspace.rootPath
+    || (workspaceHasLinkedSource(workspace)
+      ? 'Linked through browser directory access.'
+      : 'This workspace is ready, but it is not linked to a local folder path yet.');
 
   return (
     <section className="code-stage-shell">
@@ -68,7 +72,7 @@ export function CodeWorkspaceStage({
         <div className="code-stage-copy">
           <span className="launch-kicker">Active workspace</span>
           <h1>{workspace.label}</h1>
-          <p>{workspace.rootPath || 'This workspace is ready, but it is not linked to a local folder path yet.'}</p>
+          <p>{linkedSourceCopy}</p>
         </div>
 
         <div className="code-stage-actions">

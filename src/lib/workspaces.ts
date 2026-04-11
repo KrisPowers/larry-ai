@@ -10,9 +10,16 @@ export interface WorkspaceGroup {
   fileCount: number;
   directoryCount: number;
   rootPath?: string;
+  browserHandleId?: string;
   fileTree?: ProjectFolder['fileTree'];
   fileEntries?: ProjectFolder['fileEntries'];
   syncedAt?: number;
+}
+
+export function workspaceHasLinkedSource(
+  workspace: Pick<ProjectFolder, 'rootPath' | 'browserHandleId'> | Pick<WorkspaceGroup, 'rootPath' | 'browserHandleId'>,
+): boolean {
+  return Boolean(workspace.rootPath || workspace.browserHandleId);
 }
 
 export function normaliseProjectId(label: string): string {
@@ -35,13 +42,14 @@ export function buildWorkspaceIdFromPath(rootPath: string, label?: string): stri
   return `workspace:${slugSource}-${hash.toString(36)}`;
 }
 
-export function applyWorkspaceSnapshot<T extends Pick<ProjectFolder, 'rootPath'>>(
+export function applyWorkspaceSnapshot<T extends Pick<ProjectFolder, 'rootPath' | 'browserHandleId'>>(
   folder: T,
   snapshot: WorkspaceSnapshot,
 ) {
   return {
     ...folder,
-    rootPath: snapshot.rootPath,
+    rootPath: snapshot.rootPath || folder.rootPath,
+    browserHandleId: folder.browserHandleId,
     fileTree: snapshot.fileTree,
     fileEntries: snapshot.fileEntries,
     fileCount: snapshot.fileCount,
@@ -86,6 +94,7 @@ function mergeWorkspaceGroup(target: WorkspaceGroup, source: WorkspaceGroup) {
   target.fileCount = Math.max(target.fileCount, source.fileCount);
   target.directoryCount = Math.max(target.directoryCount, source.directoryCount);
   target.rootPath = target.rootPath ?? source.rootPath;
+  target.browserHandleId = target.browserHandleId ?? source.browserHandleId;
   target.fileTree = target.fileTree ?? source.fileTree;
   target.fileEntries = target.fileEntries?.length ? target.fileEntries : source.fileEntries;
   target.syncedAt = target.syncedAt ?? source.syncedAt;
@@ -147,6 +156,7 @@ export function buildWorkspaceGroups(chats: ChatRecord[], folders: ProjectFolder
         fileCount,
         directoryCount,
         rootPath: folder.rootPath,
+        browserHandleId: folder.browserHandleId,
         fileTree: folder.fileTree,
         fileEntries: folder.fileEntries,
         syncedAt: folder.syncedAt,
@@ -159,6 +169,7 @@ export function buildWorkspaceGroups(chats: ChatRecord[], folders: ProjectFolder
     existing.fileCount = Math.max(existing.fileCount, fileCount);
     existing.directoryCount = Math.max(existing.directoryCount, directoryCount);
     existing.rootPath = folder.rootPath;
+    existing.browserHandleId = folder.browserHandleId;
     existing.fileTree = folder.fileTree;
     existing.fileEntries = folder.fileEntries;
     existing.syncedAt = folder.syncedAt;
@@ -168,7 +179,7 @@ export function buildWorkspaceGroups(chats: ChatRecord[], folders: ProjectFolder
   const folderBackedByLabel = new Map<string, WorkspaceGroup[]>();
 
   for (const group of groups) {
-    if (!group.rootPath) continue;
+    if (!workspaceHasLinkedSource(group)) continue;
     const labelKey = normalizeWorkspaceLabel(group.label);
     const existing = folderBackedByLabel.get(labelKey);
     if (existing) {
@@ -180,7 +191,7 @@ export function buildWorkspaceGroups(chats: ChatRecord[], folders: ProjectFolder
 
   const merged = new Map<string, WorkspaceGroup>(groups.map((group) => [group.id, group]));
   for (const group of groups) {
-    if (group.rootPath) continue;
+    if (workspaceHasLinkedSource(group)) continue;
     if (!merged.has(group.id)) continue;
 
     const labelMatches = folderBackedByLabel.get(normalizeWorkspaceLabel(group.label)) ?? [];

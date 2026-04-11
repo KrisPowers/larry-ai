@@ -108,7 +108,12 @@ func PickDirectory(ctx context.Context) (Selection, error) {
 		return Selection{}, nil
 	}
 
-	return BuildSelection(selectedPath)
+	label := filepath.Base(selectedPath)
+	if label == "." || label == string(filepath.Separator) || strings.TrimSpace(label) == "" {
+		label = "Workspace"
+	}
+
+	return CreateManagedWorkspace(label)
 }
 
 func BuildSelection(rootPath string) (Selection, error) {
@@ -127,6 +132,21 @@ func BuildSelection(rootPath string) (Selection, error) {
 		RootPath: snapshot.RootPath,
 		Snapshot: snapshot,
 	}, nil
+}
+
+func CreateManagedWorkspace(label string) (Selection, error) {
+	rootDir, err := managedWorkspaceRoot()
+	if err != nil {
+		return Selection{}, err
+	}
+
+	directoryName := sanitizeWorkspaceDirectoryName(label)
+	targetPath, err := ensureWorkspaceDirectory(rootDir, directoryName)
+	if err != nil {
+		return Selection{}, err
+	}
+
+	return BuildSelection(targetPath)
 }
 
 func Scan(rootPath string) (Snapshot, error) {
@@ -392,6 +412,76 @@ func normaliseRootPath(rootPath string) (string, error) {
 	}
 
 	return absoluteRoot, nil
+}
+
+func managedWorkspaceRoot() (string, error) {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve user config dir for workspaces: %w", err)
+	}
+
+	rootDir := filepath.Join(configDir, "LarryAI", "workspaces")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		return "", fmt.Errorf("create managed workspace root %q: %w", rootDir, err)
+	}
+
+	return rootDir, nil
+}
+
+func sanitizeWorkspaceDirectoryName(label string) string {
+	trimmed := strings.TrimSpace(label)
+	if trimmed == "" {
+		return "Workspace"
+	}
+
+	replacer := strings.NewReplacer(
+		"/", "-",
+		"\\", "-",
+		":", "-",
+		"*", "",
+		"?", "",
+		"\"", "",
+		"<", "",
+		">", "",
+		"|", "",
+	)
+	safe := strings.TrimSpace(replacer.Replace(trimmed))
+	safe = strings.Trim(safe, ". ")
+	if safe == "" {
+		return "Workspace"
+	}
+
+	return safe
+}
+
+func ensureWorkspaceDirectory(rootDir string, desiredName string) (string, error) {
+	basePath := filepath.Join(rootDir, desiredName)
+	info, err := os.Stat(basePath)
+	switch {
+	case err == nil && info.IsDir():
+		return basePath, nil
+	case err == nil:
+		// Fall through and create a unique directory name beside the existing file.
+	case !errors.Is(err, os.ErrNotExist):
+		return "", fmt.Errorf("stat managed workspace directory %q: %w", basePath, err)
+	}
+
+	for index := 0; index < 1000; index += 1 {
+		candidatePath := basePath
+		if index > 0 {
+			candidatePath = filepath.Join(rootDir, fmt.Sprintf("%s-%d", desiredName, index+1))
+		}
+
+		if err := os.Mkdir(candidatePath, 0o755); err == nil {
+			return candidatePath, nil
+		} else if errors.Is(err, os.ErrExist) {
+			continue
+		} else {
+			return "", fmt.Errorf("create managed workspace directory %q: %w", candidatePath, err)
+		}
+	}
+
+	return "", fmt.Errorf("could not allocate a managed workspace directory for %q", desiredName)
 }
 
 func resolveWorkspacePath(rootPath string, relativePath string) (string, string, error) {

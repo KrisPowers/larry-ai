@@ -1,3 +1,4 @@
+import { EventsOn } from '../../wailsjs/runtime/runtime';
 import { getCachedSettings, saveAppSettings } from './persistence';
 import type { Message, ModelProvider, ModelProviderState } from '../types';
 
@@ -104,6 +105,33 @@ interface DecodedModelHandle {
   modelId: string;
 }
 
+type OllamaRequestMessageRole = 'system' | Message['role'];
+
+interface OllamaRequestMessage {
+  role: OllamaRequestMessageRole;
+  content: string;
+}
+
+interface OllamaDesktopBridge {
+  FetchOllamaModels(endpoint: string): Promise<string[]>;
+  ChatOllama(endpoint: string, requestId: string, model: string, messages: OllamaRequestMessage[]): Promise<string>;
+  StartOllamaChatStream(
+    endpoint: string,
+    requestId: string,
+    model: string,
+    messages: OllamaRequestMessage[],
+  ): Promise<void>;
+  CancelOllamaRequest(requestId: string): Promise<void>;
+}
+
+type DesktopOllamaQueueEvent =
+  | { type: 'chunk'; content: string }
+  | { type: 'done' }
+  | { type: 'error'; error: string }
+  | { type: 'abort' };
+
+const OLLAMA_STREAM_EVENT_PREFIX = 'ollama-stream:';
+
 async function persistSettingsPatch(patch: Partial<Pick<
   ReturnType<typeof getCachedSettings>,
   'ollamaEndpoint' | 'openAIApiKey' | 'anthropicApiKey'
@@ -192,6 +220,82 @@ async function buildProviderHttpError(provider: ModelProvider, res: Response): P
 
   const label = PROVIDER_LABELS[provider];
   return new Error(`${label} error ${res.status}: ${detail || res.statusText || 'Request failed'}`);
+}
+
+function getDesktopOllamaBridge(): OllamaDesktopBridge | null {
+  if (typeof window === 'undefined') return null;
+
+  const app = window.go?.main?.App;
+  if (!app) return null;
+
+  const requiredMethods: Array<keyof OllamaDesktopBridge> = [
+    'FetchOllamaModels',
+    'ChatOllama',
+    'StartOllamaChatStream',
+    'CancelOllamaRequest',
+  ];
+
+  return requiredMethods.every((method) => typeof app[method] === 'function')
+    ? (app as OllamaDesktopBridge)
+    : null;
+}
+
+function isAbsoluteNetworkBase(base: string): boolean {
+  return /^https?:\/\//i.test(base);
+}
+
+function createAbortError(): Error {
+  const error = new Error('The operation was aborted');
+  error.name = 'AbortError';
+  return error;
+}
+
+function isAbortLikeError(error: unknown): boolean {
+  const message = error instanceof Error
+    ? `${error.name} ${error.message}`
+    : typeof error === 'string'
+      ? error
+      : JSON.stringify(error);
+
+  return /(abort|aborted|canceled|cancelled|context canceled|context cancelled)/i.test(message);
+}
+
+function normalizeUnknownError(error: unknown): Error {
+  if (error instanceof Error) return error;
+  if (typeof error === 'string') return new Error(error);
+  if (error && typeof error === 'object' && 'message' in error && typeof error.message === 'string') {
+    return new Error(error.message);
+  }
+
+  return new Error(String(error));
+}
+
+function createOllamaRequestId(prefix: string): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `${prefix}-${crypto.randomUUID()}`;
+  }
+
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+async function withTimeoutSignal<T>(
+  timeoutMs: number,
+  operation: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+    return operation(AbortSignal.timeout(timeoutMs));
+  }
+
+  const controller = new AbortController();
+  const timeoutHandle = globalThis.setTimeout(() => {
+    controller.abort(new Error(`Timed out after ${timeoutMs}ms`));
+  }, timeoutMs);
+
+  try {
+    return await operation(controller.signal);
+  } finally {
+    globalThis.clearTimeout(timeoutHandle);
+  }
 }
 
 export function normalizeOllamaBase(value?: string | null): string {
@@ -385,19 +489,25 @@ export function getModelDisplayLabel(handle?: string | null): string {
 }
 
 async function fetchOllamaModels(base: string): Promise<string[]> {
-  const res = await fetch(`${base}/api/tags`, {
-    signal: AbortSignal.timeout(OLLAMA_MODEL_TIMEOUT_MS),
-  });
-
-  if (!res.ok) {
-    throw await buildProviderHttpError('ollama', res);
+  const desktopBridge = getDesktopOllamaBridge();
+  if (desktopBridge && isAbsoluteNetworkBase(base)) {
+    const models = await desktopBridge.FetchOllamaModels(base);
+    return models.map((modelId) => buildModelHandle('ollama', modelId));
   }
 
-  const data = await res.json();
-  return (data.models ?? [])
-    .map((model: { name?: string }) => model.name?.trim() ?? '')
-    .filter(Boolean)
-    .map((modelId: string) => buildModelHandle('ollama', modelId));
+  return withTimeoutSignal(OLLAMA_MODEL_TIMEOUT_MS, async (signal) => {
+    const res = await fetch(`${base}/api/tags`, { signal });
+
+    if (!res.ok) {
+      throw await buildProviderHttpError('ollama', res);
+    }
+
+    const data = await res.json();
+    return (data.models ?? [])
+      .map((model: { name?: string }) => model.name?.trim() ?? '')
+      .filter(Boolean)
+      .map((modelId: string) => buildModelHandle('ollama', modelId));
+  });
 }
 
 async function fetchOpenAIModels(apiKey: string): Promise<string[]> {
@@ -405,23 +515,25 @@ async function fetchOpenAIModels(apiKey: string): Promise<string[]> {
     return OPENAI_UI_SAMPLE_MODELS.map((modelId) => buildModelHandle('openai', modelId));
   }
 
-  const res = await fetch(`${OPENAI_API_BASE}/models`, {
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-    },
-    signal: AbortSignal.timeout(OPENAI_MODEL_TIMEOUT_MS),
+  return withTimeoutSignal(OPENAI_MODEL_TIMEOUT_MS, async (signal) => {
+    const res = await fetch(`${OPENAI_API_BASE}/models`, {
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+      },
+      signal,
+    });
+
+    if (!res.ok) {
+      throw await buildProviderHttpError('openai', res);
+    }
+
+    const data = await res.json();
+    return (data.data ?? [])
+      .map((model: { id?: string }) => model.id?.trim() ?? '')
+      .filter(isLikelyTextModelId)
+      .sort((left: string, right: string) => left.localeCompare(right))
+      .map((modelId: string) => buildModelHandle('openai', modelId));
   });
-
-  if (!res.ok) {
-    throw await buildProviderHttpError('openai', res);
-  }
-
-  const data = await res.json();
-  return (data.data ?? [])
-    .map((model: { id?: string }) => model.id?.trim() ?? '')
-    .filter(isLikelyTextModelId)
-    .sort((left: string, right: string) => left.localeCompare(right))
-    .map((modelId: string) => buildModelHandle('openai', modelId));
 }
 
 async function fetchAnthropicModels(apiKey: string): Promise<string[]> {
@@ -429,24 +541,26 @@ async function fetchAnthropicModels(apiKey: string): Promise<string[]> {
     return ANTHROPIC_UI_SAMPLE_MODELS.map((modelId) => buildModelHandle('anthropic', modelId));
   }
 
-  const res = await fetch(`${ANTHROPIC_API_BASE}/models`, {
-    headers: {
-      'x-api-key': apiKey,
-      'anthropic-version': ANTHROPIC_API_VERSION,
-    },
-    signal: AbortSignal.timeout(ANTHROPIC_MODEL_TIMEOUT_MS),
+  return withTimeoutSignal(ANTHROPIC_MODEL_TIMEOUT_MS, async (signal) => {
+    const res = await fetch(`${ANTHROPIC_API_BASE}/models`, {
+      headers: {
+        'x-api-key': apiKey,
+        'anthropic-version': ANTHROPIC_API_VERSION,
+      },
+      signal,
+    });
+
+    if (!res.ok) {
+      throw await buildProviderHttpError('anthropic', res);
+    }
+
+    const data = await res.json();
+    return (data.data ?? [])
+      .map((model: { id?: string }) => model.id?.trim() ?? '')
+      .filter((modelId: string) => modelId.toLowerCase().startsWith('claude'))
+      .sort((left: string, right: string) => left.localeCompare(right))
+      .map((modelId: string) => buildModelHandle('anthropic', modelId));
   });
-
-  if (!res.ok) {
-    throw await buildProviderHttpError('anthropic', res);
-  }
-
-  const data = await res.json();
-  return (data.data ?? [])
-    .map((model: { id?: string }) => model.id?.trim() ?? '')
-    .filter((modelId: string) => modelId.toLowerCase().startsWith('claude'))
-    .sort((left: string, right: string) => left.localeCompare(right))
-    .map((modelId: string) => buildModelHandle('anthropic', modelId));
 }
 
 export async function fetchModelCatalog(options: ProviderFetchOptions = {}): Promise<ModelCatalogResult> {
@@ -584,11 +698,50 @@ export async function fetchModels(
   return catalog.models;
 }
 
-function buildPayloadMessages(messages: Message[], systemPrompt: string) {
+function buildPayloadMessages(messages: Message[], systemPrompt: string): OllamaRequestMessage[] {
   return [
     { role: 'system' as const, content: systemPrompt },
     ...messages.map(({ role, content }) => ({ role, content })),
   ];
+}
+
+async function chatOnceWithDesktopOllama(
+  bridge: OllamaDesktopBridge,
+  base: string,
+  modelId: string,
+  payload: OllamaRequestMessage[],
+  signal: AbortSignal,
+): Promise<string> {
+  if (signal.aborted) {
+    throw createAbortError();
+  }
+
+  const requestId = createOllamaRequestId('ollama-once');
+  let aborted: boolean = signal.aborted;
+  const handleAbort = () => {
+    aborted = true;
+    void bridge.CancelOllamaRequest(requestId).catch(() => undefined);
+  };
+
+  signal.addEventListener('abort', handleAbort, { once: true });
+
+  try {
+    const reply = await bridge.ChatOllama(base, requestId, modelId, payload);
+    if (aborted || signal.aborted) {
+      throw createAbortError();
+    }
+
+    return reply;
+  } catch (error) {
+    if (aborted || signal.aborted || isAbortLikeError(error)) {
+      throw createAbortError();
+    }
+
+    throw normalizeUnknownError(error);
+  } finally {
+    signal.removeEventListener('abort', handleAbort);
+    void bridge.CancelOllamaRequest(requestId).catch(() => undefined);
+  }
 }
 
 async function chatOnceWithOllama(
@@ -599,6 +752,11 @@ async function chatOnceWithOllama(
 ): Promise<string> {
   const base = getOllamaBase();
   const payload = buildPayloadMessages(messages, systemPrompt);
+
+  const desktopBridge = getDesktopOllamaBridge();
+  if (desktopBridge && isAbsoluteNetworkBase(base)) {
+    return chatOnceWithDesktopOllama(desktopBridge, base, modelId, payload, signal);
+  }
 
   const res = await fetch(`${base}/api/chat`, {
     method: 'POST',
@@ -710,6 +868,90 @@ export async function chatOnce(
   return chatOnceWithOllama(modelId, messages, systemPrompt, signal);
 }
 
+async function* streamWithDesktopOllama(
+  bridge: OllamaDesktopBridge,
+  base: string,
+  modelId: string,
+  payload: OllamaRequestMessage[],
+  signal: AbortSignal,
+): AsyncGenerator<string> {
+  if (signal.aborted) {
+    throw createAbortError();
+  }
+
+  const requestId = createOllamaRequestId('ollama-stream');
+  const eventName = `${OLLAMA_STREAM_EVENT_PREFIX}${requestId}`;
+  const queue: DesktopOllamaQueueEvent[] = [];
+  let notifyNext: (() => void) | null = null;
+  let aborted: boolean = signal.aborted;
+
+  const pushEvent = (event: DesktopOllamaQueueEvent) => {
+    queue.push(event);
+    const pending = notifyNext;
+    notifyNext = null;
+    pending?.();
+  };
+
+  const unsubscribe = EventsOn(eventName, (chunk: unknown) => {
+    if (typeof chunk === 'string' && chunk) {
+      pushEvent({ type: 'chunk', content: chunk });
+    }
+  });
+
+  const handleAbort = () => {
+    aborted = true;
+    pushEvent({ type: 'abort' });
+    void bridge.CancelOllamaRequest(requestId).catch(() => undefined);
+  };
+
+  signal.addEventListener('abort', handleAbort, { once: true });
+
+  void bridge.StartOllamaChatStream(base, requestId, modelId, payload)
+    .then(() => {
+      pushEvent({ type: 'done' });
+    })
+    .catch((error) => {
+      if (aborted || signal.aborted || isAbortLikeError(error)) {
+        pushEvent({ type: 'abort' });
+        return;
+      }
+
+      pushEvent({ type: 'error', error: normalizeUnknownError(error).message });
+    });
+
+  try {
+    while (true) {
+      if (!queue.length) {
+        await new Promise<void>((resolve) => {
+          notifyNext = resolve;
+        });
+      }
+
+      const next = queue.shift();
+      if (!next) continue;
+
+      if (next.type === 'chunk') {
+        yield next.content;
+        continue;
+      }
+
+      if (next.type === 'done') {
+        return;
+      }
+
+      if (next.type === 'abort') {
+        throw createAbortError();
+      }
+
+      throw new Error(next.error);
+    }
+  } finally {
+    signal.removeEventListener('abort', handleAbort);
+    unsubscribe?.();
+    void bridge.CancelOllamaRequest(requestId).catch(() => undefined);
+  }
+}
+
 async function* streamWithOllama(
   modelId: string,
   messages: Message[],
@@ -718,6 +960,12 @@ async function* streamWithOllama(
 ): AsyncGenerator<string> {
   const base = getOllamaBase();
   const payload = buildPayloadMessages(messages, systemPrompt);
+
+  const desktopBridge = getDesktopOllamaBridge();
+  if (desktopBridge && isAbsoluteNetworkBase(base)) {
+    yield* streamWithDesktopOllama(desktopBridge, base, modelId, payload, signal);
+    return;
+  }
 
   const res = await fetch(`${base}/api/chat`, {
     method: 'POST',

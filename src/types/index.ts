@@ -169,6 +169,7 @@ export interface ProjectFolder {
   label: string;
   createdAt: number;
   rootPath?: string;
+  browserHandleId?: string;
   fileTree?: WorkspaceFileNode[];
   fileCount?: number;
   directoryCount?: number;

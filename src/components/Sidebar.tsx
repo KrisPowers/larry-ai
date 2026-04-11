@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { WorkspaceGroup } from '../lib/workspaces';
+import { workspaceHasLinkedSource, type WorkspaceGroup } from '../lib/workspaces';
 import type { ChatRecord, WorkspaceFileNode } from '../types';
 import {
   IconArchive,
@@ -679,7 +679,7 @@ function CodeSidebar({
                   collapsedPaths={collapsedPaths}
                   onToggleDirectory={toggleDirectory}
                 />
-              ) : activeWorkspace.rootPath ? (
+              ) : workspaceHasLinkedSource(activeWorkspace) ? (
                 <div className="workbench-thread-empty">
                   No source files were indexed in this folder yet.
                 </div>

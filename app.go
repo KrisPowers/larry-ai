@@ -2,14 +2,16 @@ package main
 
 import (
 	"context"
+	"sync"
 
 	"github.com/krisp/ai-chat-ui/internal/storage"
 	"github.com/krisp/ai-chat-ui/internal/workspace"
 )
 
 type App struct {
-	ctx   context.Context
-	store *storage.Store
+	ctx            context.Context
+	store          *storage.Store
+	ollamaRequests sync.Map
 }
 
 func NewApp() (*App, error) {
@@ -73,6 +75,10 @@ func (a *App) SeedFromBrowser(snapshot storage.Snapshot) (bool, error) {
 
 func (a *App) PickWorkspaceDirectory() (workspace.Selection, error) {
 	return workspace.PickDirectory(a.ctx)
+}
+
+func (a *App) CreateManagedWorkspaceDirectory(label string) (workspace.Selection, error) {
+	return workspace.CreateManagedWorkspace(label)
 }
 
 func (a *App) ScanWorkspace(rootPath string) (workspace.Snapshot, error) {

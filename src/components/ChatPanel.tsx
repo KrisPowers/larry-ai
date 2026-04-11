@@ -27,7 +27,6 @@ import type { FileRegistry } from '../lib/fileRegistry';
 interface Props {
   panel: Panel;
   models: string[];
-  showDeveloperTools?: boolean;
   showAdvancedUse?: boolean;
   onUpdate: (id: string, patch: Partial<Panel>) => void;
   onClose: (id: string) => void;
@@ -109,8 +108,10 @@ function buildModelErrorHelp(model: string, message: string): string {
       return [
         'Make sure Ollama is running and that the configured endpoint is correct:',
         '```bash',
-        'OLLAMA_ORIGINS=* ollama serve',
+        'ollama serve',
         '```',
+        '',
+        'If you are using the browser-only dev server, start Ollama with `OLLAMA_ORIGINS=*` so the browser can reach it.',
       ].join('\n');
     }
 
@@ -861,7 +862,6 @@ function normalizeWheelDelta(event: WheelEvent, viewport: HTMLDivElement): numbe
 export function ChatPanel({
   panel,
   models,
-  showDeveloperTools = false,
   onUpdate,
   onClose,
   onSave,
@@ -890,12 +890,12 @@ export function ChatPanel({
   const rowResizeObserversRef = useRef<Map<number, ResizeObserver>>(new Map());
   const visibilityObserverRef = useRef<IntersectionObserver | null>(null);
   const scrollFrameRef = useRef<number | null>(null);
+  const suppressAutoScrollUntilRef = useRef(0);
   const scrollTopRef = useRef(0);
   const stickToBottomRef = useRef(true);
   const scrollDirectionRef = useRef<'up' | 'down'>('down');
   const [inputValue, setInputValue] = useState('');
   const [liveResponseMs, setLiveResponseMs] = useState<number | null>(null);
-  const [liveReplyLatencyMs, setLiveReplyLatencyMs] = useState<number | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(0);
   const [measurementVersion, setMeasurementVersion] = useState(0);
@@ -1179,6 +1179,7 @@ export function ChatPanel({
 
   useEffect(() => {
     if (!stickToBottomRef.current || (!hasMessages && !panel.streaming)) return;
+    if (performance.now() < suppressAutoScrollUntilRef.current) return;
 
     const frame = window.requestAnimationFrame(() => {
       scrollMessagesToEnd('auto');
@@ -1186,6 +1187,10 @@ export function ChatPanel({
 
     return () => window.cancelAnimationFrame(frame);
   }, [hasMessages, measurementVersion, panel.streaming]);
+
+  function handleAssistantRunStatusToggle() {
+    suppressAutoScrollUntilRef.current = performance.now() + 500;
+  }
 
   useEffect(() => {
     if (!panel.streaming) {
@@ -1198,7 +1203,6 @@ export function ChatPanel({
       setChecklistClassifying(false);
       setChecklistMode(undefined);
       setLiveResponseMs(null);
-      setLiveReplyLatencyMs(null);
     }
   }, [backgroundMode, panel.streaming]);
 
@@ -1306,7 +1310,6 @@ export function ChatPanel({
     responseTimingRef.current = { startedAt: runStartedAt, startedPerf: performance.now() };
     visibleReplyContentRef.current = '';
     setLiveResponseMs(0);
-    setLiveReplyLatencyMs(null);
 
     if (provisionalTitle) {
       autoTitleRef.current = provisionalTitle;
@@ -1967,7 +1970,6 @@ export function ChatPanel({
       responseTimingRef.current = null;
       visibleReplyContentRef.current = '';
       setLiveResponseMs(null);
-      setLiveReplyLatencyMs(null);
 
       onUpdate(panel.id, {
         title: nextTitle,
@@ -2043,7 +2045,6 @@ export function ChatPanel({
           autoTitleRef.current = nextTitle;
           responseTimingRef.current = null;
           setLiveResponseMs(null);
-          setLiveReplyLatencyMs(null);
           onUpdate(panel.id, {
             title: nextTitle,
             messages: finalMessages,
@@ -2063,7 +2064,6 @@ export function ChatPanel({
           responseTimingRef.current = null;
           visibleReplyContentRef.current = '';
           setLiveResponseMs(null);
-          setLiveReplyLatencyMs(null);
           onUpdate(panel.id, { streaming: false, streamingContent: '', streamingPhase: null });
         }
       } else {
@@ -2085,7 +2085,6 @@ export function ChatPanel({
         responseTimingRef.current = null;
         visibleReplyContentRef.current = '';
         setLiveResponseMs(null);
-        setLiveReplyLatencyMs(null);
         onUpdate(panel.id, { messages: [...msgs, errMsg], streaming: false, streamingContent: '', streamingPhase: null });
       }
     }
@@ -2102,7 +2101,6 @@ export function ChatPanel({
         firstTokenPerf,
       };
       trace.firstTokenAt = firstTokenAt;
-      setLiveReplyLatencyMs(Math.max(0, Math.round(firstTokenPerf - timing.startedPerf)));
     }
 
   }, [models, onSave, onUpdate, panel, replyPreferences]);
@@ -2297,10 +2295,10 @@ export function ChatPanel({
                           withDownload={true}
                           prevRegistry={panel.prevRegistry}
                           model={panel.model}
-                          showDeveloperTools={showDeveloperTools}
                           feedbackValue={replyPreferenceDraft ? replyPreferenceFeedbackById.get(replyPreferenceDraft.id) ?? null : null}
                           onFeedbackChange={replyPreferenceDraft ? (next) => handleReplyFeedbackChange(msg, actualIndex, next) : undefined}
                           hideCodeBlocks={isCodeAssistant}
+                          onAssistantRunStatusToggle={handleAssistantRunStatusToggle}
                           suppressNoCodeWarning={currentPreset !== 'code'}
                         />
                       </div>
@@ -2324,7 +2322,7 @@ export function ChatPanel({
                   </div>
                 )}
 
-                {panel.streamingContent ? (
+                {(!isCodeStreaming || panel.streamingContent) ? (
                   <div className="streaming-wrap">
                     {(() => {
                       const summaryMarker = '\n\n<!-- summary -->\n\n';
@@ -2337,21 +2335,15 @@ export function ChatPanel({
                           withDownload={false}
                           prevRegistry={panel.prevRegistry}
                           model={panel.model}
-                          showDeveloperTools={showDeveloperTools}
                           hideCodeBlocks={isCodeStreaming}
-                          liveReplyLatencyMs={liveReplyLatencyMs ?? undefined}
+                          isStreaming={true}
+                          streamingPhase={panel.streamingPhase}
+                          liveResponseMs={liveResponseMs}
+                          onAssistantRunStatusToggle={handleAssistantRunStatusToggle}
                           suppressNoCodeWarning={true}
                         />
                       );
                     })()}
-                  </div>
-                ) : !isCodeStreaming ? (
-                  <div className="thinking">
-                    <div className="thinking-dots"><span /><span /><span /></div>
-                    <span>
-                      thinking...
-                      {liveResponseMs != null ? ` ${Math.max(0.1, liveResponseMs / 1000).toFixed(1)}s` : ''}
-                    </span>
                   </div>
                 ) : null}
               </>
