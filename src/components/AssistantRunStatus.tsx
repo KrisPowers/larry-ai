@@ -1,6 +1,6 @@
-import { useState } from 'react';
+import { type ReactNode, useEffect, useState } from 'react';
 import { IconCheck, IconChevronDown, IconX } from './Icon';
-import type { ResponseTrace, ResponseTraceMetric, ResponseTraceSource, StreamingPhase } from '../types';
+import type { ResponseTrace, ResponseTraceMetric, ResponseTracePhase, ResponseTraceSource, StreamingPhase } from '../types';
 
 interface Props {
   trace?: ResponseTrace;
@@ -8,13 +8,10 @@ interface Props {
   isStreaming?: boolean;
   liveResponseMs?: number | null;
   hasStreamingContent?: boolean;
+  defaultOpen?: boolean;
   onToggleOpenChange?: () => void;
-}
-
-interface ReadingChip {
-  id: string;
-  label: string;
-  iconUrl?: string | null;
+  onOpenSources?: () => void;
+  replyContent?: ReactNode;
 }
 
 interface ThinkingStep {
@@ -63,11 +60,6 @@ function sourceFavicon(url: string): string | null {
   const hostname = sourceHostname(url);
   if (!hostname) return null;
   return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(hostname)}&sz=64`;
-}
-
-function truncateLabel(value: string, max = 34): string {
-  if (value.length <= max) return value;
-  return `${value.slice(0, max - 3).trimEnd()}...`;
 }
 
 function cleanSourceLabel(source: ResponseTraceSource): string {
@@ -136,6 +128,22 @@ function formatReferenceDate(trace?: ResponseTrace): string {
   }).format(new Date(timestamp));
 }
 
+function findLatestPhase(
+  trace: ResponseTrace | undefined,
+  ids: string[],
+  options: { requireDetail?: boolean; status?: ResponseTracePhase['status'] } = {},
+): ResponseTracePhase | undefined {
+  const phases = trace?.phases ?? [];
+  for (let index = phases.length - 1; index >= 0; index -= 1) {
+    const phase = phases[index];
+    if (!ids.includes(phase.id)) continue;
+    if (options.status && phase.status !== options.status) continue;
+    if (options.requireDetail && !normalizeText(phase.detail)) continue;
+    return phase;
+  }
+  return undefined;
+}
+
 function inferTopic(trace?: ResponseTrace): string | null {
   const prompt = normalizeText(trace?.prompt);
   const promptLower = prompt.toLowerCase();
@@ -193,13 +201,23 @@ function buildFirstThinkingStep(trace?: ResponseTrace): ThinkingStep {
   };
 }
 
-function buildSecondThinkingStep(trace?: ResponseTrace): ThinkingStep {
+function buildSecondThinkingStep(trace?: ResponseTrace, isStreaming = false): ThinkingStep {
   const topic = inferTopic(trace);
-  const verifyPhase = (trace?.phases ?? []).find((phase) => phase.id === 'verify-live-sources');
+  const verifyPhase = findLatestPhase(trace, ['verify-live-sources']);
   const captured = metricValue(verifyPhase?.metrics, 'Captured');
   const required = metricValue(verifyPhase?.metrics, 'Required');
   const corroboratedSources = preferredSources(trace).length;
   const detailLabel = topic ? `Clarifying the ${topic} details` : 'Clarifying the final answer';
+  const liveAssemblyPhase = isStreaming
+    ? findLatestPhase(trace, ['context-assembly', 'verify-live-sources', 'extract-crew-roster'], { requireDetail: true })
+    : undefined;
+
+  if (liveAssemblyPhase?.detail) {
+    return {
+      heading: detailLabel,
+      detail: normalizeText(liveAssemblyPhase.detail),
+    };
+  }
 
   if (captured != null && required != null && captured < required) {
     return {
@@ -228,24 +246,6 @@ function buildSecondThinkingStep(trace?: ResponseTrace): ThinkingStep {
   };
 }
 
-function buildReadingChips(trace?: ResponseTrace): ReadingChip[] {
-  const sources = preferredSources(trace);
-  if (sources.length > 0) {
-    return sources.slice(0, 2).map((source) => ({
-      id: source.id,
-      label: truncateLabel(cleanSourceLabel(source)),
-      iconUrl: sourceFavicon(source.url),
-    }));
-  }
-
-  const packages = trace?.packages ?? [];
-  return packages.slice(0, 2).map((pkg) => ({
-    id: `${pkg.ecosystem}-${pkg.name}`,
-    label: truncateLabel(`${pkg.name} ${pkg.version}`),
-    iconUrl: null,
-  }));
-}
-
 function buildReadingDetail(trace?: ResponseTrace): string | null {
   const sources = preferredSources(trace);
   if (sources.length > 0) return null;
@@ -263,11 +263,40 @@ function buildReadingDetail(trace?: ResponseTrace): string | null {
 }
 
 function inferActiveStage(
+  trace: ResponseTrace | undefined,
   isStreaming: boolean,
   streamingPhase: StreamingPhase | null | undefined,
   hasStreamingContent: boolean,
-): 'thinking-1' | 'reading' | 'thinking-2' | null {
+): 'thinking-1' | 'reading' | 'thinking-2' | 'answering' | null {
   if (!isStreaming) return null;
+
+  const runningPhaseId = findLatestPhase(trace, [
+    'classify-chat-mode',
+    'reply-preferences',
+    'prompt-url-fetch',
+    'live-context-fetch',
+    'resolve-packages',
+    'extract-crew-roster',
+    'context-assembly',
+    'verify-live-sources',
+    'reply-stream',
+  ], { status: 'running' })?.id;
+
+  if (hasStreamingContent || runningPhaseId === 'reply-stream') {
+    return 'answering';
+  }
+
+  if (runningPhaseId && ['prompt-url-fetch', 'live-context-fetch', 'resolve-packages'].includes(runningPhaseId)) {
+    return 'reading';
+  }
+
+  if (runningPhaseId && ['context-assembly', 'verify-live-sources', 'extract-crew-roster'].includes(runningPhaseId)) {
+    return 'thinking-2';
+  }
+
+  if (runningPhaseId) {
+    return 'thinking-1';
+  }
 
   const phaseLabel = normalizeText(streamingPhase?.label).toLowerCase();
   if (/fetch|source|read|url|context|package/.test(phaseLabel)) {
@@ -275,7 +304,7 @@ function inferActiveStage(
   }
 
   if (hasStreamingContent || /stream|write|summary|reply|draft/.test(phaseLabel)) {
-    return 'thinking-2';
+    return 'answering';
   }
 
   return 'thinking-1';
@@ -303,19 +332,53 @@ export function AssistantRunStatus({
   isStreaming = false,
   liveResponseMs = null,
   hasStreamingContent = false,
+  defaultOpen = false,
   onToggleOpenChange,
+  onOpenSources,
+  replyContent = null,
 }: Props) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(defaultOpen);
+
+  useEffect(() => {
+    setOpen(defaultOpen);
+  }, [defaultOpen]);
 
   const firstThinking = buildFirstThinkingStep(trace);
-  const secondThinking = buildSecondThinkingStep(trace);
-  const readingChips = buildReadingChips(trace);
+  const secondThinking = buildSecondThinkingStep(trace, isStreaming);
   const readingDetail = buildReadingDetail(trace);
-  const activeStage = inferActiveStage(isStreaming, streamingPhase, hasStreamingContent);
+  const activeStage = inferActiveStage(trace, isStreaming, streamingPhase, hasStreamingContent);
   const durationLabel = formatDuration(liveResponseMs ?? trace?.totalDurationMs);
   const summaryLabel = isStreaming
     ? 'Thinking'
     : `Thought for ${durationLabel ?? '0s'}`;
+  const sources = preferredSources(trace);
+  const sourceIcons = sources.slice(0, 3);
+  const showReplyOutput = replyContent != null || !isStreaming || activeStage === 'answering';
+  const outputLabel = isStreaming
+    ? (hasStreamingContent ? 'Answering' : 'Preparing reply')
+    : 'Done';
+  const outputBody = replyContent != null
+    ? <div className="assistant-run-status-output-body">{replyContent}</div>
+    : (
+        <div className={`assistant-run-status-step-kicker assistant-run-status-step-kicker-done${isStreaming ? ' is-live' : ''}`}>
+          {outputLabel}
+        </div>
+      );
+
+  function renderOutputRow(mode: 'inline' | 'standalone') {
+    if (!showReplyOutput) return null;
+
+    return (
+      <div className={`assistant-run-status-final assistant-run-status-final-${mode}${activeStage === 'answering' ? ' is-active' : ''}`}>
+        <span className={`assistant-run-status-final-marker${isStreaming ? ' is-live' : ' is-done'}`} aria-hidden="true">
+          {!isStreaming ? <IconCheck size={9} /> : null}
+        </span>
+        <div className="assistant-run-status-final-copy">
+          {outputBody}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="assistant-run-status">
@@ -358,19 +421,30 @@ export function AssistantRunStatus({
               <span className="assistant-run-status-step-marker" aria-hidden="true" />
               <div className="assistant-run-status-step-copy">
                 <div className="assistant-run-status-step-kicker">Reading</div>
-                {readingChips.length > 0 && (
-                  <div className="assistant-run-status-chip-row">
-                    {readingChips.map((chip) => (
-                      <span key={chip.id} className="assistant-run-status-chip">
-                        {chip.iconUrl ? (
-                          <img src={chip.iconUrl} alt="" aria-hidden="true" />
-                        ) : (
-                          <span className="assistant-run-status-chip-dot" aria-hidden="true" />
-                        )}
-                        <span>{chip.label}</span>
-                      </span>
-                    ))}
-                  </div>
+                {sources.length > 0 && onOpenSources && (
+                  <button
+                    type="button"
+                    className="assistant-run-status-source-trigger"
+                    onClick={onOpenSources}
+                    aria-label="Open sources"
+                  >
+                    <span className="assistant-run-status-source-icons" aria-hidden="true">
+                      {sourceIcons.map((source) => {
+                        const iconUrl = sourceFavicon(source.url);
+                        return (
+                          <span key={source.id} className="assistant-run-status-source-icon">
+                            {iconUrl ? (
+                              <img src={iconUrl} alt="" />
+                            ) : (
+                              <span className="assistant-run-status-source-icon-fallback" />
+                            )}
+                          </span>
+                        );
+                      })}
+                    </span>
+                    <span className="assistant-run-status-source-label">Sources</span>
+                    <span className="assistant-run-status-source-count">{sources.length}</span>
+                  </button>
                 )}
                 {readingDetail && <p className="assistant-run-status-step-detail">{readingDetail}</p>}
               </div>
@@ -385,16 +459,11 @@ export function AssistantRunStatus({
               </div>
             </div>
 
-            <div className="assistant-run-status-step is-done">
-              <span className="assistant-run-status-step-marker is-done" aria-hidden="true">
-                <IconCheck size={9} />
-              </span>
-              <div className="assistant-run-status-step-copy">
-                <div className="assistant-run-status-step-kicker assistant-run-status-step-kicker-done">Done</div>
-              </div>
-            </div>
+            {renderOutputRow('inline')}
           </div>
         )}
+
+        {!open && renderOutputRow('standalone')}
       </div>
     </div>
   );

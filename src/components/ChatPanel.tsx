@@ -808,19 +808,29 @@ function appendTraceSources(
   ];
 }
 
-function snapshotTrace(trace: ResponseTrace, completedAt?: number): ResponseTrace {
+function cloneTrace(
+  trace: ResponseTrace,
+  options: {
+    completedAt?: number;
+    freezeRunning?: boolean;
+  } = {},
+): ResponseTrace {
   return {
     ...trace,
-    completedAt: completedAt ?? trace.completedAt,
+    completedAt: options.completedAt ?? trace.completedAt,
     phases: trace.phases.map((phase) => ({
       ...phase,
-      status: phase.status === 'running' ? 'completed' : phase.status,
+      status: options.freezeRunning && phase.status === 'running' ? 'completed' : phase.status,
       metrics: phase.metrics?.map((metric) => ({ ...metric })),
     })),
     sources: trace.sources?.map((source) => ({ ...source })),
     packages: trace.packages?.map((pkg) => ({ ...pkg })),
     plannerSteps: trace.plannerSteps?.map((step) => ({ ...step })),
   };
+}
+
+function snapshotTrace(trace: ResponseTrace, completedAt?: number): ResponseTrace {
+  return cloneTrace(trace, { completedAt, freezeRunning: true });
 }
 
 function estimateMessageHeight(
@@ -1320,6 +1330,7 @@ export function ChatPanel({
       messages: updatedMessages,
       streaming: true,
       streamingContent: '',
+      streamingTrace: cloneTrace(trace),
       prevRegistry: snapshotRegistry,
       streamingPhase: {
         label: hasPromptUrls || fetchLiveContext ? 'Fetching context...' : 'Starting reply...',
@@ -1327,6 +1338,13 @@ export function ChatPanel({
         totalSteps: 0,
       },
     });
+
+    const pushStreamingTrace = (patch: Partial<Panel> = {}) => {
+      onUpdate(panel.id, {
+        ...patch,
+        streamingTrace: cloneTrace(trace),
+      });
+    };
 
     const abort = new AbortController();
     abortRef.current = abort;
@@ -1365,6 +1383,7 @@ export function ChatPanel({
       'Load reply preferences',
       'Apply previously rated valid and invalid replies as guidance when they are relevant to the current prompt.',
     );
+    pushStreamingTrace();
     try {
       if (chatModePhase && chatWorkflow) {
         finishTracePhase(chatModePhase, {
@@ -1388,6 +1407,7 @@ export function ChatPanel({
           { label: 'Matched', value: String(replyPreferenceSummary.matchedCount) },
         ],
       });
+      pushStreamingTrace();
 
       const [loadedPromptContexts, loadedGlobalContexts] = await Promise.all([
         fetchUrlsFromPrompt(text),
@@ -1443,6 +1463,7 @@ export function ChatPanel({
       urlInject    = urlContextToSystemInject(promptContexts);
       globalInject = globalContextToSystemInject(globalContexts, { depth: fetchDepth });
       contextTurns = globalContextToConversationInject(globalContexts, text, { depth: fetchDepth });
+      pushStreamingTrace();
     } catch (error) {
       contextFetchErrorMessage = error instanceof Error ? error.message : String(error);
       if (replyPreferencePhase.status === 'running') {
@@ -1465,6 +1486,7 @@ export function ChatPanel({
         status: 'error',
         detail: contextFetchErrorMessage || 'Live context fetching failed before reply generation.',
       });
+      pushStreamingTrace();
     }
 
     // Non-code presets - single pass
@@ -1545,6 +1567,7 @@ export function ChatPanel({
           });
         }
       }
+      pushStreamingTrace();
       const validatedCrewInject = validatedCrewRoster.length > 0
         ? buildValidatedCrewRosterInject(validatedCrewRoster)
         : '';
@@ -1594,6 +1617,7 @@ export function ChatPanel({
       trace.orchestrationSummary = enrichmentLabels.length > 0
         ? `Single-pass ${modeLabel}reply enriched with ${enrichmentLabels.join(' and ')} before streaming from ${modelName}.`
         : `Single-pass ${modeLabel}reply streamed directly from ${modelName} with no extra fetched context.`;
+      pushStreamingTrace();
 
       if (!hasSufficientLiveContext) {
         if (contextFetchErrorMessage?.includes('Local fetch proxy unavailable')) {
@@ -1612,6 +1636,7 @@ export function ChatPanel({
             ],
           });
           trace.orchestrationSummary = 'Live retrieval could not run because the local fetch proxy was unavailable in this app session.';
+          pushStreamingTrace();
           await finaliseResponse(
             buildLiveTransportUnavailableReply(referenceDateLabel, contextFetchErrorMessage),
             updatedMessages,
@@ -1636,6 +1661,7 @@ export function ChatPanel({
           ],
         });
         trace.orchestrationSummary = `Live retrieval captured ${globalContexts.length} verified source${globalContexts.length === 1 ? '' : 's'}, below the required ${requiredLiveSourceCount}; the reply was withheld instead of guessing.`;
+        pushStreamingTrace();
         await finaliseResponse(
           buildInsufficientLiveContextReply(referenceDateLabel, globalContexts.length, requiredLiveSourceCount),
           updatedMessages,
@@ -1649,6 +1675,7 @@ export function ChatPanel({
         trace.orchestrationSummary = validatedCrewRoster.length > 0
           ? `Direct crew lookup answered from ${validatedCrewRoster.length} validated roster entr${validatedCrewRoster.length === 1 ? 'y' : 'ies'} extracted from live sources.`
           : 'Direct crew lookup could not derive a validated roster from the live sources, so the reply was withheld instead of guessed.';
+        pushStreamingTrace();
         await finaliseResponse(
           buildCrewLookupReply(validatedCrewRoster, text, referenceDateLabel),
           updatedMessages,
@@ -1676,6 +1703,7 @@ export function ChatPanel({
         'Stream reply',
         'Open the assistant stream and accumulate tokens until the reply is complete.',
       );
+      pushStreamingTrace();
       try {
         const gen = streamChat(modelName, messagesWithContext, systemPrompt, abort.signal);
         for await (const chunk of gen) {
@@ -1976,6 +2004,7 @@ export function ChatPanel({
         messages: finalMessages,
         streaming: false,
         streamingContent: '',
+        streamingTrace: null,
         fileRegistry: updatedReg,
         prevRegistry: snapReg,
         streamingPhase: null,
@@ -2050,6 +2079,7 @@ export function ChatPanel({
             messages: finalMessages,
             streaming: false,
             streamingContent: '',
+            streamingTrace: null,
             fileRegistry: updatedReg,
             streamingPhase: null,
           });
@@ -2064,7 +2094,7 @@ export function ChatPanel({
           responseTimingRef.current = null;
           visibleReplyContentRef.current = '';
           setLiveResponseMs(null);
-          onUpdate(panel.id, { streaming: false, streamingContent: '', streamingPhase: null });
+          onUpdate(panel.id, { streaming: false, streamingContent: '', streamingTrace: null, streamingPhase: null });
         }
       } else {
         trace.orchestrationSummary = `The reply pipeline failed before completion while using ${modelName}.`;
@@ -2085,7 +2115,7 @@ export function ChatPanel({
         responseTimingRef.current = null;
         visibleReplyContentRef.current = '';
         setLiveResponseMs(null);
-        onUpdate(panel.id, { messages: [...msgs, errMsg], streaming: false, streamingContent: '', streamingPhase: null });
+        onUpdate(panel.id, { messages: [...msgs, errMsg], streaming: false, streamingContent: '', streamingTrace: null, streamingPhase: null });
       }
     }
 
@@ -2298,6 +2328,7 @@ export function ChatPanel({
                           feedbackValue={replyPreferenceDraft ? replyPreferenceFeedbackById.get(replyPreferenceDraft.id) ?? null : null}
                           onFeedbackChange={replyPreferenceDraft ? (next) => handleReplyFeedbackChange(msg, actualIndex, next) : undefined}
                           hideCodeBlocks={isCodeAssistant}
+                          isMostRecentReply={!panel.streaming && msg.role === 'assistant' && actualIndex === panel.messages.length - 1}
                           onAssistantRunStatusToggle={handleAssistantRunStatusToggle}
                           suppressNoCodeWarning={currentPreset !== 'code'}
                         />
@@ -2331,7 +2362,11 @@ export function ChatPanel({
                       if (isCodeStreaming && !hasSummary) return null;
                       return (
                         <MessageBubble
-                          message={{ role: 'assistant', content: panel.streamingContent }}
+                          message={{
+                            role: 'assistant',
+                            content: panel.streamingContent,
+                            responseTrace: panel.streamingTrace ?? undefined,
+                          }}
                           withDownload={false}
                           prevRegistry={panel.prevRegistry}
                           model={panel.model}
@@ -2339,6 +2374,7 @@ export function ChatPanel({
                           isStreaming={true}
                           streamingPhase={panel.streamingPhase}
                           liveResponseMs={liveResponseMs}
+                          isMostRecentReply={true}
                           onAssistantRunStatusToggle={handleAssistantRunStatusToggle}
                           suppressNoCodeWarning={true}
                         />

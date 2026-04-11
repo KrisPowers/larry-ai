@@ -22,23 +22,10 @@ interface Props {
   isStreaming?: boolean;
   streamingPhase?: StreamingPhase | null;
   liveResponseMs?: number | null;
+  isMostRecentReply?: boolean;
   onAssistantRunStatusToggle?: () => void;
   // When true, never show the NoCodeWarning even if the pattern fires.
   suppressNoCodeWarning?: boolean;
-}
-
-function getSourceHostname(url: string): string {
-  try {
-    return new URL(url).hostname;
-  } catch {
-    return '';
-  }
-}
-
-function getSourceFaviconUrl(url: string): string | null {
-  const hostname = getSourceHostname(url);
-  if (!hostname) return null;
-  return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(hostname)}&sz=64`;
 }
 
 function sourceCredibilityRank(source: ResponseTraceSource): number {
@@ -174,6 +161,7 @@ export function MessageBubble({
   isStreaming = false,
   streamingPhase = null,
   liveResponseMs = null,
+  isMostRecentReply = false,
   onAssistantRunStatusToggle,
   suppressNoCodeWarning = false,
 }: Props) {
@@ -223,9 +211,48 @@ export function MessageBubble({
       })
     : [];
   const messageSources = [...new Map(traceSources.map((source) => [source.url, source])).values()];
-  const sourceButtonIcons = messageSources.slice(0, 3);
   const copyableReply = !isUser ? cleanedDisplay.trim() : '';
   const feedbackEnabled = !isUser && typeof onFeedbackChange === 'function';
+
+  const renderedReplyContent = (!isStreaming || hasVisibleContent)
+    ? (
+        <>
+          {parsedDisplay.parts.map((part, index) => {
+            if (part.type === 'text') {
+              return (
+                <span key={index} dangerouslySetInnerHTML={{ __html: renderTextBlock(part.content) }} />
+              );
+            }
+
+            if (part.block.isInline) {
+              return <InlineCodeBlock key={index} block={part.block} />;
+            }
+
+            if (hideCodeBlocks && !isUser) {
+              return null;
+            }
+
+            if (!withDownload || isUser) {
+              return (
+                <div key={index} className="code-block-wrapper">
+                  <div className="code-block-header">
+                    <span className="code-lang-badge">{part.block.lang || 'text'}</span>
+                  </div>
+                  <pre className="code-pre">
+                    <code className="block-code">{part.block.code}</code>
+                  </pre>
+                </div>
+              );
+            }
+
+            const resolvedPath = extractFilePath(part.block.code, part.block.suggestedFilename);
+            const prevContent = prevRegistry?.get(resolvedPath)?.content;
+            return <CodeBlock key={index} block={part.block} prevContent={prevContent} />;
+          })}
+        </>
+      )
+    : null;
+  const renderReplyInsideRunStatus = shouldShowAssistantRunStatus && !isUser;
 
   function handleCopyReply() {
     if (!copyableReply) return;
@@ -240,6 +267,73 @@ export function MessageBubble({
       });
   }
 
+  const assistantReplyActions = !isUser && !isStreaming ? (
+    <div className="msg-source-actions">
+      <button
+        type="button"
+        className={`msg-source-trigger msg-copy-trigger${replyCopied ? ' copied' : ''}`}
+        onClick={handleCopyReply}
+        aria-label={replyCopied ? 'Reply copied' : 'Copy reply'}
+        title={replyCopied ? 'Copied' : 'Copy reply'}
+        disabled={!copyableReply}
+      >
+        {replyCopied ? <IconCheck size={16} /> : <IconCopy size={16} />}
+      </button>
+
+      {feedbackEnabled && (
+        <>
+          <button
+            type="button"
+            className={`msg-source-trigger msg-feedback-trigger like${feedbackValue === 'liked' ? ' active' : ''}`}
+            onClick={() => onFeedbackChange?.(feedbackValue === 'liked' ? null : 'liked')}
+            aria-pressed={feedbackValue === 'liked'}
+            aria-label={feedbackValue === 'liked' ? 'Remove valid or accurate rating' : 'Mark reply as valid or accurate'}
+            title={feedbackValue === 'liked' ? 'Remove valid or accurate rating' : 'Mark reply as valid or accurate'}
+          >
+            <IconThumbsUp size={16} />
+          </button>
+
+          <button
+            type="button"
+            className={`msg-source-trigger msg-feedback-trigger dislike${feedbackValue === 'disliked' ? ' active' : ''}`}
+            onClick={() => onFeedbackChange?.(feedbackValue === 'disliked' ? null : 'disliked')}
+            aria-pressed={feedbackValue === 'disliked'}
+            aria-label={feedbackValue === 'disliked' ? 'Remove invalid or inaccurate rating' : 'Mark reply as invalid or inaccurate'}
+            title={feedbackValue === 'disliked' ? 'Remove invalid or inaccurate rating' : 'Mark reply as invalid or inaccurate'}
+          >
+            <IconThumbsDown size={16} />
+          </button>
+        </>
+      )}
+
+      {!shouldShowAssistantRunStatus && messageSources.length > 0 && (
+        <button
+          type="button"
+          className="msg-source-trigger msg-source-primary"
+          onClick={() => setSourcesOpen(true)}
+          aria-label="Open sources"
+        >
+          <span className="msg-source-trigger-label">Sources</span>
+        </button>
+      )}
+    </div>
+  ) : null;
+
+  const assistantReplyBlock = (!isUser && (renderedReplyContent || assistantReplyActions)) ? (
+    <div className="msg-reply-stack">
+      {renderedReplyContent && (
+        <div className="msg-bubble-body">
+          {renderedReplyContent}
+        </div>
+      )}
+      {assistantReplyActions}
+    </div>
+  ) : renderedReplyContent ? (
+    <div className="msg-bubble-body">
+      {renderedReplyContent}
+    </div>
+  ) : null;
+
   return (
     <div className={`msg ${message.role}`}>
 
@@ -250,112 +344,16 @@ export function MessageBubble({
           isStreaming={isStreaming}
           liveResponseMs={isStreaming ? liveResponseMs : message.responseTimeMs ?? liveResponseMs}
           hasStreamingContent={hasVisibleContent}
+          defaultOpen={isMostRecentReply}
           onToggleOpenChange={onAssistantRunStatusToggle}
+          onOpenSources={messageSources.length > 0 ? () => setSourcesOpen(true) : undefined}
+          replyContent={renderReplyInsideRunStatus ? assistantReplyBlock : null}
         />
       )}
 
-      {(!isStreaming || hasVisibleContent) && (
+      {!renderReplyInsideRunStatus && assistantReplyBlock && (
         <div className="msg-bubble">
-          <div className="msg-bubble-body">
-            {parsedDisplay.parts.map((part, index) => {
-              if (part.type === 'text') {
-                return (
-                  <span key={index} dangerouslySetInnerHTML={{ __html: renderTextBlock(part.content) }} />
-                );
-              }
-
-              if (part.block.isInline) {
-                return <InlineCodeBlock key={index} block={part.block} />;
-              }
-
-              if (hideCodeBlocks && !isUser) {
-                return null;
-              }
-
-              if (!withDownload || isUser) {
-                return (
-                  <div key={index} className="code-block-wrapper">
-                    <div className="code-block-header">
-                      <span className="code-lang-badge">{part.block.lang || 'text'}</span>
-                    </div>
-                    <pre className="code-pre">
-                      <code className="block-code">{part.block.code}</code>
-                    </pre>
-                  </div>
-                );
-              }
-
-              const resolvedPath = extractFilePath(part.block.code, part.block.suggestedFilename);
-              const prevContent = prevRegistry?.get(resolvedPath)?.content;
-              return <CodeBlock key={index} block={part.block} prevContent={prevContent} />;
-            })}
-          </div>
-        </div>
-      )}
-
-      {!isUser && !isStreaming && (
-        <div className="msg-source-actions">
-          <button
-            type="button"
-            className={`msg-source-trigger msg-copy-trigger${replyCopied ? ' copied' : ''}`}
-            onClick={handleCopyReply}
-            aria-label={replyCopied ? 'Reply copied' : 'Copy reply'}
-            title={replyCopied ? 'Copied' : 'Copy reply'}
-            disabled={!copyableReply}
-          >
-            {replyCopied ? <IconCheck size={16} /> : <IconCopy size={16} />}
-          </button>
-
-          {feedbackEnabled && (
-            <>
-              <button
-                type="button"
-                className={`msg-source-trigger msg-feedback-trigger like${feedbackValue === 'liked' ? ' active' : ''}`}
-                onClick={() => onFeedbackChange?.(feedbackValue === 'liked' ? null : 'liked')}
-                aria-pressed={feedbackValue === 'liked'}
-                aria-label={feedbackValue === 'liked' ? 'Remove valid or accurate rating' : 'Mark reply as valid or accurate'}
-                title={feedbackValue === 'liked' ? 'Remove valid or accurate rating' : 'Mark reply as valid or accurate'}
-              >
-                <IconThumbsUp size={16} />
-              </button>
-
-              <button
-                type="button"
-                className={`msg-source-trigger msg-feedback-trigger dislike${feedbackValue === 'disliked' ? ' active' : ''}`}
-                onClick={() => onFeedbackChange?.(feedbackValue === 'disliked' ? null : 'disliked')}
-                aria-pressed={feedbackValue === 'disliked'}
-                aria-label={feedbackValue === 'disliked' ? 'Remove invalid or inaccurate rating' : 'Mark reply as invalid or inaccurate'}
-                title={feedbackValue === 'disliked' ? 'Remove invalid or inaccurate rating' : 'Mark reply as invalid or inaccurate'}
-              >
-                <IconThumbsDown size={16} />
-              </button>
-            </>
-          )}
-
-          {messageSources.length > 0 && (
-            <button
-              type="button"
-              className="msg-source-trigger msg-source-primary"
-              onClick={() => setSourcesOpen(true)}
-              aria-label="Open sources"
-            >
-              <span className="msg-source-trigger-icons" aria-hidden="true">
-                {sourceButtonIcons.map((source) => (
-                  <span key={source.id} className="msg-source-trigger-icon">
-                    {getSourceFaviconUrl(source.url) ? (
-                      <img
-                        src={getSourceFaviconUrl(source.url) ?? undefined}
-                        alt=""
-                      />
-                    ) : (
-                      <span className="msg-source-trigger-icon-fallback" />
-                    )}
-                  </span>
-                ))}
-              </span>
-              <span className="msg-source-trigger-label">Sources</span>
-            </button>
-          )}
+          {assistantReplyBlock}
         </div>
       )}
 

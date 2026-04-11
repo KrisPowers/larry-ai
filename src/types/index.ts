@@ -204,6 +204,7 @@ export interface Panel {
   messages: Message[];
   streaming: boolean;
   streamingContent: string;
+  streamingTrace: ResponseTrace | null;
   fileRegistry: FileRegistry;
   prevRegistry: FileRegistry;
   streamingPhase: StreamingPhase | null;

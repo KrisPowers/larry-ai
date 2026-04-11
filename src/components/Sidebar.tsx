@@ -8,16 +8,20 @@ import {
   IconChevronDown,
   IconChevronLeft,
   IconChevronRight,
+  IconDownload,
   IconFileText,
   IconFolder,
   IconFolderOpen,
   IconFolderPlus,
   IconGripHorizontal,
+  IconListChecks,
   IconMessageSquare,
   IconRefreshCw,
   IconSearch,
   IconSettings,
+  IconSlidersHorizontal,
   IconSquarePen,
+  IconTerminal,
   IconX,
 } from './Icon';
 
@@ -54,7 +58,23 @@ type ChatSidebarProps = {
   onOpenSettings: () => void;
 };
 
-type Props = CodeSidebarProps | ChatSidebarProps;
+type SettingsSidebarTab = {
+  id: string;
+  label: string;
+  title: string;
+  description: string;
+  summary: string;
+};
+
+type SettingsSidebarProps = {
+  mode: 'settings';
+  tabs: SettingsSidebarTab[];
+  activeTabId: string;
+  onSelectTab: (id: string) => void;
+  onBackToChat: () => void;
+};
+
+type Props = CodeSidebarProps | ChatSidebarProps | SettingsSidebarProps;
 
 function formatHistoryTimestamp(updatedAt: number): string {
   const elapsedMs = Math.max(0, Date.now() - updatedAt);
@@ -104,6 +124,23 @@ function findRecentMessage(chat: ChatRecord, role?: 'user' | 'assistant') {
   return [...(chat.messages ?? [])]
     .reverse()
     .find((message) => message.content.trim() && (!role || message.role === role));
+}
+
+function getSettingsTabIcon(tabId: string) {
+  switch (tabId) {
+    case 'workspace':
+      return IconSlidersHorizontal;
+    case 'providers':
+      return IconSearch;
+    case 'data':
+      return IconDownload;
+    case 'shortcuts':
+      return IconListChecks;
+    case 'advanced':
+      return IconTerminal;
+    default:
+      return IconSettings;
+  }
 }
 
 function WorkspaceRow({
@@ -967,9 +1004,131 @@ function ChatSidebar({
   );
 }
 
+function SettingsSidebar({
+  tabs,
+  activeTabId,
+  onSelectTab,
+  onBackToChat,
+}: Omit<SettingsSidebarProps, 'mode'>) {
+  const [query, setQuery] = useState('');
+  const searchRef = useRef<HTMLInputElement>(null);
+  const cleanQuery = query.trim().toLowerCase();
+  const visibleTabs = useMemo(
+    () => tabs.filter((tab) => {
+      if (!cleanQuery) return true;
+      const searchable = [tab.label, tab.title, tab.description, tab.summary].join(' ').toLowerCase();
+      return searchable.includes(cleanQuery);
+    }),
+    [cleanQuery, tabs],
+  );
+
+  return (
+    <aside
+      className="workbench-sidebar workbench-sidebar-chat workbench-sidebar-library workbench-sidebar-settings"
+      aria-label="Settings sidebar"
+    >
+      <div className="workbench-sidebar-main">
+        <section className="workbench-thread-section" aria-label="Settings sections">
+          <div className="workbench-thread-section-head workbench-thread-section-head-chat">
+            <div className="workbench-thread-section-copy">
+              <span className="workbench-thread-section-title">Settings</span>
+              <span className="workbench-thread-section-caption">
+                {tabs.length} tab{tabs.length === 1 ? '' : 's'}
+              </span>
+            </div>
+
+            <div className="workbench-thread-section-tools">
+              <button
+                type="button"
+                className="workbench-thread-section-tool"
+                onClick={() => searchRef.current?.focus()}
+                title="Search settings"
+              >
+                <IconSearch size={15} />
+              </button>
+            </div>
+          </div>
+
+          <label className="workbench-thread-search-shell">
+            <IconSearch size={14} />
+            <input
+              ref={searchRef}
+              type="text"
+              className="workbench-thread-search"
+              placeholder="Search settings"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+            />
+          </label>
+
+          <div className="workbench-sidebar-library-scroll">
+            <div className="workbench-thread-list workbench-chat-thread-list workbench-sidebar-library-list">
+              {visibleTabs.length === 0 ? (
+                <div className="workbench-thread-empty">
+                  No settings match this search.
+                </div>
+              ) : (
+                visibleTabs.map((tab, index) => {
+                  const isActive = activeTabId === tab.id;
+                  const Icon = getSettingsTabIcon(tab.id);
+
+                  return (
+                    <article
+                      key={tab.id}
+                      className={`workbench-chat-thread-entry workbench-library-entry workbench-settings-entry${isActive ? ' active' : ''}`}
+                    >
+                      <button
+                        type="button"
+                        className={`workbench-thread-item workbench-thread-item-chat workbench-thread-item-library workbench-thread-item-library-settings${isActive ? ' active' : ''}`}
+                        onClick={() => onSelectTab(tab.id)}
+                        aria-current={isActive ? 'page' : undefined}
+                        aria-label={`${tab.label}. ${tab.description}`}
+                        title={`${tab.title} - ${tab.description}`}
+                      >
+                        <span className="workbench-thread-item-icon workbench-thread-item-kind settings" aria-hidden="true">
+                          <Icon size={14} />
+                        </span>
+
+                        <span className="workbench-settings-item-copy">
+                          <span className="workbench-settings-item-head">
+                            <span className="workbench-thread-item-label">{tab.label}</span>
+                            <span className="workbench-settings-item-order">
+                              {String(index + 1).padStart(2, '0')}
+                            </span>
+                          </span>
+                          <span className="workbench-settings-item-summary">{tab.summary}</span>
+                        </span>
+                      </button>
+                    </article>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div className="workbench-sidebar-footer">
+        <button
+          type="button"
+          className="workbench-sidebar-utility"
+          onClick={onBackToChat}
+        >
+          <IconChevronLeft size={15} />
+          <span>Back to chat</span>
+        </button>
+      </div>
+    </aside>
+  );
+}
+
 export function Sidebar(props: Props) {
   if (props.mode === 'chat') {
     return <ChatSidebar {...props} />;
+  }
+
+  if (props.mode === 'settings') {
+    return <SettingsSidebar {...props} />;
   }
 
   return <CodeSidebar {...props} />;

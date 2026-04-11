@@ -101,6 +101,10 @@ const SETTINGS_TAB_META: Record<SettingsTabId, {
   },
 };
 
+function isSettingsTabId(value: string): value is SettingsTabId {
+  return value in SETTINGS_TAB_META;
+}
+
 function buildStartPath(threadType: ThreadType): string {
   if (threadType === 'code' || threadType === 'debug') return '/code';
   return '/chat';
@@ -353,6 +357,7 @@ function newPanel(defaultModel: string, chatData?: Partial<ChatRecord>): Panel {
     messages: chatData?.messages ?? [],
     streaming: false,
     streamingContent: '',
+    streamingTrace: null,
     fileRegistry: restoreRegistry(chatData),
     prevRegistry: new Map(),
     streamingPhase: null,
@@ -2507,6 +2512,19 @@ export default function App() {
       onOpenSettings={() => navigate('/settings')}
     />
   );
+  const settingsSidebar = (
+    <Sidebar
+      mode="settings"
+      tabs={settingsTabs}
+      activeTabId={settingsTab}
+      onSelectTab={(tabId) => {
+        if (isSettingsTabId(tabId)) {
+          setSettingsTab(tabId);
+        }
+      }}
+      onBackToChat={() => navigate('/chat')}
+    />
+  );
 
   return (
     <div id="app">
@@ -2567,14 +2585,17 @@ export default function App() {
 
         <div id="main-content">
           {route.kind === 'settings' ? (
-            <div id="settings-view">
-              <div className="settings-stage">
-                <div className="settings-header">
-                    <span className="settings-eyebrow">Settings</span>
-                    <h2>Workspace controls</h2>
-                    <p>Pick defaults for new chats, manage providers, review local data, and keep the app&apos;s shortcut system easy to discover.</p>
+            <div className="workbench-route-shell chat-route-shell settings-route-shell">
+              {settingsSidebar}
+              <div className="workbench-route-main settings-route-main">
+                <div id="settings-view">
+                  <div className="settings-stage">
+                    <div className="settings-header">
+                      <span className="settings-eyebrow">Settings</span>
+                      <h2>App settings</h2>
+                      <p>Pick defaults for new chats, manage providers, review local data, and keep the app&apos;s shortcut system easy to discover.</p>
 
-                  <div className="settings-overview-grid">
+                      <div className="settings-overview-grid">
                     <article className="settings-overview-card">
                       <span className="settings-overview-icon" aria-hidden="true">
                         <IconMessageSquare size={18} />
@@ -2604,22 +2625,6 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="settings-tab-strip" role="tablist" aria-label="Settings categories">
-                  {settingsTabs.map((tab) => (
-                    <button
-                      key={tab.id}
-                      type="button"
-                      role="tab"
-                      aria-selected={settingsTab === tab.id}
-                      className={`settings-tab-pill${settingsTab === tab.id ? ' active' : ''}`}
-                      onClick={() => setSettingsTab(tab.id)}
-                    >
-                      <span className="settings-tab-pill-label">{tab.label}</span>
-                      <span className="settings-tab-pill-summary">{tab.summary}</span>
-                    </button>
-                  ))}
-                </div>
-
                 <section className="settings-panel">
                   <div className="settings-panel-head">
                     <div>
@@ -2630,7 +2635,7 @@ export default function App() {
                   </div>
 
                   <div className="settings-panel-body">
-                  {settingsTab === 'workspace' && (
+                    {settingsTab === 'workspace' && (
                     <>
                       <div className="settings-card-grid settings-card-grid-two">
                         <section className="settings-card settings-card-spacious">
@@ -3408,10 +3413,12 @@ export default function App() {
                       )}
                     </section>
                   )}
-                </div>
-              </section>
+                  </div>
+                </section>
+              </div>
             </div>
-            </div>
+          </div>
+        </div>
           ) : route.kind === 'landing' ? (
             <PromptLibraryView
               page="landing"
