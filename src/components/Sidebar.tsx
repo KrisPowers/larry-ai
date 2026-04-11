@@ -18,7 +18,6 @@ import {
   IconSearch,
   IconSettings,
   IconSquarePen,
-  IconTrash2,
   IconX,
 } from './Icon';
 
@@ -32,7 +31,7 @@ type CodeSidebarProps = {
   onClearActiveWorkspace: () => void;
   onCreateChat: () => void;
   onOpenChat: (chat: ChatRecord) => void;
-  onDeleteChat: (id: string) => void;
+  onArchiveChat: (id: string) => void;
   onRenameWorkspace: (workspace: WorkspaceGroup, nextLabel: string) => void;
   onArchiveWorkspace: (workspace: WorkspaceGroup) => void;
   onOpenWorkspaceInExplorer: (workspace: WorkspaceGroup) => void;
@@ -43,11 +42,15 @@ type CodeSidebarProps = {
 type ChatSidebarProps = {
   mode: 'chat';
   chats: ChatRecord[];
+  workspaces: WorkspaceGroup[];
   activeChatId: string | null;
   openPanelIds: string[];
+  onCreateWorkspace: () => void;
   onCreateChat: () => void;
+  onSelectWorkspace: (workspace: WorkspaceGroup) => void;
+  onArchiveWorkspace: (workspace: WorkspaceGroup) => void;
   onOpenChat: (chat: ChatRecord) => void;
-  onDeleteChat: (id: string) => void;
+  onArchiveChat: (id: string) => void;
   onOpenSettings: () => void;
 };
 
@@ -87,6 +90,14 @@ function formatHistoryTimestampDetail(updatedAt: number): string {
 function compressPreviewText(value?: string, fallback = ''): string {
   const compact = (value ?? fallback).replace(/\s+/g, ' ').trim();
   return compact || fallback;
+}
+
+function getWorkspaceLastChatUpdatedAt(workspace: WorkspaceGroup): number | null {
+  if (!workspace.chats.length) return null;
+  return workspace.chats.reduce(
+    (latest, chat) => Math.max(latest, chat.updatedAt),
+    workspace.chats[0]?.updatedAt ?? 0,
+  );
 }
 
 function findRecentMessage(chat: ChatRecord, role?: 'user' | 'assistant') {
@@ -304,7 +315,7 @@ function CodeSidebar({
   onClearActiveWorkspace,
   onCreateChat,
   onOpenChat,
-  onDeleteChat,
+  onArchiveChat,
   onRenameWorkspace,
   onArchiveWorkspace,
   onOpenWorkspaceInExplorer,
@@ -608,12 +619,12 @@ function CodeSidebar({
 
                       <button
                         type="button"
-                        className="workbench-thread-item-delete"
-                        onClick={() => onDeleteChat(chat.id)}
-                        aria-label={`Delete ${title}`}
-                        title="Delete chat"
+                        className="workbench-thread-item-action"
+                        onClick={() => onArchiveChat(chat.id)}
+                        aria-label={`Archive ${title}`}
+                        title="Archive chat"
                       >
-                        <IconTrash2 size={12} />
+                        <IconArchive size={12} />
                       </button>
                     </article>
                   );
@@ -709,46 +720,87 @@ function CodeSidebar({
 
 function ChatSidebar({
   chats,
+  workspaces,
   activeChatId,
   openPanelIds,
+  onCreateWorkspace,
   onCreateChat,
+  onSelectWorkspace,
+  onArchiveWorkspace,
   onOpenChat,
-  onDeleteChat,
+  onArchiveChat,
   onOpenSettings,
 }: Omit<ChatSidebarProps, 'mode'>) {
   const [query, setQuery] = useState('');
   const searchRef = useRef<HTMLInputElement>(null);
   const openIds = useMemo(() => new Set(openPanelIds), [openPanelIds]);
+  const sortedWorkspaces = useMemo(
+    () => [...workspaces]
+      .filter((workspace) => workspace.id !== 'project:general')
+      .sort((left, right) => right.updatedAt - left.updatedAt),
+    [workspaces],
+  );
   const sortedChats = useMemo(
     () => [...chats].sort((left, right) => right.updatedAt - left.updatedAt),
     [chats],
   );
-  const filteredChats = useMemo(() => {
-    const cleanQuery = query.trim().toLowerCase();
-    if (!cleanQuery) return sortedChats;
+  const cleanQuery = query.trim().toLowerCase();
+  const libraryItems = useMemo(() => {
+    const workspaceItems = sortedWorkspaces
+      .filter((workspace) => {
+        if (!cleanQuery) return true;
+        const label = (workspace.label || '').toLowerCase();
+        const path = (workspace.rootPath || '').toLowerCase();
+        return label.includes(cleanQuery) || path.includes(cleanQuery);
+      })
+      .map((workspace) => ({
+        kind: 'workspace' as const,
+        id: workspace.id,
+        updatedAt: getWorkspaceLastChatUpdatedAt(workspace) ?? workspace.updatedAt,
+        workspace,
+      }));
 
-    return sortedChats.filter((chat) => {
-      const title = (chat.title || '').toLowerCase();
-      const messageText = (chat.messages ?? [])
-        .slice(-3)
-        .map((message) => message.content.toLowerCase())
-        .join(' ');
-      return title.includes(cleanQuery) || messageText.includes(cleanQuery);
-    });
-  }, [query, sortedChats]);
+    const chatItems = sortedChats
+      .filter((chat) => {
+        if (!cleanQuery) return true;
+        const title = (chat.title || '').toLowerCase();
+        const messageText = (chat.messages ?? [])
+          .slice(-3)
+          .map((message) => message.content.toLowerCase())
+          .join(' ');
+        return title.includes(cleanQuery) || messageText.includes(cleanQuery);
+      })
+      .map((chat) => ({
+        kind: 'chat' as const,
+        id: chat.id,
+        updatedAt: chat.updatedAt,
+        chat,
+      }));
+
+    return [...workspaceItems, ...chatItems].sort((left, right) => right.updatedAt - left.updatedAt);
+  }, [cleanQuery, sortedChats, sortedWorkspaces]);
+  const libraryItemCount = sortedWorkspaces.length + sortedChats.length;
 
   return (
-    <aside className="workbench-sidebar workbench-sidebar-chat" aria-label="Chat sidebar">
+    <aside className="workbench-sidebar workbench-sidebar-chat workbench-sidebar-library" aria-label="Chat sidebar">
       <div className="workbench-sidebar-main">
-        <section className="workbench-thread-section" aria-label="Chats">
+        <section className="workbench-thread-section" aria-label="Chats and workspaces">
           <div className="workbench-thread-section-head workbench-thread-section-head-chat">
             <div className="workbench-thread-section-copy">
-              <span className="workbench-thread-section-title">Chats</span>
+              <span className="workbench-thread-section-title">Library</span>
               <span className="workbench-thread-section-caption">
-                {sortedChats.length} stored / {openPanelIds.length} open
+                {libraryItemCount} item{libraryItemCount === 1 ? '' : 's'}
               </span>
             </div>
             <div className="workbench-thread-section-tools">
+              <button
+                type="button"
+                className="workbench-thread-section-tool"
+                onClick={onCreateWorkspace}
+                title="Add a workspace folder"
+              >
+                <IconFolderPlus size={15} />
+              </button>
               <button
                 type="button"
                 className="workbench-thread-section-tool"
@@ -761,7 +813,7 @@ function ChatSidebar({
                 type="button"
                 className="workbench-thread-section-tool"
                 onClick={() => searchRef.current?.focus()}
-                title="Search chats"
+                title="Search chats and workspaces"
               >
                 <IconSearch size={15} />
               </button>
@@ -774,70 +826,129 @@ function ChatSidebar({
               ref={searchRef}
               type="text"
               className="workbench-thread-search"
-              placeholder="Search conversations"
+              placeholder="Search chats and workspaces"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
             />
           </label>
 
-          <div className="workbench-thread-list workbench-chat-thread-list">
-            {filteredChats.length === 0 ? (
-              <div className="workbench-thread-empty">
-                {query.trim() ? 'No saved chats match this search.' : 'No chats yet'}
-              </div>
-            ) : (
-              filteredChats.map((chat) => {
-                const isActive = activeChatId === chat.id;
-                const isOpen = openIds.has(chat.id);
-                const latestUserMessage = findRecentMessage(chat, 'user');
-                const title = compressPreviewText(
-                  chat.title,
-                  latestUserMessage?.content || 'Untitled conversation',
-                );
-                const updatedLabel = formatHistoryTimestamp(chat.updatedAt);
-                const updatedDetail = formatHistoryTimestampDetail(chat.updatedAt);
-                const accessibilityLabel = `${title}, ${updatedDetail}${isActive ? ', active chat' : isOpen ? ', open chat' : ''}`;
+          <div className="workbench-sidebar-library-scroll">
+            <div className="workbench-thread-list workbench-chat-thread-list workbench-sidebar-library-list">
+              {libraryItems.length === 0 ? (
+                <div className="workbench-thread-empty">
+                  {cleanQuery ? 'No chats or workspaces match this search.' : 'No chats or workspaces yet.'}
+                </div>
+              ) : (
+                libraryItems.map((item) => {
+                  if (item.kind === 'workspace') {
+                    const { workspace } = item;
+                    const label = workspace.label || 'Untitled workspace';
+                    const lastChatUpdatedAt = getWorkspaceLastChatUpdatedAt(workspace);
+                    const updatedLabel = lastChatUpdatedAt ? formatHistoryTimestamp(lastChatUpdatedAt) : 'new';
+                    const updatedDetail = lastChatUpdatedAt
+                      ? formatHistoryTimestampDetail(lastChatUpdatedAt)
+                      : 'No chats in this workspace yet.';
 
-                return (
-                  <article
-                    key={chat.id}
-                    className={`workbench-chat-thread-entry${isActive ? ' active' : ''}${isOpen ? ' open' : ''}`}
-                  >
-                    <button
-                      type="button"
-                      className={`workbench-thread-item workbench-thread-item-chat${isActive ? ' active' : ''}`}
-                      onClick={() => onOpenChat(chat)}
-                      aria-current={isActive ? 'page' : undefined}
-                      aria-label={accessibilityLabel}
-                      title={`${title} - ${updatedDetail}`}
+                    return (
+                      <article
+                        key={workspace.id}
+                        className="workbench-chat-thread-entry workbench-library-entry workbench-library-entry-workspace"
+                      >
+                        <button
+                          type="button"
+                          className="workbench-thread-item workbench-thread-item-chat workbench-thread-item-library workbench-thread-item-library-workspace"
+                          onClick={() => onSelectWorkspace(workspace)}
+                          aria-label={`Open workspace ${label}, ${updatedDetail}`}
+                          title={`${label} - ${updatedDetail}`}
+                        >
+                          <span className="workbench-thread-item-icon workbench-thread-item-kind workspace" aria-hidden="true">
+                            <IconFolder size={14} />
+                          </span>
+
+                          <span className="workbench-thread-item-copy">
+                            <span className="workbench-thread-item-chat-main workbench-thread-item-library-main">
+                              <span className="workbench-thread-item-label">{label}</span>
+                              <time
+                                className="workbench-thread-item-timestamp"
+                                dateTime={lastChatUpdatedAt ? new Date(lastChatUpdatedAt).toISOString() : undefined}
+                                title={updatedDetail}
+                              >
+                                {updatedLabel}
+                              </time>
+                            </span>
+                          </span>
+                        </button>
+
+                        <button
+                          type="button"
+                          className="workbench-thread-item-action"
+                          onClick={() => onArchiveWorkspace(workspace)}
+                          aria-label={`Archive ${label}`}
+                          title="Archive workspace"
+                        >
+                          <IconArchive size={12} />
+                        </button>
+                      </article>
+                    );
+                  }
+
+                  const { chat } = item;
+                  const isActive = activeChatId === chat.id;
+                  const isOpen = openIds.has(chat.id);
+                  const latestUserMessage = findRecentMessage(chat, 'user');
+                  const title = compressPreviewText(
+                    chat.title,
+                    latestUserMessage?.content || 'Untitled conversation',
+                  );
+                  const updatedLabel = formatHistoryTimestamp(chat.updatedAt);
+                  const updatedDetail = formatHistoryTimestampDetail(chat.updatedAt);
+                  const accessibilityLabel = `${title}, ${updatedDetail}${isActive ? ', active chat' : isOpen ? ', open chat' : ''}`;
+
+                  return (
+                    <article
+                      key={chat.id}
+                      className={`workbench-chat-thread-entry workbench-library-entry workbench-library-entry-chat${isActive ? ' active' : ''}${isOpen ? ' open' : ''}`}
                     >
-                      <span className="workbench-thread-item-copy">
-                        <span className="workbench-thread-item-chat-main">
-                          <span className="workbench-thread-item-label">{title}</span>
-                          <time
-                            className="workbench-thread-item-timestamp"
-                            dateTime={new Date(chat.updatedAt).toISOString()}
-                            title={updatedDetail}
-                          >
-                            {updatedLabel}
-                          </time>
+                      <button
+                        type="button"
+                        className={`workbench-thread-item workbench-thread-item-chat workbench-thread-item-library${isActive ? ' active' : ''}`}
+                        onClick={() => onOpenChat(chat)}
+                        aria-current={isActive ? 'page' : undefined}
+                        aria-label={accessibilityLabel}
+                        title={`${title} - ${updatedDetail}`}
+                      >
+                        <span className="workbench-thread-item-icon workbench-thread-item-kind chat" aria-hidden="true">
+                          <IconMessageSquare size={14} />
                         </span>
-                      </span>
-                    </button>
 
-                    <button
-                      type="button"
-                      className="workbench-thread-item-delete"
-                      onClick={() => onDeleteChat(chat.id)}
-                      aria-label={`Delete ${title}`}
-                      title="Delete chat"
-                    >
-                      <IconTrash2 size={12} />
-                    </button>
-                  </article>
-                );
-              })
-            )}
+                        <span className="workbench-thread-item-copy">
+                          <span className="workbench-thread-item-chat-main workbench-thread-item-library-main">
+                            <span className="workbench-thread-item-label">{title}</span>
+                            <time
+                              className="workbench-thread-item-timestamp"
+                              dateTime={new Date(chat.updatedAt).toISOString()}
+                              title={updatedDetail}
+                            >
+                              {updatedLabel}
+                            </time>
+                          </span>
+                        </span>
+                      </button>
+
+                      <button
+                        type="button"
+                        className="workbench-thread-item-action"
+                        onClick={() => onArchiveChat(chat.id)}
+                        aria-label={`Archive ${title}`}
+                        title="Archive chat"
+                      >
+                        <IconArchive size={12} />
+                      </button>
+                    </article>
+                  );
+                })
+              )}
+            </div>
           </div>
         </section>
       </div>

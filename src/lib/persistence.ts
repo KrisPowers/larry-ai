@@ -374,10 +374,12 @@ export async function loadChats(): Promise<ChatRecord[]> {
 
   const desktopBridge = getDesktopBridge();
   if (desktopBridge) {
-    return desktopBridge.LoadChats();
+    const chats = await desktopBridge.LoadChats();
+    return chats.filter((chat) => !(typeof chat.archivedAt === 'number' && chat.archivedAt > 0));
   }
 
-  return loadAllChats();
+  const chats = await loadAllChats();
+  return chats.filter((chat) => !(typeof chat.archivedAt === 'number' && chat.archivedAt > 0));
 }
 
 export async function saveChat(chat: ChatRecord): Promise<void> {

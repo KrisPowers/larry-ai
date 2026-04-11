@@ -1106,6 +1106,17 @@ export default function App() {
     }, { silent: true });
   }, [navigate, syncWorkspaceFolder]);
 
+  const handleSelectSidebarWorkspace = useCallback((workspace: WorkspaceGroup) => {
+    setSelectedCodeWorkspaceId(workspace.id);
+    void syncWorkspaceFolder({
+      id: workspace.id,
+      label: workspace.label,
+      createdAt: workspace.createdAt,
+      rootPath: workspace.rootPath,
+      browserHandleId: workspace.browserHandleId,
+    }, { silent: true });
+  }, [syncWorkspaceFolder]);
+
   const handleClearSelectedCodeWorkspace = useCallback(() => {
     setSelectedCodeWorkspaceId(null);
     const currentRecord = route.kind === 'chat'
@@ -1115,6 +1126,10 @@ export default function App() {
       navigate('/code');
     }
   }, [chats, navigate, panels, route]);
+
+  const handleClearChatSidebarWorkspace = useCallback(() => {
+    setSelectedCodeWorkspaceId(null);
+  }, []);
 
   const handleRenameWorkspace = useCallback(async (workspace: WorkspaceGroup, nextLabel: string) => {
     const clean = nextLabel.trim();
@@ -1449,6 +1464,46 @@ export default function App() {
       },
     });
   }, [chats, closePanel, remove, requestConfirmation, toast]);
+
+  const requestArchiveChat = useCallback((id: string) => {
+    const panel = panels.find((candidate) => candidate.id === id) ?? null;
+    const chat = chats.find((candidate) => candidate.id === id) ?? null;
+    const source = panel ?? chat;
+    if (!source) return;
+
+    requestConfirmation({
+      title: 'Archive this chat?',
+      message: 'The chat will disappear from the active sidebar, but remain saved in local storage.',
+      confirmLabel: 'Archive chat',
+      onConfirm: async () => {
+        const timestamp = Date.now();
+        const archivedRecord = buildPersistedChatRecord({
+          id: source.id,
+          title: source.title,
+          model: source.model,
+          preset: source.preset,
+          reasoningEffort: source.reasoningEffort,
+          threadType: source.threadType,
+          projectId: source.projectId,
+          projectLabel: source.projectLabel,
+          messages: source.messages,
+          updatedAt: timestamp,
+          archivedAt: timestamp,
+          fileEntries: panel ? entriesFromRegistry(panel.fileRegistry) : cloneFileEntries(chat?.fileEntries),
+        });
+
+        await save(archivedRecord);
+
+        if (panel) {
+          closePanel(id);
+        } else if (route.kind === 'chat' && route.chatId === id) {
+          navigate(buildStartPath(resolveThreadSurface(chat)));
+        }
+
+        toast(`Archived "${source.title || 'Untitled'}".`);
+      },
+    });
+  }, [buildPersistedChatRecord, chats, closePanel, navigate, panels, requestConfirmation, route, save, toast]);
 
   const requestDeleteWorkspace = useCallback((workspace: { id: string; label: string }) => {
     const relatedChats = chats.filter((chat) => deriveWorkspaceFromChat(chat).id === workspace.id);
@@ -2418,15 +2473,37 @@ export default function App() {
     setChatStarterPanelId(starterPanelId);
     navigate(buildChatPath(starterPanelId));
   }, [chatStarterPanelId, defaultChatPreset, defaultReasoningEffort, navigate, openDraftChat, panels]);
-  const chatSidebar = (
+  const chatSidebar = selectedCodeWorkspace ? (
+    <Sidebar
+      mode="code"
+      workspaces={codeWorkspaceGroups}
+      activeWorkspaceId={selectedCodeWorkspace.id}
+      activeChatId={activeChatSidebarId}
+      onCreateWorkspace={() => void openWorkspaceLauncher()}
+      onSelectWorkspace={handleSelectSidebarWorkspace}
+      onClearActiveWorkspace={handleClearChatSidebarWorkspace}
+      onCreateChat={handleCreateCodeChat}
+      onOpenChat={handleOpenFromHistory}
+      onArchiveChat={requestArchiveChat}
+      onRenameWorkspace={handleRenameWorkspace}
+      onArchiveWorkspace={requestArchiveWorkspace}
+      onOpenWorkspaceInExplorer={handleOpenWorkspaceInExplorer}
+      onRefreshWorkspace={handleRefreshWorkspace}
+      onOpenSettings={() => navigate('/settings')}
+    />
+  ) : (
     <Sidebar
       mode="chat"
       chats={chatSurfaceChats}
+      workspaces={codeWorkspaceGroups}
       activeChatId={activeChatSidebarId}
       openPanelIds={chatSurfaceOpenPanelIds}
+      onCreateWorkspace={() => void openWorkspaceLauncher()}
       onCreateChat={handleShowChatStarter}
+      onSelectWorkspace={handleSelectSidebarWorkspace}
+      onArchiveWorkspace={requestArchiveWorkspace}
       onOpenChat={handleOpenFromHistory}
-      onDeleteChat={requestDeleteChat}
+      onArchiveChat={requestArchiveChat}
       onOpenSettings={() => navigate('/settings')}
     />
   );
@@ -3399,7 +3476,7 @@ export default function App() {
                 onClearActiveWorkspace={handleClearSelectedCodeWorkspace}
                 onCreateChat={handleCreateCodeChat}
                 onOpenChat={handleOpenFromHistory}
-                onDeleteChat={requestDeleteChat}
+                onArchiveChat={requestArchiveChat}
                 onRenameWorkspace={handleRenameWorkspace}
                 onArchiveWorkspace={requestArchiveWorkspace}
                 onOpenWorkspaceInExplorer={handleOpenWorkspaceInExplorer}
@@ -3451,7 +3528,7 @@ export default function App() {
                 onClearActiveWorkspace={handleClearSelectedCodeWorkspace}
                 onCreateChat={handleCreateCodeChat}
                 onOpenChat={handleOpenFromHistory}
-                onDeleteChat={requestDeleteChat}
+                onArchiveChat={requestArchiveChat}
                 onRenameWorkspace={handleRenameWorkspace}
                 onArchiveWorkspace={requestArchiveWorkspace}
                 onOpenWorkspaceInExplorer={handleOpenWorkspaceInExplorer}

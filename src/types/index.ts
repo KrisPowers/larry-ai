@@ -138,6 +138,7 @@ export interface ChatRecord {
   projectLabel?: string;
   messages: Message[];
   updatedAt: number;
+  archivedAt?: number;
   fileEntries?: FileEntry[];
 }
 
