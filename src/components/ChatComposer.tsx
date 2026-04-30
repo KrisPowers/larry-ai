@@ -4,7 +4,6 @@ import {
   IconArrowUp,
   IconCheck,
   IconChevronDown,
-  IconHourglass,
   IconPlus,
   IconSlidersHorizontal,
   IconStop,
@@ -233,9 +232,6 @@ export function ChatComposer({
               aria-haspopup="listbox"
               aria-expanded={openPicker === 'preset'}
             >
-              <span className="chatbar-pill-icon">
-                <IconHourglass size={14} />
-              </span>
               <span className="chatbar-pill-label">{currentPreset?.label ?? presetValue}</span>
               <span className="chatbar-pill-chevron">
                 <IconChevronDown size={14} />

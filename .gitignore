@@ -10,3 +10,5 @@
 tmp-fetch-runtime/
 tmp-fetch-test/
 package.json.md5
+/.gocache
+/.gocache/25

@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { workspaceHasLinkedSource, type WorkspaceGroup } from '../lib/workspaces';
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
+import { findWorkspaceGroup, workspaceHasLinkedSource, type WorkspaceGroup } from '../lib/workspaces';
 import type { ChatRecord, WorkspaceFileNode } from '../types';
 import {
   IconArchive,
@@ -8,6 +8,7 @@ import {
   IconChevronDown,
   IconChevronLeft,
   IconChevronRight,
+  IconCopy,
   IconDownload,
   IconFileText,
   IconFolder,
@@ -22,6 +23,7 @@ import {
   IconSlidersHorizontal,
   IconSquarePen,
   IconTerminal,
+  IconTrash2,
   IconX,
 } from './Icon';
 
@@ -30,11 +32,24 @@ type CodeSidebarProps = {
   workspaces: WorkspaceGroup[];
   activeWorkspaceId: string | null;
   activeChatId: string | null;
+  activeFilePath: string | null;
   onCreateWorkspace: () => void;
   onSelectWorkspace: (workspace: WorkspaceGroup) => void;
   onClearActiveWorkspace: () => void;
   onCreateChat: () => void;
   onOpenChat: (chat: ChatRecord) => void;
+  onOpenFile: (workspace: WorkspaceGroup, relativePath: string) => void;
+  onCreateFileInFolder: (workspace: WorkspaceGroup, parentRelativePath: string | null) => void;
+  onCreateFolderInFolder: (workspace: WorkspaceGroup, parentRelativePath: string | null) => void;
+  onRenameFile: (workspace: WorkspaceGroup, relativePath: string, nextName: string) => void;
+  onRenameFolder: (workspace: WorkspaceGroup, relativePath: string, nextName: string) => void;
+  onDuplicateFile: (workspace: WorkspaceGroup, relativePath: string) => void;
+  onDeleteFile: (workspace: WorkspaceGroup, relativePath: string) => void;
+  onDeleteFolder: (workspace: WorkspaceGroup, relativePath: string) => void;
+  onCopyFilePath: (workspace: WorkspaceGroup, relativePath: string) => void;
+  onCopyFolderPath: (workspace: WorkspaceGroup, relativePath: string) => void;
+  onOpenFileOutsideApp: (workspace: WorkspaceGroup, relativePath: string) => void;
+  onOpenFolderOutsideApp: (workspace: WorkspaceGroup, relativePath: string) => void;
   onArchiveChat: (id: string) => void;
   onRenameWorkspace: (workspace: WorkspaceGroup, nextLabel: string) => void;
   onArchiveWorkspace: (workspace: WorkspaceGroup) => void;
@@ -112,6 +127,30 @@ function compressPreviewText(value?: string, fallback = ''): string {
   return compact || fallback;
 }
 
+function getWorkspaceEntryName(path: string): string {
+  const normalizedPath = path.replace(/\\/g, '/');
+  return normalizedPath.split('/').filter(Boolean).pop() || normalizedPath;
+}
+
+function findWorkspaceNodeByPath(
+  nodes: WorkspaceFileNode[] | undefined,
+  targetPath: string,
+): WorkspaceFileNode | null {
+  if (!nodes?.length) return null;
+
+  const stack = [...nodes];
+  while (stack.length) {
+    const node = stack.pop();
+    if (!node) continue;
+    if (node.path === targetPath) return node;
+    if (node.kind === 'directory' && node.children?.length) {
+      stack.push(...node.children);
+    }
+  }
+
+  return null;
+}
+
 function getWorkspaceLastChatUpdatedAt(workspace: WorkspaceGroup): number | null {
   if (!workspace.chats.length) return null;
   return workspace.chats.reduce(
@@ -130,6 +169,8 @@ function getSettingsTabIcon(tabId: string) {
   switch (tabId) {
     case 'workspace':
       return IconSlidersHorizontal;
+    case 'editor':
+      return IconFileText;
     case 'providers':
       return IconSearch;
     case 'data':
@@ -141,6 +182,64 @@ function getSettingsTabIcon(tabId: string) {
     default:
       return IconSettings;
   }
+}
+
+const SETTINGS_SIDEBAR_SECTION_ORDER: Array<{
+  id: string;
+  label: string;
+  tabIds: string[];
+}> = [
+  {
+    id: 'workspace-models',
+    label: 'Workspace & Models',
+    tabIds: ['workspace', 'editor', 'providers'],
+  },
+  {
+    id: 'data-behavior',
+    label: 'Data & Behavior',
+    tabIds: ['data'],
+  },
+  {
+    id: 'documents-knowledge',
+    label: 'Documents & Knowledge',
+    tabIds: ['shortcuts'],
+  },
+  {
+    id: 'advanced',
+    label: 'Advanced',
+    tabIds: ['advanced'],
+  },
+];
+
+function buildSettingsSidebarSections(tabs: SettingsSidebarTab[]) {
+  const tabMap = new Map(tabs.map((tab) => [tab.id, tab]));
+  const claimed = new Set<string>();
+  const sections = SETTINGS_SIDEBAR_SECTION_ORDER.map((section) => {
+    const sectionTabs = section.tabIds
+      .map((tabId) => {
+        const tab = tabMap.get(tabId);
+        if (tab) claimed.add(tabId);
+        return tab;
+      })
+      .filter((tab): tab is SettingsSidebarTab => Boolean(tab));
+
+    return {
+      id: section.id,
+      label: section.label,
+      tabs: sectionTabs,
+    };
+  }).filter((section) => section.tabs.length > 0);
+
+  const uncategorizedTabs = tabs.filter((tab) => !claimed.has(tab.id));
+  if (uncategorizedTabs.length > 0) {
+    sections.push({
+      id: 'more',
+      label: 'More',
+      tabs: uncategorizedTabs,
+    });
+  }
+
+  return sections;
 }
 
 function WorkspaceRow({
@@ -258,12 +357,32 @@ function WorkspaceRow({
 
 function WorkspaceFileTree({
   nodes,
+  activeFilePath,
+  editingFilePath,
+  editingFileName,
   collapsedPaths,
+  onEditingFileNameChange,
+  onCancelRenamingFile,
+  onCommitRenamingFile,
   onToggleDirectory,
+  onOpenFile,
+  onOpenFileContextMenu,
 }: {
   nodes: WorkspaceFileNode[];
+  activeFilePath: string | null;
+  editingFilePath: string | null;
+  editingFileName: string;
   collapsedPaths: Set<string>;
+  onEditingFileNameChange: (value: string) => void;
+  onCancelRenamingFile: () => void;
+  onCommitRenamingFile: (path: string) => void;
   onToggleDirectory: (path: string) => void;
+  onOpenFile: (path: string) => void;
+  onOpenFileContextMenu: (
+    event: ReactMouseEvent<HTMLButtonElement>,
+    path: string,
+    kind: WorkspaceFileNode['kind'],
+  ) => void;
 }) {
   return (
     <div className="code-file-tree-list" role="tree" aria-label="Workspace files">
@@ -272,8 +391,16 @@ function WorkspaceFileTree({
           key={node.path}
           node={node}
           depth={0}
+          activeFilePath={activeFilePath}
+          editingFilePath={editingFilePath}
+          editingFileName={editingFileName}
           collapsedPaths={collapsedPaths}
+          onEditingFileNameChange={onEditingFileNameChange}
+          onCancelRenamingFile={onCancelRenamingFile}
+          onCommitRenamingFile={onCommitRenamingFile}
           onToggleDirectory={onToggleDirectory}
+          onOpenFile={onOpenFile}
+          onOpenFileContextMenu={onOpenFileContextMenu}
         />
       ))}
     </div>
@@ -283,48 +410,120 @@ function WorkspaceFileTree({
 function WorkspaceFileTreeNode({
   node,
   depth,
+  activeFilePath,
+  editingFilePath,
+  editingFileName,
   collapsedPaths,
+  onEditingFileNameChange,
+  onCancelRenamingFile,
+  onCommitRenamingFile,
   onToggleDirectory,
+  onOpenFile,
+  onOpenFileContextMenu,
 }: {
   node: WorkspaceFileNode;
   depth: number;
+  activeFilePath: string | null;
+  editingFilePath: string | null;
+  editingFileName: string;
   collapsedPaths: Set<string>;
+  onEditingFileNameChange: (value: string) => void;
+  onCancelRenamingFile: () => void;
+  onCommitRenamingFile: (path: string) => void;
   onToggleDirectory: (path: string) => void;
+  onOpenFile: (path: string) => void;
+  onOpenFileContextMenu: (
+    event: ReactMouseEvent<HTMLButtonElement>,
+    path: string,
+    kind: WorkspaceFileNode['kind'],
+  ) => void;
 }) {
   const isDirectory = node.kind === 'directory';
   const isCollapsed = isDirectory && collapsedPaths.has(node.path);
+  const isActiveFile = !isDirectory && activeFilePath === node.path;
+  const isEditingEntry = editingFilePath === node.path;
   const paddingLeft = 12 + (depth * 16);
 
   return (
     <div className="code-file-tree-node">
-      <button
-        type="button"
-        className={`code-file-tree-item${isDirectory ? ' directory' : ''}`}
-        style={{ paddingLeft }}
-        onClick={() => {
-          if (isDirectory) {
-            onToggleDirectory(node.path);
-          }
-        }}
-        aria-expanded={isDirectory ? !isCollapsed : undefined}
-        role="treeitem"
-      >
-        {isDirectory ? (
-          <span className="code-file-tree-toggle" aria-hidden="true">
-            {isCollapsed ? <IconChevronRight size={13} /> : <IconChevronDown size={13} />}
-          </span>
-        ) : (
+      {isEditingEntry ? (
+        <div className="code-file-tree-edit" style={{ paddingLeft }}>
           <span className="code-file-tree-toggle placeholder" aria-hidden="true" />
-        )}
+          <span className="code-file-tree-icon" aria-hidden="true">
+            {isDirectory ? <IconFolder size={14} /> : <IconFileText size={14} />}
+          </span>
 
-        <span className="code-file-tree-icon" aria-hidden="true">
-          {isDirectory
-            ? (isCollapsed ? <IconFolder size={14} /> : <IconFolderOpen size={14} />)
-            : <IconFileText size={14} />}
-        </span>
+          <input
+            autoFocus
+            className="code-file-tree-input"
+            value={editingFileName}
+            onChange={(event) => onEditingFileNameChange(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') {
+                event.preventDefault();
+                onCommitRenamingFile(node.path);
+              } else if (event.key === 'Escape') {
+                event.preventDefault();
+                onCancelRenamingFile();
+              }
+            }}
+          />
 
-        <span className="code-file-tree-label">{node.name}</span>
-      </button>
+          <div className="code-file-tree-edit-actions">
+            <button
+              type="button"
+              className="workbench-thread-section-tool"
+              onClick={() => onCommitRenamingFile(node.path)}
+              title="Save file name"
+            >
+              <IconCheck size={13} />
+            </button>
+            <button
+              type="button"
+              className="workbench-thread-section-tool"
+              onClick={onCancelRenamingFile}
+              title="Cancel rename"
+            >
+              <IconX size={13} />
+            </button>
+          </div>
+        </div>
+      ) : (
+        <button
+          type="button"
+          className={`code-file-tree-item${isDirectory ? ' directory' : ''}${isActiveFile ? ' active' : ''}`}
+          style={{ paddingLeft }}
+          onClick={() => {
+            if (isDirectory) {
+              onToggleDirectory(node.path);
+              return;
+            }
+
+            onOpenFile(node.path);
+          }}
+          onContextMenu={(event) => onOpenFileContextMenu(event, node.path, node.kind)}
+          aria-expanded={isDirectory ? !isCollapsed : undefined}
+          aria-current={isActiveFile ? 'page' : undefined}
+          role="treeitem"
+          title={node.path}
+        >
+          {isDirectory ? (
+            <span className="code-file-tree-toggle" aria-hidden="true">
+              {isCollapsed ? <IconChevronRight size={13} /> : <IconChevronDown size={13} />}
+            </span>
+          ) : (
+            <span className="code-file-tree-toggle placeholder" aria-hidden="true" />
+          )}
+
+          <span className="code-file-tree-icon" aria-hidden="true">
+            {isDirectory
+              ? (isCollapsed ? <IconFolder size={14} /> : <IconFolderOpen size={14} />)
+              : <IconFileText size={14} />}
+          </span>
+
+          <span className="code-file-tree-label">{node.name}</span>
+        </button>
+      )}
 
       {isDirectory && !isCollapsed && node.children?.length ? (
         <div role="group">
@@ -333,8 +532,16 @@ function WorkspaceFileTreeNode({
               key={child.path}
               node={child}
               depth={depth + 1}
+              activeFilePath={activeFilePath}
+              editingFilePath={editingFilePath}
+              editingFileName={editingFileName}
               collapsedPaths={collapsedPaths}
+              onEditingFileNameChange={onEditingFileNameChange}
+              onCancelRenamingFile={onCancelRenamingFile}
+              onCommitRenamingFile={onCommitRenamingFile}
               onToggleDirectory={onToggleDirectory}
+              onOpenFile={onOpenFile}
+              onOpenFileContextMenu={onOpenFileContextMenu}
             />
           ))}
         </div>
@@ -347,11 +554,24 @@ function CodeSidebar({
   workspaces,
   activeWorkspaceId,
   activeChatId,
+  activeFilePath,
   onCreateWorkspace,
   onSelectWorkspace,
   onClearActiveWorkspace,
   onCreateChat,
   onOpenChat,
+  onOpenFile,
+  onCreateFileInFolder,
+  onCreateFolderInFolder,
+  onRenameFile,
+  onRenameFolder,
+  onDuplicateFile,
+  onDeleteFile,
+  onDeleteFolder,
+  onCopyFilePath,
+  onCopyFolderPath,
+  onOpenFileOutsideApp,
+  onOpenFolderOutsideApp,
   onArchiveChat,
   onRenameWorkspace,
   onArchiveWorkspace,
@@ -364,7 +584,7 @@ function CodeSidebar({
     [workspaces],
   );
   const activeWorkspace = useMemo(
-    () => sortedWorkspaces.find((workspace) => workspace.id === activeWorkspaceId) ?? null,
+    () => findWorkspaceGroup(sortedWorkspaces, activeWorkspaceId),
     [activeWorkspaceId, sortedWorkspaces],
   );
   const workspaceChats = useMemo(
@@ -377,9 +597,20 @@ function CodeSidebar({
   const [splitRatio, setSplitRatio] = useState(0.44);
   const [splitDragging, setSplitDragging] = useState(false);
   const [collapsedPaths, setCollapsedPaths] = useState<Set<string>>(new Set());
+  const [editingFilePath, setEditingFilePath] = useState<string | null>(null);
+  const [editingFileName, setEditingFileName] = useState('');
+  const [fileContextMenu, setFileContextMenu] = useState<{
+    path: string;
+    kind: WorkspaceFileNode['kind'];
+    x: number;
+    y: number;
+  } | null>(null);
 
   useEffect(() => {
     setCollapsedPaths(new Set());
+    setEditingFilePath(null);
+    setEditingFileName('');
+    setFileContextMenu(null);
   }, [activeWorkspaceId]);
 
   const beginWorkspaceEditing = useCallback((workspace: WorkspaceGroup) => {
@@ -420,6 +651,74 @@ function CodeSidebar({
       return next;
     });
   }, []);
+
+  const closeFileContextMenu = useCallback(() => {
+    setFileContextMenu(null);
+  }, []);
+
+  const beginFileEditing = useCallback((path: string) => {
+    setEditingFilePath(path);
+    setEditingFileName(getWorkspaceEntryName(path));
+    closeFileContextMenu();
+  }, [closeFileContextMenu]);
+
+  const cancelFileEditing = useCallback(() => {
+    setEditingFilePath(null);
+    setEditingFileName('');
+  }, []);
+
+  const commitFileEditing = useCallback((path: string) => {
+    if (!activeWorkspace) return;
+    const nextName = editingFileName.trim();
+    if (!nextName) return;
+    const node = findWorkspaceNodeByPath(activeWorkspace.fileTree, path);
+    if (node?.kind === 'directory') {
+      onRenameFolder(activeWorkspace, path, nextName);
+    } else {
+      onRenameFile(activeWorkspace, path, nextName);
+    }
+    setEditingFilePath(null);
+    setEditingFileName('');
+  }, [activeWorkspace, editingFileName, onRenameFile, onRenameFolder]);
+
+  const openFileContextMenu = useCallback((
+    event: ReactMouseEvent<HTMLButtonElement>,
+    path: string,
+    kind: WorkspaceFileNode['kind'],
+  ) => {
+    event.preventDefault();
+    setEditingFilePath(null);
+    setEditingFileName('');
+    setFileContextMenu({
+      path,
+      kind,
+      x: event.clientX,
+      y: event.clientY,
+    });
+  }, []);
+
+  const fileContextMenuPosition = useMemo(() => {
+    if (!fileContextMenu || typeof window === 'undefined') return null;
+    const menuWidth = 224;
+    const menuHeight = fileContextMenu.kind === 'directory' ? 276 : 228;
+    return {
+      left: Math.max(12, Math.min(fileContextMenu.x, window.innerWidth - menuWidth - 12)),
+      top: Math.max(12, Math.min(fileContextMenu.y, window.innerHeight - menuHeight - 12)),
+    };
+  }, [fileContextMenu]);
+
+  useEffect(() => {
+    if (!fileContextMenu && !editingFilePath) return undefined;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      closeFileContextMenu();
+      cancelFileEditing();
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [cancelFileEditing, closeFileContextMenu, editingFilePath, fileContextMenu]);
 
   if (!activeWorkspace) {
     return (
@@ -704,7 +1003,6 @@ function CodeSidebar({
                 <span className="workbench-thread-section-title">Files</span>
                 <span className="workbench-thread-section-caption">
                   {activeWorkspace.fileCount} file{activeWorkspace.fileCount === 1 ? '' : 's'}
-                  {activeWorkspace.syncedAt ? ` · synced ${formatHistoryTimestamp(activeWorkspace.syncedAt)}` : ''}
                 </span>
               </div>
 
@@ -712,10 +1010,18 @@ function CodeSidebar({
                 <button
                   type="button"
                   className="workbench-thread-section-tool"
-                  onClick={() => onRefreshWorkspace(activeWorkspace)}
-                  title="Refresh files"
+                  onClick={() => onCreateFileInFolder(activeWorkspace, null)}
+                  title="New file"
                 >
-                  <IconRefreshCw size={15} />
+                  <IconFileText size={15} />
+                </button>
+                <button
+                  type="button"
+                  className="workbench-thread-section-tool"
+                  onClick={() => onCreateFolderInFolder(activeWorkspace, null)}
+                  title="New folder"
+                >
+                  <IconFolderPlus size={15} />
                 </button>
               </div>
             </div>
@@ -724,8 +1030,16 @@ function CodeSidebar({
               {activeWorkspace.fileTree?.length ? (
                 <WorkspaceFileTree
                   nodes={activeWorkspace.fileTree}
+                  activeFilePath={activeFilePath}
+                  editingFilePath={editingFilePath}
+                  editingFileName={editingFileName}
                   collapsedPaths={collapsedPaths}
+                  onEditingFileNameChange={setEditingFileName}
+                  onCancelRenamingFile={cancelFileEditing}
+                  onCommitRenamingFile={commitFileEditing}
                   onToggleDirectory={toggleDirectory}
+                  onOpenFile={(relativePath) => onOpenFile(activeWorkspace, relativePath)}
+                  onOpenFileContextMenu={openFileContextMenu}
                 />
               ) : workspaceHasLinkedSource(activeWorkspace) ? (
                 <div className="workbench-thread-empty">
@@ -751,6 +1065,141 @@ function CodeSidebar({
           <span>Settings</span>
         </button>
       </div>
+
+      {fileContextMenu && fileContextMenuPosition && (
+        <div className="code-file-context-backdrop" onClick={closeFileContextMenu}>
+          <div
+            className="code-file-context-menu"
+            style={fileContextMenuPosition}
+            role="menu"
+            aria-label={`Actions for ${getWorkspaceEntryName(fileContextMenu.path)}`}
+            onClick={(event) => event.stopPropagation()}
+          >
+            {fileContextMenu.kind === 'directory' ? (
+              <>
+                <button
+                  type="button"
+                  className="code-file-context-menu-item"
+                  onClick={() => {
+                    closeFileContextMenu();
+                    onCreateFileInFolder(activeWorkspace, fileContextMenu.path);
+                  }}
+                >
+                  <IconFileText size={14} />
+                  <span>New File</span>
+                </button>
+                <button
+                  type="button"
+                  className="code-file-context-menu-item"
+                  onClick={() => {
+                    closeFileContextMenu();
+                    onCreateFolderInFolder(activeWorkspace, fileContextMenu.path);
+                  }}
+                >
+                  <IconFolderPlus size={14} />
+                  <span>New Folder</span>
+                </button>
+                <button
+                  type="button"
+                  className="code-file-context-menu-item"
+                  onClick={() => {
+                    closeFileContextMenu();
+                    onOpenFolderOutsideApp(activeWorkspace, fileContextMenu.path);
+                  }}
+                >
+                  <IconArrowUpRight size={14} />
+                  <span>Open Outside Larry</span>
+                </button>
+                <button
+                  type="button"
+                  className="code-file-context-menu-item"
+                  onClick={() => beginFileEditing(fileContextMenu.path)}
+                >
+                  <IconSquarePen size={14} />
+                  <span>Rename</span>
+                </button>
+                <button
+                  type="button"
+                  className="code-file-context-menu-item"
+                  onClick={() => {
+                    closeFileContextMenu();
+                    onCopyFolderPath(activeWorkspace, fileContextMenu.path);
+                  }}
+                >
+                  <IconCopy size={14} />
+                  <span>Copy Path</span>
+                </button>
+                <button
+                  type="button"
+                  className="code-file-context-menu-item danger"
+                  onClick={() => {
+                    closeFileContextMenu();
+                    onDeleteFolder(activeWorkspace, fileContextMenu.path);
+                  }}
+                >
+                  <IconTrash2 size={14} />
+                  <span>Delete</span>
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  className="code-file-context-menu-item"
+                  onClick={() => {
+                    closeFileContextMenu();
+                    onOpenFileOutsideApp(activeWorkspace, fileContextMenu.path);
+                  }}
+                >
+                  <IconArrowUpRight size={14} />
+                  <span>Open Outside Larry</span>
+                </button>
+                <button
+                  type="button"
+                  className="code-file-context-menu-item"
+                  onClick={() => {
+                    closeFileContextMenu();
+                    onDuplicateFile(activeWorkspace, fileContextMenu.path);
+                  }}
+                >
+                  <IconCopy size={14} />
+                  <span>Duplicate</span>
+                </button>
+                <button
+                  type="button"
+                  className="code-file-context-menu-item"
+                  onClick={() => beginFileEditing(fileContextMenu.path)}
+                >
+                  <IconSquarePen size={14} />
+                  <span>Rename</span>
+                </button>
+                <button
+                  type="button"
+                  className="code-file-context-menu-item"
+                  onClick={() => {
+                    closeFileContextMenu();
+                    onCopyFilePath(activeWorkspace, fileContextMenu.path);
+                  }}
+                >
+                  <IconCopy size={14} />
+                  <span>Copy Path</span>
+                </button>
+                <button
+                  type="button"
+                  className="code-file-context-menu-item danger"
+                  onClick={() => {
+                    closeFileContextMenu();
+                    onDeleteFile(activeWorkspace, fileContextMenu.path);
+                  }}
+                >
+                  <IconTrash2 size={14} />
+                  <span>Delete</span>
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      )}
     </aside>
   );
 }
@@ -1010,17 +1459,7 @@ function SettingsSidebar({
   onSelectTab,
   onBackToChat,
 }: Omit<SettingsSidebarProps, 'mode'>) {
-  const [query, setQuery] = useState('');
-  const searchRef = useRef<HTMLInputElement>(null);
-  const cleanQuery = query.trim().toLowerCase();
-  const visibleTabs = useMemo(
-    () => tabs.filter((tab) => {
-      if (!cleanQuery) return true;
-      const searchable = [tab.label, tab.title, tab.description, tab.summary].join(' ').toLowerCase();
-      return searchable.includes(cleanQuery);
-    }),
-    [cleanQuery, tabs],
-  );
+  const sections = useMemo(() => buildSettingsSidebarSections(tabs), [tabs]);
 
   return (
     <aside
@@ -1028,82 +1467,42 @@ function SettingsSidebar({
       aria-label="Settings sidebar"
     >
       <div className="workbench-sidebar-main">
-        <section className="workbench-thread-section" aria-label="Settings sections">
-          <div className="workbench-thread-section-head workbench-thread-section-head-chat">
-            <div className="workbench-thread-section-copy">
-              <span className="workbench-thread-section-title">Settings</span>
-              <span className="workbench-thread-section-caption">
-                {tabs.length} tab{tabs.length === 1 ? '' : 's'}
-              </span>
-            </div>
-
-            <div className="workbench-thread-section-tools">
-              <button
-                type="button"
-                className="workbench-thread-section-tool"
-                onClick={() => searchRef.current?.focus()}
-                title="Search settings"
-              >
-                <IconSearch size={15} />
-              </button>
-            </div>
+        <section className="settings-sidebar-shell" aria-label="Settings sections">
+          <div className="settings-sidebar-head">
+            <span className="settings-sidebar-kicker">Settings</span>
+            <span className="settings-sidebar-title">Control center</span>
           </div>
 
-          <label className="workbench-thread-search-shell">
-            <IconSearch size={14} />
-            <input
-              ref={searchRef}
-              type="text"
-              className="workbench-thread-search"
-              placeholder="Search settings"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-            />
-          </label>
+          <div className="settings-sidebar-sections">
+            {sections.map((section) => (
+              <div key={section.id} className="settings-sidebar-section">
+                <span className="settings-sidebar-section-label">{section.label}</span>
 
-          <div className="workbench-sidebar-library-scroll">
-            <div className="workbench-thread-list workbench-chat-thread-list workbench-sidebar-library-list">
-              {visibleTabs.length === 0 ? (
-                <div className="workbench-thread-empty">
-                  No settings match this search.
-                </div>
-              ) : (
-                visibleTabs.map((tab, index) => {
+                <div className="settings-sidebar-section-list">
+                  {section.tabs.map((tab) => {
                   const isActive = activeTabId === tab.id;
                   const Icon = getSettingsTabIcon(tab.id);
 
                   return (
-                    <article
+                    <button
                       key={tab.id}
-                      className={`workbench-chat-thread-entry workbench-library-entry workbench-settings-entry${isActive ? ' active' : ''}`}
+                      type="button"
+                      className={`settings-sidebar-item${isActive ? ' active' : ''}`}
+                      onClick={() => onSelectTab(tab.id)}
+                      aria-current={isActive ? 'page' : undefined}
+                      aria-label={`${tab.label}. ${tab.description}`}
+                      title={`${tab.title} - ${tab.description}`}
                     >
-                      <button
-                        type="button"
-                        className={`workbench-thread-item workbench-thread-item-chat workbench-thread-item-library workbench-thread-item-library-settings${isActive ? ' active' : ''}`}
-                        onClick={() => onSelectTab(tab.id)}
-                        aria-current={isActive ? 'page' : undefined}
-                        aria-label={`${tab.label}. ${tab.description}`}
-                        title={`${tab.title} - ${tab.description}`}
-                      >
-                        <span className="workbench-thread-item-icon workbench-thread-item-kind settings" aria-hidden="true">
-                          <Icon size={14} />
-                        </span>
-
-                        <span className="workbench-settings-item-copy">
-                          <span className="workbench-settings-item-head">
-                            <span className="workbench-thread-item-label">{tab.label}</span>
-                            <span className="workbench-settings-item-order">
-                              {String(index + 1).padStart(2, '0')}
-                            </span>
-                          </span>
-                          <span className="workbench-settings-item-summary">{tab.summary}</span>
-                        </span>
-                      </button>
-                    </article>
+                      <span className="settings-sidebar-item-icon" aria-hidden="true">
+                        <Icon size={16} />
+                      </span>
+                      <span className="settings-sidebar-item-label">{tab.label}</span>
+                    </button>
                   );
-                })
-              )}
-            </div>
+                })}
+                </div>
+              </div>
+            ))}
           </div>
         </section>
       </div>

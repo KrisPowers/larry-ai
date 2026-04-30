@@ -22,15 +22,31 @@ const (
 
 type JSONMap = map[string]any
 
+type ProviderConnectionSettings struct {
+	SelectedModels []string `json:"selectedModels"`
+	AutoUpdate     bool     `json:"autoUpdate"`
+}
+
+type ProviderSettingsMap struct {
+	Ollama    ProviderConnectionSettings `json:"ollama"`
+	OpenAI    ProviderConnectionSettings `json:"openai"`
+	Anthropic ProviderConnectionSettings `json:"anthropic"`
+}
+
 type AppSettings struct {
-	DefaultModel            string `json:"defaultModel"`
-	DefaultChatPreset       string `json:"defaultChatPreset"`
-	DefaultReasoningEffort  string `json:"defaultReasoningEffort"`
-	DeveloperToolsEnabled   bool   `json:"developerToolsEnabled"`
-	AdvancedUseEnabled      bool   `json:"advancedUseEnabled"`
-	OllamaEndpoint          string `json:"ollamaEndpoint"`
-	OpenAIApiKey            string `json:"openAIApiKey"`
-	AnthropicApiKey         string `json:"anthropicApiKey"`
+	DefaultModel                       string              `json:"defaultModel"`
+	DefaultChatPreset                  string              `json:"defaultChatPreset"`
+	DefaultReasoningEffort             string              `json:"defaultReasoningEffort"`
+	DeveloperToolsEnabled              bool                `json:"developerToolsEnabled"`
+	AdvancedUseEnabled                 bool                `json:"advancedUseEnabled"`
+	CodeEditorAutoSaveEnabled          bool                `json:"codeEditorAutoSaveEnabled"`
+	CodeEditorIndentGuidesEnabled      bool                `json:"codeEditorIndentGuidesEnabled"`
+	CodeEditorSetupGuideEnabled        bool                `json:"codeEditorSetupGuideEnabled"`
+	CodeEditorDependencyInstallEnabled bool                `json:"codeEditorDependencyInstallEnabled"`
+	OllamaEndpoint                     string              `json:"ollamaEndpoint"`
+	OpenAIApiKey                       string              `json:"openAIApiKey"`
+	AnthropicApiKey                    string              `json:"anthropicApiKey"`
+	ProviderSettings                   ProviderSettingsMap `json:"providerSettings"`
 }
 
 type Snapshot struct {
@@ -111,14 +127,70 @@ CREATE INDEX IF NOT EXISTS idx_app_documents_kind_updated
 
 func defaultSettings() AppSettings {
 	return AppSettings{
-		DefaultModel:           "",
-		DefaultChatPreset:      "auto-chat",
-		DefaultReasoningEffort: "balanced",
-		DeveloperToolsEnabled:  false,
-		AdvancedUseEnabled:     false,
-		OllamaEndpoint:         "http://localhost:11434",
-		OpenAIApiKey:           "",
-		AnthropicApiKey:        "",
+		DefaultModel:                       "",
+		DefaultChatPreset:                  "auto-chat",
+		DefaultReasoningEffort:             "balanced",
+		DeveloperToolsEnabled:              false,
+		AdvancedUseEnabled:                 false,
+		CodeEditorAutoSaveEnabled:          true,
+		CodeEditorIndentGuidesEnabled:      true,
+		CodeEditorSetupGuideEnabled:        false,
+		CodeEditorDependencyInstallEnabled: false,
+		OllamaEndpoint:                     "http://localhost:11434",
+		OpenAIApiKey:                       "",
+		AnthropicApiKey:                    "",
+		ProviderSettings:                   defaultProviderSettingsMap(),
+	}
+}
+
+func defaultProviderConnectionSettings() ProviderConnectionSettings {
+	return ProviderConnectionSettings{
+		SelectedModels: []string{},
+		AutoUpdate:     true,
+	}
+}
+
+func defaultProviderSettingsMap() ProviderSettingsMap {
+	return ProviderSettingsMap{
+		Ollama:    defaultProviderConnectionSettings(),
+		OpenAI:    defaultProviderConnectionSettings(),
+		Anthropic: defaultProviderConnectionSettings(),
+	}
+}
+
+func providerConnectionSettingsIsZero(input ProviderConnectionSettings) bool {
+	return len(input.SelectedModels) == 0 &&
+		!input.AutoUpdate
+}
+
+func normaliseProviderConnectionSettings(input ProviderConnectionSettings) ProviderConnectionSettings {
+	defaults := defaultProviderConnectionSettings()
+
+	if providerConnectionSettingsIsZero(input) {
+		return defaults
+	}
+
+	selected := make([]string, 0, len(input.SelectedModels))
+	for _, model := range input.SelectedModels {
+		if model == "" {
+			continue
+		}
+		selected = append(selected, model)
+	}
+	input.SelectedModels = selected
+
+	if input.SelectedModels == nil {
+		input.SelectedModels = []string{}
+	}
+
+	return input
+}
+
+func normaliseProviderSettingsMap(input ProviderSettingsMap) ProviderSettingsMap {
+	return ProviderSettingsMap{
+		Ollama:    normaliseProviderConnectionSettings(input.Ollama),
+		OpenAI:    normaliseProviderConnectionSettings(input.OpenAI),
+		Anthropic: normaliseProviderConnectionSettings(input.Anthropic),
 	}
 }
 
@@ -138,6 +210,8 @@ func normaliseSettings(input AppSettings) AppSettings {
 	if input.OllamaEndpoint == "" {
 		input.OllamaEndpoint = defaults.OllamaEndpoint
 	}
+
+	input.ProviderSettings = normaliseProviderSettingsMap(input.ProviderSettings)
 
 	return input
 }
@@ -172,13 +246,35 @@ func (s *Store) LoadSnapshot() (Snapshot, error) {
 }
 
 func (s *Store) LoadSettings() (AppSettings, error) {
-	var settings AppSettings
-	found, err := s.loadDocument("settings", &settings)
-	if err != nil {
-		return AppSettings{}, err
-	}
-	if !found {
+	var payload string
+	err := s.db.QueryRow(`SELECT payload FROM app_documents WHERE key = ?`, "settings").Scan(&payload)
+	if errors.Is(err, sql.ErrNoRows) {
 		return defaultSettings(), nil
+	}
+	if err != nil {
+		return AppSettings{}, fmt.Errorf("load document %q: %w", "settings", err)
+	}
+
+	var settings AppSettings
+	if err := json.Unmarshal([]byte(payload), &settings); err != nil {
+		return AppSettings{}, fmt.Errorf("decode document %q: %w", "settings", err)
+	}
+
+	var rawSettings map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(payload), &rawSettings); err == nil {
+		defaults := defaultSettings()
+		if _, ok := rawSettings["codeEditorAutoSaveEnabled"]; !ok {
+			settings.CodeEditorAutoSaveEnabled = defaults.CodeEditorAutoSaveEnabled
+		}
+		if _, ok := rawSettings["codeEditorIndentGuidesEnabled"]; !ok {
+			settings.CodeEditorIndentGuidesEnabled = defaults.CodeEditorIndentGuidesEnabled
+		}
+		if _, ok := rawSettings["codeEditorSetupGuideEnabled"]; !ok {
+			settings.CodeEditorSetupGuideEnabled = defaults.CodeEditorSetupGuideEnabled
+		}
+		if _, ok := rawSettings["codeEditorDependencyInstallEnabled"]; !ok {
+			settings.CodeEditorDependencyInstallEnabled = defaults.CodeEditorDependencyInstallEnabled
+		}
 	}
 
 	return normaliseSettings(settings), nil

@@ -12,7 +12,7 @@
  *
  * Phase 2 (execution): One streaming call per step (unchanged).
  *
- * Phase 3 (summary): Automatic prose summary after all steps (unchanged).
+ * Phase 3 (summary): Automatic prose summary after validation and repair complete.
  *
  * Additionally, before Phase 1, any npm/pip/etc. package names detected in
  * the user request or plan are resolved to their latest versions via the
@@ -20,9 +20,17 @@
  */
 
 import { chatOnce } from './ollama';
-import { fetchUrl } from './fetcher';
+import { fetchJsonDirect, fetchUrl } from './fetcher';
 import { appendSharedResponseStylePrompt } from './responseStyle';
 import type { Message } from '../types';
+
+const PLANNER_TIMEOUT_MS = 40_000;
+const PLANNER_RETRY_TIMEOUT_MS = 15_000;
+const PLANNER_HISTORY_USER_LIMIT = 4;
+const PLANNER_HISTORY_ASSISTANT_LIMIT = 2;
+const PLANNER_HISTORY_ITEM_MAX_CHARS = 320;
+const PLANNER_PROMPT_MAX_CHARS = 12_000;
+const PLANNER_PROMPT_RETRY_MAX_CHARS = 6_000;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -34,6 +42,7 @@ export type RequestMode =
   | 'feature_integration' // Integrate/connect two existing systems or libraries
   | 'debug'               // Fix a bug, error, or unexpected behaviour
   | 'refactor'            // Restructure/improve existing code without changing behaviour
+  | 'code_snippet'        // Return a focused example/snippet without project-wide file planning
   | 'explain'             // Explain how existing code works (minimal file output)
   | 'edit_file'           // Targeted edits to specific files (user gave code to modify)
   | 'docs_only'           // Add/improve documentation files only (README, guides, comments)
@@ -73,6 +82,372 @@ export interface DeepPlan {
   resolvedPackages?: PackageVersion[];
 }
 
+function normalizePlannerText(value: string): string {
+  return value.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function clampPlannerSnippet(value: string, maxChars = PLANNER_HISTORY_ITEM_MAX_CHARS): string {
+  const compact = value.replace(/\s+/g, ' ').trim();
+  if (compact.length <= maxChars) return compact;
+  return `${compact.slice(0, maxChars - 3).trimEnd()}...`;
+}
+
+function stripPlannerCodeNoise(value: string): string {
+  return value
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/(?:\/\/|#|<!--)\s*FILE:[^\n]+/gi, ' ')
+    .replace(/\bFILE:\s*[^\n]+/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function compactPlannerPrompt(value: string, maxChars: number): string {
+  const compact = value.trim();
+  if (compact.length <= maxChars) return compact;
+
+  const headBudget = Math.max(1_500, Math.floor(maxChars * 0.62));
+  const tailBudget = Math.max(700, maxChars - headBudget - 48);
+  const head = compact.slice(0, headBudget).trimEnd();
+  const tail = compact.slice(-tailBudget).trimStart();
+
+  return `${head}\n\n[planner context compacted for speed]\n\n${tail}`;
+}
+
+function createTimedChildSignal(parentSignal: AbortSignal, timeoutMs: number) {
+  const controller = new AbortController();
+  let timedOut = false;
+
+  const forwardAbort = () => {
+    controller.abort();
+  };
+
+  if (parentSignal.aborted) {
+    controller.abort();
+  } else {
+    parentSignal.addEventListener('abort', forwardAbort, { once: true });
+  }
+
+  const timeoutHandle = globalThis.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+
+  return {
+    signal: controller.signal,
+    didTimeout: () => timedOut,
+    dispose: () => {
+      globalThis.clearTimeout(timeoutHandle);
+      parentSignal.removeEventListener('abort', forwardAbort);
+    },
+  };
+}
+
+function buildPlanningConversationSummary(history: Message[]): string {
+  if (!history.length) return '';
+
+  const userLines = history
+    .filter((message) => message.role === 'user')
+    .slice(-PLANNER_HISTORY_USER_LIMIT)
+    .map((message, index) => `Prior user request ${index + 1}: ${clampPlannerSnippet(stripPlannerCodeNoise(message.content))}`);
+
+  const assistantLines = history
+    .filter((message) => message.role === 'assistant')
+    .map((message) => stripPlannerCodeNoise(message.content))
+    .filter(Boolean)
+    .slice(-PLANNER_HISTORY_ASSISTANT_LIMIT)
+    .map((content, index) => `Prior assistant outcome ${index + 1}: ${clampPlannerSnippet(content)}`);
+
+  const summaryLines = [...userLines, ...assistantLines];
+  if (!summaryLines.length) return '';
+  return summaryLines.join('\n');
+}
+
+function isWebsiteBuildPrompt(userMessage: string): boolean {
+  const normalized = normalizePlannerText(userMessage);
+  return /\b(website|web app|landing page|homepage|home page|marketing site|portfolio|hero|navbar|pricing|contact|calendar|frontend|react|vite|next)\b/.test(normalized);
+}
+
+function normalizeHeuristicPath(path: string): string {
+  return path.replace(/\\/g, '/').split('/').filter(Boolean).join('/');
+}
+
+function extractKnownWorkspacePathsFromPrompt(userMessage: string): string[] {
+  const lines = userMessage.replace(/\r\n/g, '\n').split('\n');
+  const paths = new Set<string>();
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line.startsWith('- ')) continue;
+    const candidate = line.slice(2).split(' [')[0].trim();
+    if (!candidate || /\s{2,}/.test(candidate)) continue;
+    if (!/[/.]/.test(candidate) && !/^[A-Z][A-Za-z0-9_-]*file(?:\.[A-Za-z0-9]+)?$/i.test(candidate) && !/^[A-Za-z0-9_-]+file$/i.test(candidate)) {
+      continue;
+    }
+    paths.add(normalizeHeuristicPath(candidate));
+  }
+
+  return [...paths];
+}
+
+function chooseKnownOrDefault(knownPaths: Set<string>, candidates: string[], fallback: string): string {
+  const normalizedFallback = normalizeHeuristicPath(fallback);
+  for (const candidate of candidates) {
+    const normalized = normalizeHeuristicPath(candidate);
+    if (knownPaths.has(normalized)) return normalized;
+  }
+  return normalizedFallback;
+}
+
+function inferWebsiteSectionsFromPrompt(userMessage: string): string[] {
+  const normalized = normalizePlannerText(userMessage);
+  const sections = new Set<string>(['header', 'hero']);
+
+  if (/\b(about|company|team|story|mission)\b/.test(normalized)) sections.add('about');
+  if (/\b(feature|features|benefit|benefits|service|services|product|products|solution|solutions)\b/.test(normalized)) sections.add('features');
+  if (/\b(dashboard|analytics|data|stocks?|trading|market|finance|signals?|watchlist|portfolio tracker)\b/.test(normalized)) sections.add('dashboard');
+  if (/\b(portfolio|gallery|work|projects?)\b/.test(normalized)) sections.add('portfolio');
+  if (/\b(pricing|plans?|tiers?)\b/.test(normalized)) sections.add('pricing');
+  if (/\b(calendar|booking|schedule|appointment|events?)\b/.test(normalized)) sections.add('calendar');
+  if (/\b(contact|get in touch|reach out|lead form)\b/.test(normalized)) sections.add('contact');
+  if (/\b(testimonials?|reviews?)\b/.test(normalized)) sections.add('testimonials');
+  if (/\b(faq|questions?)\b/.test(normalized)) sections.add('faq');
+  if (!sections.has('about') && !sections.has('dashboard') && !sections.has('portfolio')) sections.add('about');
+  if (!sections.has('features') && !sections.has('dashboard') && !sections.has('portfolio')) sections.add('features');
+  sections.add('footer');
+
+  return [...sections];
+}
+
+function inferWebsiteExperienceFocus(userMessage: string): string {
+  const cleaned = stripPlannerCodeNoise(userMessage)
+    .replace(/^can you\s+/i, '')
+    .replace(/^please\s+/i, '')
+    .replace(/^build\s+/i, '')
+    .replace(/^create\s+/i, '')
+    .replace(/^make\s+/i, '')
+    .trim();
+
+  if (!cleaned) return 'the main experience requested by the user';
+  return clampPlannerSnippet(cleaned, 180);
+}
+
+function buildStep(
+  stepNumber: number,
+  filePath: string,
+  purpose: string,
+  imports: string[] = [],
+  exports: string[] = [],
+  isSupport = false,
+): DeepStep {
+  return {
+    stepNumber,
+    label: filePath,
+    filePath,
+    purpose,
+    imports,
+    exports,
+    isSupport,
+  };
+}
+
+function plannerBasename(path: string): string {
+  const normalized = path.replace(/\\/g, '/').trim();
+  const segments = normalized.split('/').filter(Boolean);
+  return segments[segments.length - 1] ?? normalized;
+}
+
+function isPlannerDotfileLikePath(path: string): boolean {
+  return plannerBasename(path).startsWith('.');
+}
+
+function buildHeuristicReactViteWebsitePlan(
+  userMessage: string,
+  classification: ClassificationResult,
+): { projectSummary: string; steps: DeepStep[] } {
+  const knownPaths = new Set(extractKnownWorkspacePathsFromPrompt(userMessage));
+  const wantsTypeScript = /\btypescript|\btsx\b/i.test(userMessage) || knownPaths.has('tsconfig.json');
+  const packagePath = chooseKnownOrDefault(knownPaths, ['package.json'], 'package.json');
+  const tsconfigPath = chooseKnownOrDefault(knownPaths, ['tsconfig.json'], 'tsconfig.json');
+  const viteConfigPath = chooseKnownOrDefault(
+    knownPaths,
+    ['vite.config.ts', 'vite.config.tsx', 'vite.config.js', 'vite.config.mjs'],
+    wantsTypeScript ? 'vite.config.ts' : 'vite.config.js',
+  );
+  const indexHtmlPath = chooseKnownOrDefault(knownPaths, ['index.html'], 'index.html');
+  const mainEntryPath = chooseKnownOrDefault(
+    knownPaths,
+    ['src/main.tsx', 'src/main.jsx', 'src/main.ts', 'src/main.js'],
+    wantsTypeScript ? 'src/main.tsx' : 'src/main.jsx',
+  );
+  const appPath = chooseKnownOrDefault(
+    knownPaths,
+    ['src/App.tsx', 'src/App.jsx', 'src/app.tsx', 'src/app.jsx'],
+    wantsTypeScript ? 'src/App.tsx' : 'src/App.jsx',
+  );
+  const stylePath = chooseKnownOrDefault(
+    knownPaths,
+    ['src/styles.css', 'src/index.css', 'src/App.css'],
+    'src/styles.css',
+  );
+  const hasExistingScaffold = knownPaths.has(packagePath) || knownPaths.has(mainEntryPath) || knownPaths.has(appPath);
+  const sections = inferWebsiteSectionsFromPrompt(userMessage);
+  const sectionSummary = sections.join(', ');
+  const experienceFocus = inferWebsiteExperienceFocus(userMessage);
+  const isFeatureLike = classification.mode === 'feature_build' && hasExistingScaffold;
+  const appAction = isFeatureLike ? 'MODIFY' : 'Build';
+  const styleAction = isFeatureLike ? 'MODIFY' : 'Create';
+
+  const steps: DeepStep[] = [];
+  let stepNumber = 1;
+  const addStep = (
+    include: boolean,
+    filePath: string,
+    purpose: string,
+    imports: string[] = [],
+    exports: string[] = [],
+    isSupport = false,
+  ) => {
+    if (!include) return;
+    steps.push(buildStep(stepNumber, filePath, purpose, imports, exports, isSupport));
+    stepNumber += 1;
+  };
+
+  addStep(!isFeatureLike || !knownPaths.has(packagePath), packagePath,
+    'Define the React + TypeScript + Vite workspace scripts, dependencies, and build metadata needed to install, develop, build, and preview the requested web application.',
+    [],
+    [],
+    true,
+  );
+  addStep(wantsTypeScript && (!isFeatureLike || !knownPaths.has(tsconfigPath)), tsconfigPath,
+    'Configure strict TypeScript compiler settings for the Vite React workspace so the source files build cleanly and editor tooling resolves TSX entrypoints correctly.',
+    [packagePath],
+    [],
+    true,
+  );
+  addStep(!isFeatureLike || !knownPaths.has(viteConfigPath), viteConfigPath,
+    'Configure the Vite React app entrypoints and plugin setup required to run and build the requested single-page web experience.',
+    [packagePath],
+    [],
+    true,
+  );
+  addStep(!isFeatureLike || !knownPaths.has(indexHtmlPath), indexHtmlPath,
+    'Provide the HTML shell, root mount element, and document metadata used to bootstrap the React single-page website.',
+    [mainEntryPath],
+    [],
+    true,
+  );
+  addStep(!isFeatureLike || !knownPaths.has(mainEntryPath), mainEntryPath,
+    'Bootstrap the React application, import the global stylesheet, and mount the main web experience at the root element.',
+    [appPath, stylePath],
+    [],
+    false,
+  );
+  addStep(true, appPath,
+    `${appAction}: render the requested React single-page experience with sections for ${sectionSummary}. Keep the main interface centered on ${experienceFocus}, and make the layout responsive across desktop and mobile.`,
+    [stylePath],
+    ['App'],
+    false,
+  );
+  addStep(true, stylePath,
+    `${styleAction}: define the visual system, responsive layout, navigation treatment, and section styling needed to support ${sectionSummary} around ${experienceFocus}.`,
+    [appPath],
+    [],
+    false,
+  );
+
+  return {
+    projectSummary: `Build a ${isFeatureLike ? 'React + TypeScript + Vite website feature update' : 'single-page React + TypeScript + Vite website/application'} for ${experienceFocus}, with sections for ${sectionSummary} and responsive navigation.`,
+    steps,
+  };
+}
+
+function buildHeuristicFallbackPlan(
+  userMessage: string,
+  classification: ClassificationResult,
+): { projectSummary: string; steps: DeepStep[] } {
+  const websiteLike = isWebsiteBuildPrompt(userMessage);
+  if (websiteLike && (
+    classification.mode === 'complete_project'
+    || classification.mode === 'feature_build'
+    || classification.mode === 'feature_integration'
+  )) {
+    return buildHeuristicReactViteWebsitePlan(userMessage, classification);
+  }
+
+  return {
+    projectSummary: stripPlannerCodeNoise(userMessage) || 'Apply the requested workspace changes.',
+    steps: [buildStep(
+      1,
+      'src/index.ts',
+      stripPlannerCodeNoise(userMessage) || 'Apply the requested workspace changes in a single focused source file.',
+      [],
+      [],
+      false,
+    )],
+  };
+}
+
+function buildWebsitePlannerGuidance(userMessage: string): string {
+  const normalized = normalizePlannerText(userMessage);
+  const wantsCalendar = /\b(calendar|booking|schedule|appointment|events?)\b/.test(normalized);
+  const wantsPricing = /\b(pricing|plans?|tiers?|subscriptions?)\b/.test(normalized);
+  const wantsContact = /\b(contact|lead form|reach out|get in touch)\b/.test(normalized);
+
+  return [
+    '',
+    'Website planning rules:',
+    '- Use a normal production website structure rather than abstract folders like coreLogic, entryPoints, or generic utility buckets unless the user explicitly asked for that architecture.',
+    '- For React + TypeScript + Vite requests, the baseline file plan should usually include package.json, tsconfig.json, vite.config.ts when needed, index.html, src/main.tsx, the main app/page component files, and the stylesheet files actually used.',
+    '- Keep the website subject, industry, and section themes grounded in the current request only. Do not carry over niche themes or content from unrelated earlier website prompts.',
+    '- Ensure the file checklist is enough to install, build, start, and render the website immediately.',
+    '- Include standard website sections when the prompt is broad or marketing-oriented: header, responsive navbar with a mobile menu, hero, supporting content sections, and footer.',
+    `- ${wantsPricing ? 'Include a pricing section because the request signals pricing or plan information.' : 'Include a pricing section only if the request clearly benefits from it.'}`,
+    `- ${wantsCalendar ? 'Include a calendar or scheduling section because the request explicitly mentions it.' : 'Include a calendar or scheduling section only if the request explicitly asks for booking, schedules, appointments, or events.'}`,
+    `- ${wantsContact ? 'Include a contact section because the request explicitly asks for contact or lead capture.' : 'Include a contact section when the user expects outreach, forms, or business inquiries.'}`,
+    '- Keep the step list grounded in real framework entrypoints and real component/file names.',
+  ].join('\n');
+}
+
+function buildPlannerSystemPrompt(
+  classification: ClassificationResult,
+  userMessage: string,
+): string {
+  const base = PLANNER_BY_MODE[classification.mode] ?? PLANNER_COMPLETE_PROJECT;
+  const guidance: string[] = [];
+
+  if (classification.mode === 'complete_project') {
+    guidance.push(
+      '',
+      'Project planning rules:',
+      '- Plan only the files the project genuinely needs to build, run, and satisfy the request.',
+      '- Prefer the standard scaffold shape for the requested language, framework, and build tool.',
+      '- Do not invent placeholder-heavy architectures or generic folder names when the user asked for a straightforward app or website.',
+      '- If a dependency manager or runtime is implied, include the files and scripts required to install and start the project successfully.',
+    );
+  }
+
+  if (
+    classification.mode === 'complete_project'
+    || classification.mode === 'feature_build'
+    || classification.mode === 'feature_integration'
+  ) {
+    guidance.push(
+      '',
+      'File path rules:',
+      '- Use exact, real file paths and filenames with extensions.',
+      '- Every new source, stylesheet, config, script, markup, and data file must use its real extension unless the filename is a conventional extensionless file like Dockerfile, Makefile, Procfile, or a dotfile.',
+      '- Reuse existing workspace paths when the workspace already contains a matching file.',
+      '- When planning a new file, pick the final exact path now and keep it stable across every later step.',
+    );
+  }
+
+  if (isWebsiteBuildPrompt(userMessage)) {
+    guidance.push(buildWebsitePlannerGuidance(userMessage));
+  }
+
+  return `${base}${guidance.join('\n')}`;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Phase 0 — Request classifier
 // ─────────────────────────────────────────────────────────────────────────────
@@ -102,6 +477,7 @@ MODES — pick exactly one:
   "feature_integration" — Connect/integrate two existing systems. Signals: "integrate", "connect", "wire up", "add X support to Y".
   "debug"               — Fix a bug, error, crash. Signals: error messages, stack traces, "it crashes", "broken", "not working", "fix this".
   "refactor"            — Restructure existing code without changing behaviour. Signals: "refactor", "clean up", "reorganise", "extract".
+  "code_snippet"        — Return a focused example, snippet, utility, or explanation-sized block of code without planning a full project or editing real files. Signals: "show me a snippet", "give me an example", "how do I write", "one-liner", "sample code", "utility function".
   "explain"             — Explain how existing code works. Signals: "explain", "how does this work", "walk me through".
   "edit_file"           — Targeted edits to specific files. Signals: pasted code + "change X", "update", "modify", "rename".
   "docs_only"           — Add or improve documentation files ONLY. No source code changes. Signals: "add a readme", "write a readme", "add install guide", "add contributing guide", "add changelog", "add license", "write docs", "document this", "add comments". Use this when the request is PURELY about documentation.
@@ -115,7 +491,10 @@ Ecosystems: "npm" for JS/TS, "pip" for Python, "cargo" for Rust, "gem" for Ruby,
  * We deliberately AVOID sending raw code output to the classifier — it's noisy
  * and buries the signal. Instead we send only what the user asked for.
  */
-function summariseHistoryForClassifier(history: Message[]): string {
+function summariseHistoryForClassifier(
+  history: Message[],
+  options?: { hasExistingProject?: boolean; workspaceFilePaths?: string[]; workspaceContextSummary?: string },
+): string {
   const userMessages = history
     .filter(m => m.role === 'user')
     .slice(-5) // last 5 user turns
@@ -125,25 +504,38 @@ function summariseHistoryForClassifier(history: Message[]): string {
   const assistantHadCode = history
     .filter(m => m.role === 'assistant')
     .some(m => /\/\/\s*FILE:|#\s*FILE:|<!--\s*FILE:|```\w+\s+\S+\.\w+/.test(m.content));
+  const projectExistsInWorkspace = Boolean(options?.hasExistingProject);
+  const knownPaths = options?.workspaceFilePaths?.slice(0, 20) ?? [];
 
-  const projectExists = assistantHadCode
-    ? '\nIMPORTANT: The assistant has already written code/files in this conversation. A project EXISTS. Do NOT classify as complete_project.'
+  const projectExists = assistantHadCode || projectExistsInWorkspace
+    ? '\nIMPORTANT: A project already exists in this workspace/conversation. Do NOT classify as complete_project.'
+    : '';
+  const workspaceContext = knownPaths.length > 0
+    ? `\nKnown workspace files:\n${knownPaths.map((path) => `- ${path}`).join('\n')}`
+    : '';
+  const workspaceSummary = options?.workspaceContextSummary
+    ? `\nWorkspace file analysis:\n${options.workspaceContextSummary.trim()}`
     : '';
 
-  return userMessages.join('\n') + projectExists;
+  return userMessages.join('\n') + projectExists + workspaceContext + workspaceSummary;
 }
 
 /**
  * Fast regex pre-classifier — catches obvious cases without burning an LLM call.
  * Returns a mode if confident, null if uncertain (falls through to LLM classifier).
  */
-function preClassify(userMessage: string, history: Message[]): RequestMode | null {
+function preClassify(
+  userMessage: string,
+  history: Message[],
+  options?: { hasExistingProject?: boolean },
+): RequestMode | null {
   const msg = userMessage.toLowerCase().trim();
 
   // If prior assistant messages contained file code, this is NEVER complete_project
   const assistantHadCode = history
     .filter(m => m.role === 'assistant')
     .some(m => /\/\/\s*FILE:|#\s*FILE:|<!--\s*FILE:|```\w+\s+\S+\.\w+/.test(m.content));
+  const hasExistingProject = assistantHadCode || Boolean(options?.hasExistingProject);
 
   // Docs-only signals — very reliable
   const docsSignals = /\b(add|write|create|generate|include|make)\b.{0,40}\b(readme|read me|install guide|installation guide|contributing|changelog|change log|license|documentation|docs|api docs|jsdoc|tsdoc|comments)\b/i;
@@ -162,8 +554,15 @@ function preClassify(userMessage: string, history: Message[]): RequestMode | nul
   const debugSignals = /error:|exception:|cannot find|is not defined|is not a function|undefined is not|null is not|typeerror|syntaxerror|referenceerror|uncaught|stack trace|it('s| is) (broken|not working|crashing|failing)|fix (this|the|my)|why (is|does|am i getting)/i;
   if (debugSignals.test(msg)) return 'debug';
 
+  const snippetSignals = /\b(snippet|sample code|sample snippet|example code|one-liner|utility function|show me an example|show me a snippet|give me a snippet|give me an example|just the code|standalone example|small example|sample implementation)\b/i;
+  const snippetQuestionSignals = /^(how do i|how would you|what's a good way to|write me a function to|can you show me how to)\b/i;
+  const workspaceMutationSignals = /\b(add|implement|integrate|wire|fix|debug|refactor|rename|modify|update|create file|edit file|in this project|in this workspace|in my app|in my repo|package\.json|tsconfig|src\/|app\/|components\/|workspace)\b/i;
+  if ((snippetSignals.test(msg) || snippetQuestionSignals.test(msg)) && !workspaceMutationSignals.test(msg)) {
+    return 'code_snippet';
+  }
+
   // If code exists in history and request looks like adding something, feature_build
-  if (assistantHadCode) {
+  if (hasExistingProject) {
     const addFeatureSignals = /^(please )?(add|implement|build|create|include)\b/i;
     if (addFeatureSignals.test(msg)) return 'feature_build';
 
@@ -185,10 +584,15 @@ export async function classifyRequest(
   conversationHistory: Message[],
   model: string,
   signal: AbortSignal,
+  options?: {
+    hasExistingProject?: boolean;
+    workspaceFilePaths?: string[];
+    workspaceContextSummary?: string;
+  },
 ): Promise<ClassificationResult> {
 
   // Try fast regex pre-classifier first
-  const preResult = preClassify(userMessage, conversationHistory);
+  const preResult = preClassify(userMessage, conversationHistory, options);
   if (preResult) {
     // Extract mentioned packages from message text via simple heuristic
     const pkgMatches = userMessage.match(/\b(express|react|vue|svelte|next|nuxt|fastify|koa|axios|lodash|typescript|vite|webpack|rollup|esbuild|tailwind|prisma|drizzle|mongoose|sequelize|jest|vitest|playwright|cypress)\b/gi) ?? [];
@@ -201,7 +605,7 @@ export async function classifyRequest(
   }
 
   // Build compact history summary — don't send raw code to the classifier
-  const historySummary = summariseHistoryForClassifier(conversationHistory);
+  const historySummary = summariseHistoryForClassifier(conversationHistory, options);
 
   try {
     const raw = await chatOnce(
@@ -224,9 +628,10 @@ export async function classifyRequest(
     const assistantHadCode = conversationHistory
       .filter(m => m.role === 'assistant')
       .some(m => /\/\/\s*FILE:|#\s*FILE:|<!--\s*FILE:|```\w+\s+\S+\.\w+/.test(m.content));
+    const hasExistingProject = assistantHadCode || Boolean(options?.hasExistingProject);
 
     let mode = (parsed.mode as RequestMode) ?? 'feature_build';
-    if (assistantHadCode && mode === 'complete_project') {
+    if (hasExistingProject && mode === 'complete_project') {
       mode = 'feature_build'; // hard override — never regenerate a whole project
     }
 
@@ -240,8 +645,9 @@ export async function classifyRequest(
     const assistantHadCode = conversationHistory
       .filter(m => m.role === 'assistant')
       .some(m => /\/\/\s*FILE:|#\s*FILE:|<!--\s*FILE:|```\w+\s+\S+\.\w+/.test(m.content));
+    const hasExistingProject = assistantHadCode || Boolean(options?.hasExistingProject);
     return {
-      mode: assistantHadCode ? 'feature_build' : 'complete_project',
+      mode: hasExistingProject ? 'feature_build' : 'complete_project',
       confidence: 'low',
       reasoning: 'Classification failed; using safe fallback.',
       mentionedPackages: [],
@@ -267,6 +673,108 @@ async function resolveNpm(name: string): Promise<PackageVersion | null> {
   } catch {
     return null;
   }
+}
+
+async function resolveNpmFromRegistry(name: string): Promise<PackageVersion | null> {
+  try {
+    const data = await fetchJsonDirect<{
+      description?: string;
+      'dist-tags'?: Record<string, string>;
+      versions?: Record<string, { description?: string; deprecated?: string }>;
+    }>(`https://registry.npmjs.org/${encodeURIComponent(name)}`);
+    const normalizeVersion = (value: string) => value.trim().replace(/^v/i, '');
+    const isStableVersion = (value: string) => !normalizeVersion(value).includes('-');
+    const parseSemver = (value: string) => {
+      const normalized = normalizeVersion(value);
+      const [mainPart] = normalized.split('-', 1);
+      const parts = mainPart.split('.').map((part) => Number.parseInt(part, 10));
+      if (!parts.length || parts.some((part) => !Number.isFinite(part))) return null;
+      return {
+        normalized,
+        parts: [parts[0] ?? 0, parts[1] ?? 0, parts[2] ?? 0],
+      };
+    };
+    const compareSemverDesc = (left: string, right: string) => {
+      const leftSemver = parseSemver(left);
+      const rightSemver = parseSemver(right);
+      if (!leftSemver && !rightSemver) return right.localeCompare(left);
+      if (!leftSemver) return 1;
+      if (!rightSemver) return -1;
+      for (let index = 0; index < 3; index += 1) {
+        const delta = rightSemver.parts[index] - leftSemver.parts[index];
+        if (delta !== 0) return delta;
+      }
+      return rightSemver.normalized.localeCompare(leftSemver.normalized);
+    };
+
+    const versions = data.versions ?? {};
+    const latestTag = data['dist-tags']?.latest?.trim() ?? '';
+    const latestManifest = latestTag ? versions[latestTag] : undefined;
+    if (latestTag && latestManifest && isStableVersion(latestTag) && !latestManifest.deprecated) {
+      return {
+        name,
+        ecosystem: 'npm',
+        version: normalizeVersion(latestTag),
+        description: latestManifest.description ?? data.description,
+      };
+    }
+
+    const stableVersions = Object.entries(versions)
+      .filter(([version, manifest]) => isStableVersion(version) && !manifest?.deprecated)
+      .map(([version]) => version)
+      .sort(compareSemverDesc);
+    const selectedVersion = stableVersions[0] ?? latestTag;
+    if (!selectedVersion) return null;
+
+    return {
+      name,
+      ecosystem: 'npm',
+      version: normalizeVersion(selectedVersion),
+      description: versions[selectedVersion]?.description ?? data.description,
+    };
+  } catch {
+    return resolveNpm(name);
+  }
+}
+
+function expandPackageResolutionTargets(
+  packages: ClassificationResult['mentionedPackages'],
+): ClassificationResult['mentionedPackages'] {
+  if (!packages.length) return [];
+
+  const expanded = [...packages];
+  const seen = new Set(expanded.map((pkg) => `${pkg.ecosystem}:${pkg.name.toLowerCase()}`));
+  const addPackage = (
+    name: string,
+    ecosystem: ClassificationResult['mentionedPackages'][number]['ecosystem'],
+  ) => {
+    const key = `${ecosystem}:${name.toLowerCase()}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    expanded.push({ name, ecosystem });
+  };
+
+  const npmNames = new Set(
+    expanded
+      .filter((pkg) => pkg.ecosystem === 'npm')
+      .map((pkg) => pkg.name.toLowerCase()),
+  );
+  const wantsReact = npmNames.has('react') || npmNames.has('react-dom');
+  const wantsTypeScript = npmNames.has('typescript');
+  const wantsVite = npmNames.has('vite');
+
+  if (npmNames.has('react')) {
+    addPackage('react-dom', 'npm');
+  }
+  if (wantsReact && wantsTypeScript) {
+    addPackage('@types/react', 'npm');
+    addPackage('@types/react-dom', 'npm');
+  }
+  if (wantsReact && wantsVite) {
+    addPackage('@vitejs/plugin-react', 'npm');
+  }
+
+  return expanded;
 }
 
 /** Fetch the latest version of a pip package from PyPI. */
@@ -343,11 +851,12 @@ export async function resolvePackageVersions(
   packages: ClassificationResult['mentionedPackages'],
 ): Promise<PackageVersion[]> {
   if (!packages.length) return [];
+  const targets = expandPackageResolutionTargets(packages);
 
   const results = await Promise.allSettled(
-    packages.map(p => {
+    targets.map(p => {
       switch (p.ecosystem) {
-        case 'npm':      return resolveNpm(p.name);
+        case 'npm':      return resolveNpmFromRegistry(p.name);
         case 'pip':      return resolvePip(p.name);
         case 'cargo':    return resolveCargo(p.name);
         case 'gem':      return resolveGem(p.name);
@@ -369,13 +878,14 @@ export async function resolvePackageVersions(
 export function packageVersionsToSystemInject(packages: PackageVersion[]): string {
   if (!packages.length) return '';
   const lines = packages.map(p => {
-    const desc = p.description ? ` — ${p.description.slice(0, 80)}` : '';
-    return `  ${p.name} (${p.ecosystem}): latest = ${p.version}${desc}`;
+    const desc = p.description ? ` - ${p.description.slice(0, 80)}` : '';
+    return `  ${p.name} (${p.ecosystem}): stable latest = ${p.version}${desc}`;
   });
   return (
     `\n\n---\n## Live Package Versions (fetched from registries)\n` +
+    `For npm packages, these versions come from https://registry.npmjs.org/<package> using the current stable release.\n` +
     `Use ONLY these versions in package.json / requirements.txt / Cargo.toml etc.\n` +
-    `Do NOT use older versions from your training data.\n\n` +
+    `Do NOT infer matching versions for companion packages such as @types/*, react-dom, or framework plugins.\n\n` +
     lines.join('\n') +
     `\n---\n`
   );
@@ -415,8 +925,10 @@ Rules:
 const PLANNER_COMPLETE_PROJECT = `You are a senior software architect. Your ONLY job is to produce a complete file checklist for building a new project from scratch.
 
 Include EVERY file the project needs: source files AND support files (package.json, README, etc.).
-Order: types → utilities → core logic → entry points → support files.
-Be exhaustive.` + PLANNER_BASE;
+Be exhaustive, but stay concrete.
+Choose the canonical scaffold shape for the requested stack.
+Do NOT invent abstract buckets like src/types/index.ts, src/utils/index.ts, src/coreLogic/index.ts, or src/entryPoints/index.tsx unless the user explicitly asked for that structure.
+Plan real entrypoints, real config files, and real component/module files that are enough to install, build, run, and render the project.` + PLANNER_BASE;
 
 const PLANNER_FEATURE_BUILD = `You are a senior software architect. Your ONLY job is to plan the addition of a new feature to an existing project.
 
@@ -471,6 +983,7 @@ const PLANNER_BY_MODE: Record<RequestMode, string> = {
   feature_integration: PLANNER_FEATURE_INTEGRATION,
   debug:               PLANNER_DEBUG,
   refactor:            PLANNER_REFACTOR,
+  code_snippet:        PLANNER_EDIT_FILE,
   explain:             PLANNER_EDIT_FILE,
   edit_file:           PLANNER_EDIT_FILE,
   docs_only:           PLANNER_DOCS_ONLY,
@@ -489,7 +1002,8 @@ RULE 0 — FILE PATH DECLARATION (MANDATORY, NO EXCEPTIONS)
 The VERY FIRST LINE inside every code block MUST be the file path comment.
 This is not optional. A code block without a file path comment is broken.
 
-  JS / TS / CSS:   // FILE: src/lib/router.ts
+  JS / TS:         // FILE: src/lib/router.ts
+  CSS / SCSS:      /* FILE: src/styles/app.css */
   Python / Shell:  # FILE: src/server.py
   HTML / XML / MD: <!-- FILE: README.md -->
   JSON / YAML:     \`\`\`json package.json   ← path in the fence label
@@ -510,6 +1024,11 @@ RULE 2 — IMPLEMENTATION COMPLETENESS
 - Do not write any file other than the one you are assigned.
 - When fixing a bug (FIX: steps): change ONLY what is broken. Do not refactor unrelated code.
 - When editing a file (EDIT: steps): apply ONLY the requested changes. Preserve everything else.
+- Use documented framework conventions when a technical reference bundle is present.
+- When you reference another file, match the exact provided path and filename, including extension.
+- Never silently rename the target file, move it to a different folder, or switch to a different extension.
+- Do not omit a file extension for source/config files unless the target is a conventional extensionless file like Dockerfile, Makefile, Procfile, or a dotfile.
+- Do not invent missing imports. If a referenced file does not exist in the provided workspace or plan, either use the correct existing file or keep the implementation self-contained within the assigned file.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RULE 3 — PACKAGE VERSIONS
@@ -562,13 +1081,17 @@ export function buildStepUserMessage(
     : `\nThis is step ${step.stepNumber} of ${total}. Do NOT write a summary yet.`;
 
   const ext = step.filePath.split('.').pop()?.toLowerCase() ?? '';
+  const dotfileLike = isPlannerDotfileLikePath(step.filePath);
   const jsonYaml = ['json', 'yaml', 'yml'].includes(ext);
   const pyShell  = ['py', 'sh', 'bash', 'shell'].includes(ext);
   const htmlXml  = ['html', 'xml', 'md', 'svg'].includes(ext);
+  const cssLike  = ['css', 'scss', 'sass', 'less'].includes(ext);
   const fileComment = jsonYaml
     ? `\`\`\`${ext} ${step.filePath}  ← put the path in the fence label`
-    : pyShell
+    : (pyShell || dotfileLike)
       ? `# FILE: ${step.filePath}`
+      : cssLike
+        ? `/* FILE: ${step.filePath} */`
       : htmlXml
         ? `<!-- FILE: ${step.filePath} -->`
         : `// FILE: ${step.filePath}`;
@@ -578,6 +1101,8 @@ export function buildStepUserMessage(
     modeHint +
     writtenBlock +
     `\nStep ${step.stepNumber} of ${total}: Write the file ${step.filePath}\n` +
+    `\nTARGET PATH RULE: Return the complete file for exactly ${step.filePath}. Do not rename it, move it, or change its extension.\n` +
+    `When you import another file, use the exact path and filename supplied by the workspace context or earlier completed steps.\n` +
     `\nREMINDER: The very first line inside your code block MUST be:\n  ${fileComment}\n` +
     `\nWhat this file must do:\n${step.purpose}\n` +
     importsBlock +
@@ -600,17 +1125,61 @@ export async function planRequest(
   model: string,
   signal: AbortSignal,
 ): Promise<{ projectSummary: string; steps: DeepStep[] }> {
-  const plannerSystem = PLANNER_BY_MODE[classification.mode] ?? PLANNER_COMPLETE_PROJECT;
+  const plannerSystem = buildPlannerSystemPrompt(classification, userMessage);
+  const plannerHistorySummary = buildPlanningConversationSummary(conversationHistory);
+  const buildPlannerMessage = (prompt: string, includeHistorySummary: boolean): Message => ({
+    role: 'user',
+    content: includeHistorySummary && plannerHistorySummary
+      ? [
+          'Conversation context summary:',
+          plannerHistorySummary,
+          '',
+          'Current request to plan:',
+          prompt,
+        ].join('\n')
+      : prompt,
+  });
 
-  const raw = await chatOnce(
-    model,
-    [
-      ...conversationHistory,
-      { role: 'user', content: userMessage },
-    ],
-    plannerSystem,
-    signal,
-  );
+  const requestPlan = async (prompt: string, timeoutMs: number, includeHistorySummary: boolean): Promise<string> => {
+    const timed = createTimedChildSignal(signal, timeoutMs);
+    try {
+      return await chatOnce(
+        model,
+        [buildPlannerMessage(prompt, includeHistorySummary)],
+        plannerSystem,
+        timed.signal,
+      );
+    } catch (error) {
+      if (signal.aborted) throw error;
+      if (timed.didTimeout()) {
+        throw new Error(`Planner timed out after ${Math.round(timeoutMs / 1000)}s.`);
+      }
+      throw error;
+    } finally {
+      timed.dispose();
+    }
+  };
+
+  let raw: string;
+  try {
+    raw = await requestPlan(
+      compactPlannerPrompt(userMessage, PLANNER_PROMPT_MAX_CHARS),
+      PLANNER_TIMEOUT_MS,
+      true,
+    );
+  } catch (error) {
+    if (signal.aborted) throw error;
+    try {
+      raw = await requestPlan(
+        compactPlannerPrompt(userMessage, PLANNER_PROMPT_RETRY_MAX_CHARS),
+        PLANNER_RETRY_TIMEOUT_MS,
+        false,
+      );
+    } catch (retryError) {
+      if (signal.aborted) throw retryError;
+      return buildHeuristicFallbackPlan(userMessage, classification);
+    }
+  }
 
   const cleaned = raw
     .replace(/^```(?:json)?\s*/i, '')
@@ -621,18 +1190,7 @@ export async function planRequest(
   try {
     parsed = JSON.parse(cleaned);
   } catch {
-    return {
-      projectSummary: userMessage,
-      steps: [{
-        stepNumber: 1,
-        label: 'implementation',
-        filePath: 'src/index.ts',
-        purpose: userMessage,
-        imports: [],
-        exports: [],
-        isSupport: false,
-      }],
-    };
+    return buildHeuristicFallbackPlan(userMessage, classification);
   }
 
   const steps: DeepStep[] = (parsed.steps ?? []).map((s, i) => ({
@@ -645,10 +1203,11 @@ export async function planRequest(
     isSupport:  s.isSupport ?? false,
   }));
 
-  return {
+  const planned = {
     projectSummary: parsed.projectSummary ?? userMessage,
     steps,
   };
+  return planned.steps.length > 0 ? planned : buildHeuristicFallbackPlan(userMessage, classification);
 }
 
 /**

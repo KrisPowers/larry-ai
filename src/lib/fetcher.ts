@@ -1,6 +1,10 @@
+import { indexSearchDocuments, searchLocalIndex } from './searchEngine';
+import { collectChatAwarenessSignals, isLikelyCorrectionFollowUp } from './chatAwareness';
+
 export type FetchedSourceType = 'search' | 'news' | 'official' | 'reference' | 'community';
 export type FetchedCredibility = 'official' | 'major-news' | 'reference' | 'search' | 'community';
 export type FetchContextDepth = 'standard' | 'deep';
+export type FetchedDiscoveryEngine = 'duckduckgo' | 'google' | 'local';
 
 export interface FetchedContext {
   url: string;
@@ -12,11 +16,21 @@ export interface FetchedContext {
   sourceType?: FetchedSourceType;
   credibility?: FetchedCredibility;
   publishedAt?: string;
+  discoveryEngines?: FetchedDiscoveryEngine[];
+  contextOrigin?: 'page' | 'search-result' | 'local-index';
+  promptSelected?: boolean;
 }
 
 export interface ExtractedCrewRosterMember {
   name: string;
   role?: string;
+  supportScore: number;
+  sourceCount: number;
+}
+
+export interface ExtractedCaseParticipantMember {
+  name: string;
+  outcome?: string;
   supportScore: number;
   sourceCount: number;
 }
@@ -33,14 +47,23 @@ interface QueryAnalysis {
   sourceProfile: SourceProfile;
   primaryTerm: string;
   contextTerm: string;
+  activeTopic: string;
+  namedEntities: string[];
   countries: string[];
   hasNewsCue: boolean;
+  participantFocusQuery: boolean;
+  entityRoleQuery: boolean;
+  activeSubjectFollowUp: boolean;
+  correctionFollowUp: boolean;
   prefersOfficialSources: boolean;
   prefersNewsSources: boolean;
   prefersCommunitySources: boolean;
   shouldFetch: boolean;
   maxSources: number;
   terms: string[];
+  awarenessTopics: string[];
+  awarenessPhrases: string[];
+  awarenessTerms: string[];
   missionKeys: string[];
 }
 
@@ -82,6 +105,7 @@ interface FetchPageOptions {
   provider: string;
   sourceType: FetchedSourceType;
   credibility: FetchedCredibility;
+  discoveryEngines?: FetchedDiscoveryEngine[];
   title?: string;
   publishedAt?: string;
   timeoutMs?: number;
@@ -92,6 +116,7 @@ interface FetchGlobalContextOptions {
   depth?: FetchContextDepth;
   forceFetch?: boolean;
   maxSources?: number;
+  includeLocalIndex?: boolean;
 }
 
 interface ContextFormattingOptions {
@@ -118,6 +143,30 @@ interface SearchEngineDiagnosticAttempt {
   items: SearchResultItem[];
 }
 
+function mergeDiscoveryEngines(
+  left?: FetchedDiscoveryEngine[],
+  right?: FetchedDiscoveryEngine[],
+): FetchedDiscoveryEngine[] | undefined {
+  const merged = [...(left ?? []), ...(right ?? [])];
+  if (!merged.length) return undefined;
+  return [...new Set(merged)];
+}
+
+function deriveDiscoveryEnginesFromProvider(provider: string): FetchedDiscoveryEngine[] | undefined {
+  switch (provider) {
+    case 'DuckDuckGo':
+    case 'Recovery DuckDuckGo Search':
+      return ['duckduckgo'];
+    case 'Google Search':
+    case 'Recovery Google Search':
+      return ['google'];
+    case LOCAL_SEARCH_PROVIDER:
+      return ['local'];
+    default:
+      return undefined;
+  }
+}
+
 const URL_RE = /https?:\/\/[^\s<>"')\]]+/g;
 const YEAR_RE = /\b(19\d{2}|20\d{2}|21\d{2})\b/g;
 const QUESTION_RE = /[?]|^(who|what|when|where|why|how|is|are|can|could|would|will|do|does|did|has|have|was|were|tell me|explain)\b/i;
@@ -125,7 +174,12 @@ const LOOKUP_RE = /\b(search|look up|lookup|find|research|check|browse|verify|co
 const FUTURE_RE = /\b(next|upcoming|future|planned|roadmap|timeline|schedule|scheduled|expected|forecast|target|tomorrow|next year|later this year|coming|next steps)\b/i;
 const RELATIVE_TIME_RE = /\b(today|yesterday|tonight|this week|last week|this month|this year|right now|currently|current|latest|recent|now|live|breaking)\b/i;
 const NEWS_EVENT_RE = /\b(news|headline|headlines|report|reports|reported|reporting|issue|issues|problem|problems|outage|outages|glitch|glitches|disruption|disruptions|controversy|incident|incidents|coverage|announce|announced|announcement|partnership|partnerships|partnered|partnering|deal|deals|agreement|agreements|collaboration|collaborations|launch|launched|release|released|unveil|unveiled|rollout|acquisition|acquired|merger|funding|investment|investments)\b/i;
-const FOLLOW_UP_ENTITY_RE = /\b(it|its|they|them|their|that|this|those|these|mission|program|launch|flight|crew)\b/i;
+const FOLLOW_UP_ENTITY_RE = /\b(it|its|they|them|their|he|him|his|she|her|hers|that|this|those|these|mission|program|launch|flight|crew|defendant|person|people)\b/i;
+const ACTIVE_SUBJECT_FOLLOW_UP_RE = /\b(he|him|his|she|her|hers|they|them|their|involvement|involved|role|fate|sentence|sentenced|trial|tried|verdict|outcome|what happened|happened|death|died|die|executed|execution)\b/i;
+const CASE_PARTICIPANT_QUERY_RE = /\b(individuals?|people|figures?|leaders?|defendants?|most impactful|most important|most notorious|most infamous|who was tried|who were tried)\b/i;
+const ENTITY_ROLE_QUERY_RE = /\b(what about|involved|involvement|role|what did|what was .* role|was he involved|was she involved|was .* involved|fate|what happened to|what was .* fate)\b/i;
+const CASE_PARTICIPANT_SOURCE_RE = /\b(defendant|defendants|verdict|verdicts|sentence|sentences|notorious|infamous|who was tried|who were tried|people|figures)\b/i;
+const LOW_SIGNAL_MEDIA_CONTEXT_RE = /\b(photo|photos|picture|pictures|gallery|video|youtube|clip|watch|trailer|image)\b/i;
 const STATUS_UPDATE_RE = /\b(status|timeline|latest|current|today|now|update|updates|what'?s going on|what is going on|happening|what happened|plan|next steps)\b/i;
 const SPACE_RE = /\b(nasa|moon|mars|esa|space|launch|rocket|mission|orbiter|crew|astronaut|lunar|spacex|iss|jaxa|isro|csa)\b/i;
 const GOVERNMENT_RE = /\b(government|official|agency|department|ministry|policy|president|prime minister|parliament|congress|senate|white house|state department|embassy|statement|announced|sanctions|treaty)\b/i;
@@ -134,6 +188,8 @@ const TECHNICAL_RE = /\b(code|programming|typescript|javascript|python|react|nod
 const COMMUNITY_RE = /\b(reddit|forum|hacker news|community|discussion|opinion|what are people saying|social media|sentiment)\b/i;
 const CASUAL_QUERY_RE = /^(hi|hello|hey|yo|sup|good\s+(morning|afternoon|evening)|thanks|thank you|thx|ok|okay|cool|nice|who are you|what can you do|how are you|help|help me|test)\W*$/i;
 const COUNTRY_RE = /\b(iran|ukraine|russia|china|israel|gaza|taiwan|north korea|south korea|syria|sudan|myanmar|venezuela|belarus|cuba|turkey|egypt|saudi arabia|iraq|libya|nigeria|ethiopia|haiti|somalia|mali|niger|pakistan|india|bangladesh|sri lanka|afghanistan|yemen|lebanon|jordan|canada|united states|usa|uk|united kingdom|japan|australia|france|germany|european union|eu|un|nato|g7|g20)\b/gi;
+const PEOPLE_CASE_FOLLOW_UP_RE = /\b(individuals?|people|figures?|leaders?|defendants?)\b/i;
+const TRIAL_CASE_ACTION_RE = /\b(tried|charged|convicted|prosecuted|important|impactful|main|key|major|significant)\b/i;
 const RECENT_YEAR_FLOOR = 2022;
 const MAX_TEXT = 5000;
 const MAX_SEARCH_ITEMS_PER_SOURCE = 20;
@@ -145,14 +201,29 @@ const MAX_SYSTEM_CONTEXT_EXCERPT_STANDARD = 640;
 const MAX_SYSTEM_CONTEXT_EXCERPT_DEEP = 920;
 const MAX_CONVERSATION_CONTEXT_EXCERPT_STANDARD = 180;
 const MAX_CONVERSATION_CONTEXT_EXCERPT_DEEP = 280;
+const MAX_SOURCE_CATALOG_STANDARD = 320;
+const MAX_SOURCE_CATALOG_DEEP = 1_200;
+const MAX_SOURCE_CATALOG_HOST_STANDARD = 24;
+const MAX_SOURCE_CATALOG_HOST_DEEP = 72;
+const MAX_VERIFIED_PAGE_CATALOG_STANDARD = 48;
+const MAX_VERIFIED_PAGE_CATALOG_DEEP = 144;
+const SEARCH_RESULT_PAGE_COUNT_STANDARD = 6;
+const SEARCH_RESULT_PAGE_COUNT_EXPANSIVE = 8;
+const SEARCH_RESULT_PAGE_COUNT_DEEP = 10;
+const SEARCH_VARIANT_LIMIT_STANDARD = 6;
+const SEARCH_VARIANT_LIMIT_EXPANSIVE = 8;
+const SEARCH_VARIANT_LIMIT_DEEP = 10;
+const LOCAL_SEARCH_QUERY_LIMIT_STANDARD = 6;
+const LOCAL_SEARCH_QUERY_LIMIT_DEEP = 10;
 const FETCH_PROMPT_URL_TIMEOUT_MS = 6_000;
 const FETCH_SEARCH_TIMEOUT_MS = 4_500;
 const FETCH_SEARCH_SCRAPE_TIMEOUT_MS = 2_400;
 const FETCH_DIRECT_JSON_TIMEOUT_MS = 4_500;
-const GLOBAL_CONTEXT_BUDGET_STANDARD_MS = 18_000;
-const GLOBAL_CONTEXT_BUDGET_DEEP_MS = 30_000;
+const GLOBAL_CONTEXT_BUDGET_STANDARD_MS = 45_000;
+const GLOBAL_CONTEXT_BUDGET_DEEP_MS = 90_000;
 const RECOVERY_CONTEXT_BUDGET_STANDARD_MS = 9_000;
 const RECOVERY_CONTEXT_BUDGET_DEEP_MS = 15_000;
+const SEARCH_SCRAPE_CONCURRENCY = 8;
 const SEARCH_ENGINE_DIAGNOSTIC_VERSION = '2026-04-07-operational-recovery-v6';
 const LOCAL_FETCH_PROXY_PATH = '/__fetch?url=';
 const READER_PROXY = 'https://r.jina.ai/http://';
@@ -210,6 +281,7 @@ export const SCIENCE_NEWS_DOMAINS = [
 ];
 const GOVERNMENT_DOMAINS = ['gov.uk', 'europa.eu', 'un.org', 'canada.ca', 'state.gov', 'usa.gov', 'gov.in', 'go.jp', 'gov.au', 'gouv.fr', 'bund.de', 'nato.int'];
 const SPACE_AGENCY_DOMAINS = ['nasa.gov', 'esa.int', 'jaxa.jp', 'isro.gov.in', 'asc-csa.gc.ca'];
+const INSTITUTIONAL_REFERENCE_HOST_RE = /\b(?:museum|encyclopedia|archive|archives|memorial|library)\b/i;
 // Broad U.S. federal agency roster used to prioritize official-source retrieval.
 const US_FEDERAL_AGENCY_DOMAINS = [
   'whitehouse.gov',
@@ -316,6 +388,52 @@ const US_FEDERAL_AGENCY_DOMAINS = [
   'senate.gov',
 ];
 const SEARCH_STOPWORDS = new Set(['about', 'after', 'again', 'against', 'all', 'also', 'amid', 'among', 'been', 'before', 'being', 'between', 'both', 'could', 'does', 'doing', 'for', 'from', 'have', 'having', 'heard', 'hearing', 'hello', 'help', 'here', 'into', 'just', 'latest', 'more', 'most', 'need', 'news', 'please', 'recent', 'really', 'should', 'tell', 'than', 'that', 'their', 'them', 'then', 'there', 'these', 'they', 'this', 'those', 'through', 'today', 'update', 'updates', 'want', 'what', 'when', 'where', 'which', 'while', 'who', 'why', 'with', 'would', 'yesterday', 'your']);
+const LOCAL_SEARCH_QUERY_STOPWORDS = new Set([
+  ...SEARCH_STOPWORDS,
+  'an',
+  'and',
+  'answer',
+  'are',
+  'around',
+  'as',
+  'at',
+  'be',
+  'by',
+  'can',
+  'define',
+  'describe',
+  'described',
+  'describes',
+  'describing',
+  'did',
+  'do',
+  'essay',
+  'explain',
+  'explained',
+  'explaining',
+  'explains',
+  'had',
+  'has',
+  'how',
+  'in',
+  'is',
+  'it',
+  'its',
+  'me',
+  'of',
+  'on',
+  'or',
+  'overview',
+  'summarize',
+  'summary',
+  'the',
+  'to',
+  'use',
+  'using',
+  'we',
+  'were',
+  'you',
+]);
 const NUMBERED_ENTITY_TOKEN_BLOCKLIST = new Set([
   ...SEARCH_STOPWORDS,
   'agency',
@@ -475,6 +593,101 @@ const CREW_ROLE_PATTERNS: Array<{ role: string; pattern: RegExp }> = [
   { role: 'Flight Engineer', pattern: /\bflight engineer\b/i },
   { role: 'Specialist', pattern: /\bspecialist\b/i },
 ];
+const CASE_NAME_RE = /\b([A-Z\u00C0-\u00D6\u00D8-\u00DE][A-Za-z\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u00FF'-]+(?:\s+[A-Z\u00C0-\u00D6\u00D8-\u00DE][A-Za-z\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u00FF'-]+){1,3})\b/g;
+const CASE_SEGMENT_HINT_RE = /\b(defendant|defendants|on trial|tried|charged|prosecuted|convicted|sentenced|verdict|verdicts|acquitted|in the dock|executed|hanged|imprisoned|life imprisonment)\b/i;
+const CASE_CONTEXT_LIST_RE = /\b(list of defendants|defendants|notorious defendants|infamous defendants|who was tried|who were tried|defendant list)\b/i;
+const CASE_NEGATIVE_SEGMENT_RE = /\b(not among (?:the )?(?:defendants|accused|participants)|not (?:on trial|tried|a defendant|one of the defendants|one of the accused|present(?: at the (?:trial|hearing|proceedings))?|prosecuted(?: (?:in|at) (?:the |this )?(?:case|trial|tribunal|hearing|proceedings))?)|never tried|already dead|was dead|died before (?:the )?(?:trial|hearing|proceedings)|dead before (?:the )?(?:trial|hearing|proceedings)|committed suicide before (?:the )?(?:trial|hearing|proceedings)|killed (?:himself|herself|themselves) before (?:the )?(?:trial|hearing|proceedings)|not part of the case|was not present|absent from (?:the )?(?:trial|hearing|proceedings))\b/i;
+const CASE_NAME_WORD_BLOCKLIST = new Set([
+  'accused',
+  'agency',
+  'agencies',
+  'allied',
+  'appeal',
+  'britain',
+  'case',
+  'cases',
+  'charge',
+  'charges',
+  'committee',
+  'court',
+  'crime',
+  'crimes',
+  'criminal',
+  'criminals',
+  'death',
+  'defendant',
+  'defendants',
+  'department',
+  'dock',
+  'evidence',
+  'figure',
+  'figures',
+  'government',
+  'history',
+  'incident',
+  'incidents',
+  'institution',
+  'institutions',
+  'international',
+  'justice',
+  'kingdom',
+  'leader',
+  'leaders',
+  'list',
+  'lists',
+  'main',
+  'military',
+  'ministry',
+  'news',
+  'office',
+  'official',
+  'officials',
+  'organization',
+  'organizations',
+  'participant',
+  'participants',
+  'people',
+  'peace',
+  'person',
+  'persons',
+  'power',
+  'powers',
+  'proceeding',
+  'proceedings',
+  'prosecution',
+  'prosecutor',
+  'prosecutors',
+  'republic',
+  'review',
+  'sentence',
+  'sentences',
+  'state',
+  'states',
+  'story',
+  'stories',
+  'summary',
+  'topic',
+  'topics',
+  'trial',
+  'trials',
+  'tribunal',
+  'tribunals',
+  'union',
+  'united',
+  'verdict',
+  'verdicts',
+  'war',
+  'wars',
+  'world',
+]);
+const CASE_OUTCOME_PATTERNS: Array<{ label: string; pattern: RegExp }> = [
+  { label: 'acquitted', pattern: /\bacquitted\b/i },
+  { label: 'sentenced to death', pattern: /\bsentenced to death\b/i },
+  { label: 'executed', pattern: /\b(?:executed|hanged)\b/i },
+  { label: 'life imprisonment', pattern: /\blife imprisonment\b/i },
+  { label: 'imprisoned', pattern: /\b(?:imprisoned|prison sentence|sentenced to prison)\b/i },
+];
+const LOCAL_SEARCH_PROVIDER = 'Larry Local Search';
 
 const MONTH_INDEX_BY_NAME: Record<string, number> = {
   january: 0,
@@ -598,12 +811,102 @@ async function fetchThroughLocalProxy(url: string, timeoutMs: number, signal?: A
 function buildSearchTerms(text: string): string[] {
   return uniqueStrings(
     stripPromptUrls(text)
+      .normalize('NFKD')
+      .replace(/[\u0300-\u036f]/g, '')
       .toLowerCase()
       .replace(/[^a-z0-9\s-]/g, ' ')
       .split(/\s+/)
       .map((token) => token.trim())
       .filter((token) => token.length >= 3 && !SEARCH_STOPWORDS.has(token)),
   ).slice(0, 12);
+}
+
+function buildFilteredSearchTerms(text: string, stopwords: ReadonlySet<string>, maxTerms = 12): string[] {
+  return uniqueStrings(
+    stripPromptUrls(text)
+      .normalize('NFKD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, ' ')
+      .split(/\s+/)
+      .map((token) => token.trim())
+      .filter((token) => token.length >= 3 && !stopwords.has(token)),
+  ).slice(0, maxTerms);
+}
+
+function buildLocalSearchQuery(text: string, maxTerms = 8): string {
+  return buildFilteredSearchTerms(text, LOCAL_SEARCH_QUERY_STOPWORDS, maxTerms).join(' ');
+}
+
+function extractNamedEntities(text: string, maxEntities = 4): string[] {
+  const matches = text.match(/\b(?:[A-Z\u00C0-\u00D6\u00D8-\u00DE][A-Za-z\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u00FF'-]+(?:\s+[A-Z\u00C0-\u00D6\u00D8-\u00DE][A-Za-z\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u00FF'-]+){0,3})\b/g) ?? [];
+  return uniqueStrings(
+    matches
+      .map((value) => normalizeWhitespace(value))
+      .filter((value) => value.length >= 6)
+      .filter((value) => {
+        const normalized = value.toLowerCase();
+        if (/^(?:can|could|would|please|who|what|when|where|why|how|the)$/i.test(value)) return false;
+        if (!value.includes(' ') && /^(?:trials?|case|cases|history|justice|policy|program|mission|launch|flight|crew|company|government|court|courts|tribunal|tribunals)$/i.test(value)) {
+          return false;
+        }
+        return !/^(?:introduction|overview|summary)$/i.test(normalized);
+      }),
+  ).slice(0, maxEntities);
+}
+
+function extractCorrectionIntentTerms(text: string): string[] {
+  const cleaned = normalizeWhitespace(stripPromptUrls(text)).toLowerCase();
+  if (!cleaned) return [];
+
+  const keywords: string[] = [];
+  if (/\bsuicid/i.test(cleaned)) keywords.push('suicide');
+  if (/\bcyanide\b|\bcapsule\b|\bpill\b/i.test(cleaned)) keywords.push('cyanide');
+  if (/\bsmuggl(?:ed|ing)\b/i.test(cleaned)) keywords.push('smuggled');
+  if (/\b(?:hung|hanged|hanging|execut(?:ed|ion)|gallows)\b/i.test(cleaned)) keywords.push('execution');
+  if (/\bsentenc(?:ed|ing)\b/i.test(cleaned)) keywords.push('sentenced');
+  if (/\bbefore\b/i.test(cleaned) && /\b(?:hung|hanged|execut(?:ed|ion)|gallows)\b/i.test(cleaned)) {
+    keywords.push('before execution');
+  }
+  if (/\bdied\b|\bdeath\b/i.test(cleaned)) keywords.push('death');
+
+  return uniqueStrings(keywords).slice(0, 5);
+}
+
+function extractSubjectFollowUpIntentTerms(text: string): string[] {
+  const cleaned = normalizeWhitespace(stripPromptUrls(text)).toLowerCase();
+  if (!cleaned) return [];
+
+  const keywords: string[] = [];
+  if (/\binvolvement\b|\binvolved\b/i.test(cleaned)) keywords.push('involvement');
+  if (/\brole\b/i.test(cleaned)) keywords.push('role');
+  if (/\btrial\b|\btried\b|\bverdict\b/i.test(cleaned)) keywords.push('trial');
+  if (/\bfate\b|\boutcome\b|\bwhat happened\b|\bhappened\b/i.test(cleaned)) keywords.push('fate');
+  if (/\bsentenc(?:ed|ing)\b/i.test(cleaned)) keywords.push('sentence');
+  if (/\bdied\b|\bdeath\b|\bdie\b/i.test(cleaned)) keywords.push('death');
+  if (/\bexecut(?:ed|ion)\b/i.test(cleaned)) keywords.push('execution');
+
+  return uniqueStrings(keywords).slice(0, 6);
+}
+
+function isCaseParticipantEvidenceContext(context: FetchedContext): boolean {
+  const combined = `${context.title} ${context.url} ${trimContextText(context.text, 220)}`.toLowerCase();
+  return CASE_PARTICIPANT_SOURCE_RE.test(combined)
+    || /\blist of defendants\b/i.test(combined)
+    || /\b(?:defendants|accused|participants|people)\s+(?:in|at|for)\s+(?:the\s+)?(?:case|trial|tribunal|hearing|proceedings)\b/i.test(combined);
+}
+
+function isLowSignalMediaContext(context: FetchedContext): boolean {
+  const combined = `${context.title} ${context.url}`.toLowerCase();
+  return LOW_SIGNAL_MEDIA_CONTEXT_RE.test(combined);
+}
+
+function buildFocusedRelevanceTerms(analysis: QueryAnalysis): string[] {
+  return uniqueStrings(
+    analysis.terms
+      .map((term) => term.trim().toLowerCase())
+      .filter((term) => term.length >= 4 && !LOCAL_SEARCH_QUERY_STOPWORDS.has(term)),
+  ).slice(0, 8);
 }
 
 function romanToInt(value: string): number | null {
@@ -717,40 +1020,92 @@ function stripSearchFiller(text: string): string {
   return cleaned || normalizeWhitespace(stripPromptUrls(text));
 }
 
-function analyzeQuery(currentMessage: string, conversationHistory: Array<{ role: string; content: string }> = []): QueryAnalysis {
+function analyzeQuery(
+  currentMessage: string,
+  conversationHistory: Array<{ role: string; content: string; exchangeMemory?: { topic: string; promptSummary: string; replySummary: string; keyTerms: string[]; keyPhrases: string[]; keyFacts: string[] } }> = [],
+): QueryAnalysis {
   const recentHistory = conversationHistory
     .filter((message) => message.role === 'user')
     .slice(-4)
     .map((message) => message.content)
     .join(' ');
+  const chatAwareness = collectChatAwarenessSignals(conversationHistory, 3);
+  const activeTopic = chatAwareness.activeMemory?.topic
+    || chatAwareness.topics[0]
+    || '';
+  const awarenessHint = activeTopic
+    || chatAwareness.activeMemory?.keyPhrases[0]
+    || chatAwareness.keyPhrases[0]
+    || chatAwareness.activeMemory?.keyTerms.slice(0, 4).join(' ')
+    || chatAwareness.keyTerms.slice(0, 4).join(' ');
+  const awarenessSearchText = chatAwareness.searchText;
   const combinedText = normalizeWhitespace(`${recentHistory} ${currentMessage}`);
   const currentYear = new Date().getFullYear();
   const years = extractYears(combinedText);
   const countries = uniqueStrings([...combinedText.matchAll(COUNTRY_RE)].map((match) => match[0].toLowerCase()));
   const cleanedCurrent = stripSearchFiller(currentMessage).slice(0, 160);
-  const historyTerms = buildSearchTerms(recentHistory);
   const currentTerms = buildSearchTerms(cleanedCurrent);
+  const namedEntities = extractNamedEntities(currentMessage);
+  const namedEntityHint = namedEntities.slice(0, 2).join(' ');
+  const participantFocusQuery = CASE_PARTICIPANT_QUERY_RE.test(cleanedCurrent)
+    && (Boolean(activeTopic) || /\btrial|trials|tried|court|case\b/i.test(combinedText));
+  const entityRoleQuery = namedEntities.length > 0 && ENTITY_ROLE_QUERY_RE.test(cleanedCurrent);
+  const activeSubjectFollowUp = Boolean(
+    activeTopic
+    && ACTIVE_SUBJECT_FOLLOW_UP_RE.test(currentMessage)
+    && (currentTerms.length <= 8 || FOLLOW_UP_ENTITY_RE.test(currentMessage)),
+  );
+  const correctionFollowUp = isLikelyCorrectionFollowUp(currentMessage);
+  const correctionIntentTerms = correctionFollowUp ? extractCorrectionIntentTerms(currentMessage) : [];
+  const entityRoleIntentTerms = entityRoleQuery ? extractSubjectFollowUpIntentTerms(currentMessage) : [];
+  const subjectFollowUpIntentTerms = activeSubjectFollowUp ? extractSubjectFollowUpIntentTerms(currentMessage) : [];
+  const historyTerms = buildSearchTerms(recentHistory);
   const historyEntityHint = historyTerms.slice(0, 3).join(' ');
-  const contextHint = countries.slice(0, 2).join(' ') || historyEntityHint;
+  const contextHint = countries.slice(0, 2).join(' ') || namedEntityHint || activeTopic || awarenessHint || historyEntityHint;
   const missionKeys = extractMissionKeys(`${currentMessage} ${recentHistory}`);
   const isCrewLookup = /\b(crew|astronaut|pilot|commander|mission specialist|specialist|roster|who is|who are|names?)\b/i.test(cleanedCurrent);
   const missionLead = missionKeys.flatMap((key) => missionKeyToVariants(key)).find(Boolean) ?? '';
   const hasNewsCue = NEWS_EVENT_RE.test(cleanedCurrent) || NEWS_EVENT_RE.test(currentMessage) || /\bpress release\b/i.test(combinedText);
   const followUpNeedsHistoryContext = Boolean(
     contextHint && (
-      currentTerms.length <= 3
+      currentTerms.length <= 5
       || FOLLOW_UP_ENTITY_RE.test(currentMessage)
       || hasNewsCue
+      || participantFocusQuery
+      || entityRoleQuery
+      || activeSubjectFollowUp
+      || correctionFollowUp
+      || (chatAwareness.memories.length > 0 && QUESTION_RE.test(currentMessage))
     ),
   );
-  const baseContextTerm = normalizeWhitespace(followUpNeedsHistoryContext ? `${contextHint} ${cleanedCurrent}` : cleanedCurrent).slice(0, 180);
-  const basePrimaryTerm = normalizeWhitespace(followUpNeedsHistoryContext && historyEntityHint ? `${historyEntityHint} ${cleanedCurrent}` : cleanedCurrent).slice(0, 180) || baseContextTerm;
+  const entityAnchoredTerm = entityRoleQuery
+    ? normalizeWhitespace(`${activeTopic} ${namedEntityHint} ${entityRoleIntentTerms.join(' ') || 'role involvement'}`).slice(0, 180)
+    : '';
+  const subjectAnchoredTerm = activeSubjectFollowUp && activeTopic
+    ? normalizeWhitespace(`${activeTopic} ${subjectFollowUpIntentTerms.join(' ') || buildSearchTerms(cleanedCurrent).slice(0, 4).join(' ')}`).slice(0, 180)
+    : '';
+  const correctionAnchoredTerm = correctionFollowUp && activeTopic
+    ? normalizeWhitespace(`${activeTopic} ${correctionIntentTerms.join(' ') || buildSearchTerms(cleanedCurrent).slice(0, 4).join(' ')}`).slice(0, 180)
+    : '';
+  const participantAnchoredTerm = participantFocusQuery && activeTopic
+    ? normalizeWhitespace(`${activeTopic} defendants important figures tried`).slice(0, 180)
+    : '';
+  const baseContextTerm = normalizeWhitespace(entityAnchoredTerm || participantAnchoredTerm || subjectAnchoredTerm || correctionAnchoredTerm || (followUpNeedsHistoryContext ? `${contextHint} ${cleanedCurrent}` : cleanedCurrent)).slice(0, 180);
+  const basePrimaryTerm = normalizeWhitespace(
+    entityAnchoredTerm
+    || participantAnchoredTerm
+    || subjectAnchoredTerm
+    || correctionAnchoredTerm
+    || (followUpNeedsHistoryContext && (activeTopic || awarenessHint || historyEntityHint)
+      ? `${activeTopic || awarenessHint || historyEntityHint} ${cleanedCurrent}`
+      : cleanedCurrent),
+  ).slice(0, 180) || baseContextTerm;
   const missionAnchoredLookup = isCrewLookup && missionLead
     ? normalizeWhitespace(`${missionLead} ${cleanedCurrent}`.replace(/\b(?:that|this|those|these|it|they|them|their)\b/gi, ' '))
     : '';
   const contextTerm = (missionAnchoredLookup || baseContextTerm).slice(0, 180);
   const primaryTerm = (missionAnchoredLookup || basePrimaryTerm || contextTerm).slice(0, 180) || contextTerm;
-  const terms = buildSearchTerms(`${cleanedCurrent} ${contextTerm} ${recentHistory}`);
+  const terms = buildSearchTerms(`${activeTopic} ${namedEntityHint} ${awarenessHint} ${entityRoleIntentTerms.join(' ')} ${subjectFollowUpIntentTerms.join(' ')} ${correctionIntentTerms.join(' ')} ${cleanedCurrent} ${contextTerm} ${recentHistory} ${awarenessSearchText}`);
   const queryMode: QueryMode = LOOKUP_RE.test(currentMessage) || LOOKUP_RE.test(combinedText) || terms.length >= 6 ? 'research' : QUESTION_RE.test(currentMessage) ? 'question' : 'conversation';
   const temporalFocus: TemporalFocus =
     FUTURE_RE.test(combinedText) ? 'future'
@@ -781,14 +1136,23 @@ function analyzeQuery(currentMessage: string, conversationHistory: Array<{ role:
     sourceProfile,
     primaryTerm,
     contextTerm: contextTerm || cleanedCurrent,
+    activeTopic,
+    namedEntities,
     countries,
     hasNewsCue,
+    participantFocusQuery,
+    entityRoleQuery,
+    activeSubjectFollowUp,
+    correctionFollowUp,
     prefersOfficialSources,
     prefersNewsSources,
     prefersCommunitySources,
     shouldFetch,
     maxSources: Math.max(4, Math.min(maxSources, 8)),
     terms,
+    awarenessTopics: chatAwareness.topics,
+    awarenessPhrases: chatAwareness.keyPhrases,
+    awarenessTerms: chatAwareness.keyTerms,
     missionKeys,
   };
 }
@@ -816,8 +1180,56 @@ function buildCompactQuery(analysis: QueryAnalysis): string {
   }
 
   const preferredTerms = analysis.terms.filter((term) => !['going', 'date', 'dates', 'thing', 'things', 'current'].includes(term));
+  const awarenessTerms = analysis.awarenessTerms.filter((term) => !preferredTerms.includes(term));
   const intentTerms: string[] = [];
   const promptText = `${analysis.primaryTerm} ${analysis.contextTerm}`.toLowerCase();
+  const entityRoleIntentTerms = analysis.entityRoleQuery
+    ? extractSubjectFollowUpIntentTerms(promptText)
+    : [];
+  const subjectFollowUpIntentTerms = analysis.activeSubjectFollowUp
+    ? extractSubjectFollowUpIntentTerms(promptText)
+    : [];
+  const correctionIntentTerms = analysis.correctionFollowUp
+    ? extractCorrectionIntentTerms(promptText)
+    : [];
+
+  if (analysis.entityRoleQuery && analysis.namedEntities.length > 0) {
+    return uniqueStrings([
+      analysis.activeTopic,
+      ...analysis.namedEntities.slice(0, 2),
+      ...entityRoleIntentTerms,
+      ...preferredTerms.slice(0, 4),
+    ]).join(' ').slice(0, 140) || analysis.contextTerm || analysis.primaryTerm;
+  }
+
+  if (analysis.participantFocusQuery && analysis.activeTopic) {
+    return uniqueStrings([
+      analysis.activeTopic,
+      'defendants',
+      'important',
+      'figures',
+      'tried',
+      ...preferredTerms.slice(0, 4),
+    ]).join(' ').slice(0, 140) || analysis.contextTerm || analysis.primaryTerm;
+  }
+
+  if (analysis.activeSubjectFollowUp && analysis.activeTopic) {
+    return uniqueStrings([
+      analysis.activeTopic,
+      ...subjectFollowUpIntentTerms,
+      ...analysis.awarenessPhrases.slice(0, 1),
+      ...preferredTerms.slice(0, 4),
+    ]).join(' ').slice(0, 140) || analysis.contextTerm || analysis.primaryTerm;
+  }
+
+  if (analysis.correctionFollowUp && analysis.activeTopic) {
+    return uniqueStrings([
+      analysis.activeTopic,
+      ...correctionIntentTerms,
+      ...analysis.awarenessPhrases.slice(0, 1),
+      ...preferredTerms.slice(0, 4),
+    ]).join(' ').slice(0, 140) || analysis.contextTerm || analysis.primaryTerm;
+  }
 
   if (/\btimeline|schedule|scheduled|target\b/i.test(promptText)) intentTerms.push('timeline');
   if (/\bplan|roadmap|next steps\b/i.test(promptText)) intentTerms.push('plan');
@@ -828,6 +1240,9 @@ function buildCompactQuery(analysis: QueryAnalysis): string {
   }
 
   const compactTerms = uniqueStrings([
+    ...analysis.awarenessTopics.slice(0, 2),
+    ...analysis.awarenessPhrases.slice(0, 2),
+    ...awarenessTerms.slice(0, 3),
     ...preferredTerms.slice(0, 6),
     ...intentTerms,
     ...analysis.years.slice(-1).map(String),
@@ -836,7 +1251,11 @@ function buildCompactQuery(analysis: QueryAnalysis): string {
   return compactTerms.join(' ').slice(0, 140) || analysis.contextTerm || analysis.primaryTerm;
 }
 
-function buildExactSearchQueries(currentMessage: string): string[] {
+function buildExactSearchQueries(currentMessage: string, analysis: QueryAnalysis): string[] {
+  if ((analysis.correctionFollowUp || analysis.activeSubjectFollowUp || analysis.participantFocusQuery || analysis.entityRoleQuery) && (analysis.activeTopic || analysis.namedEntities.length > 0)) {
+    return [];
+  }
+
   const raw = normalizeWhitespace(stripPromptUrls(currentMessage)).trim();
   if (!raw || CASUAL_QUERY_RE.test(raw) || buildSearchTerms(raw).length < 2) {
     return [];
@@ -858,8 +1277,87 @@ function buildQueryVariants(analysis: QueryAnalysis): string[] {
     buildCompactQuery(analysis),
     analysis.contextTerm,
     analysis.primaryTerm,
+    ...analysis.awarenessTopics.slice(0, 2).map((topic) => normalizeWhitespace(`${topic} ${analysis.primaryTerm}`)),
+    ...analysis.awarenessPhrases.slice(0, 2).map((phrase) => normalizeWhitespace(`${phrase} ${analysis.primaryTerm}`)),
   ]).filter(Boolean);
   const variants = new Set<string>(base);
+
+  analysis.awarenessPhrases.slice(0, 2).forEach((phrase) => {
+    variants.add(normalizeWhitespace(`${phrase} ${analysis.contextTerm}`));
+  });
+
+  const followUpText = `${analysis.primaryTerm} ${analysis.contextTerm}`.toLowerCase();
+  const peopleCaseFollowUp = analysis.awarenessTopics.length > 0
+    && PEOPLE_CASE_FOLLOW_UP_RE.test(followUpText)
+    && TRIAL_CASE_ACTION_RE.test(followUpText);
+  if (peopleCaseFollowUp) {
+    const subject = analysis.activeTopic || analysis.awarenessTopics[0];
+    variants.add(normalizeWhitespace(`${subject} defendants`));
+    variants.add(normalizeWhitespace(`${subject} key defendants`));
+    variants.add(normalizeWhitespace(`${subject} major figures tried`));
+    variants.add(normalizeWhitespace(`${subject} who was tried`));
+  }
+
+  if (analysis.participantFocusQuery && analysis.activeTopic) {
+    const subject = analysis.activeTopic;
+    variants.add(normalizeWhitespace(`${subject} list of defendants`));
+    variants.add(normalizeWhitespace(`${subject} most notorious defendants`));
+    variants.add(normalizeWhitespace(`${subject} defendants verdicts`));
+    variants.add(normalizeWhitespace(`${subject} important figures tried`));
+  }
+
+  if (analysis.entityRoleQuery && analysis.namedEntities.length > 0) {
+    const entity = analysis.namedEntities[0];
+    const subject = analysis.activeTopic;
+    variants.add(normalizeWhitespace(`${entity} involvement`));
+    variants.add(normalizeWhitespace(`${entity} role`));
+    variants.add(normalizeWhitespace(`${entity} verdict sentence`));
+    if (subject) {
+      variants.add(normalizeWhitespace(`${subject} ${entity} role`));
+      variants.add(normalizeWhitespace(`${subject} ${entity} involvement`));
+      variants.add(normalizeWhitespace(`${subject} ${entity} fate`));
+    }
+  }
+
+  if (analysis.correctionFollowUp && analysis.activeTopic) {
+    const subject = analysis.activeTopic;
+    const correctionIntentTerms = extractCorrectionIntentTerms(followUpText);
+    const caseTopic = analysis.awarenessTopics.find((topic) => topic !== subject && /\b(trial|trials|case|court)\b/i.test(topic));
+
+    variants.add(normalizeWhitespace(`${subject} ${correctionIntentTerms.join(' ')}`));
+    variants.add(normalizeWhitespace(`${subject} what happened after sentencing`));
+    variants.add(normalizeWhitespace(`${subject} death after sentencing`));
+    if (correctionIntentTerms.includes('suicide')) {
+      variants.add(normalizeWhitespace(`${subject} suicide before execution`));
+      variants.add(normalizeWhitespace(`how did ${subject} die`));
+    }
+    if (correctionIntentTerms.includes('cyanide')) {
+      variants.add(normalizeWhitespace(`${subject} cyanide capsule`));
+    }
+    if (caseTopic) {
+      variants.add(normalizeWhitespace(`${caseTopic} ${subject} ${correctionIntentTerms.join(' ')}`));
+      variants.add(normalizeWhitespace(`${caseTopic} ${subject} final hours`));
+    }
+  }
+
+  if (analysis.activeSubjectFollowUp && analysis.activeTopic) {
+    const subject = analysis.activeTopic;
+    const followUpIntentTerms = extractSubjectFollowUpIntentTerms(followUpText);
+    const caseTopic = analysis.awarenessTopics.find((topic) => topic !== subject && /\b(trial|trials|case|court)\b/i.test(topic));
+
+    variants.add(normalizeWhitespace(`${subject} ${followUpIntentTerms.join(' ')}`));
+    variants.add(normalizeWhitespace(`${subject} role in the trial`));
+    variants.add(normalizeWhitespace(`${subject} involvement in the trial`));
+    variants.add(normalizeWhitespace(`${subject} fate after the trial`));
+    variants.add(normalizeWhitespace(`${subject} what happened after the trial`));
+    if (followUpIntentTerms.includes('sentence') || followUpIntentTerms.includes('fate') || followUpIntentTerms.includes('death')) {
+      variants.add(normalizeWhitespace(`${subject} sentence and death`));
+    }
+    if (caseTopic) {
+      variants.add(normalizeWhitespace(`${caseTopic} ${subject} role`));
+      variants.add(normalizeWhitespace(`${caseTopic} ${subject} fate`));
+    }
+  }
 
   if (analysis.prefersNewsSources) {
     variants.add(normalizeWhitespace(`${analysis.contextTerm} latest news`));
@@ -914,6 +1412,36 @@ function resolveDesiredSourceCount(
     timelyNewsTarget || (options.depth === 'deep' ? 8 : 6),
     Math.min(base, options.depth === 'deep' ? 15 : 12),
   );
+}
+
+function resolveCatalogSourceCount(
+  analysis: QueryAnalysis,
+  options: FetchGlobalContextOptions = {},
+): number {
+  if (options.depth === 'deep') {
+    return isTimelyNewsAnalysis(analysis) ? Math.max(MAX_SOURCE_CATALOG_DEEP, 1_500) : MAX_SOURCE_CATALOG_DEEP;
+  }
+  return isTimelyNewsAnalysis(analysis) ? Math.max(MAX_SOURCE_CATALOG_STANDARD, 480) : MAX_SOURCE_CATALOG_STANDARD;
+}
+
+function resolveCatalogHostCap(
+  analysis: QueryAnalysis,
+  options: FetchGlobalContextOptions = {},
+): number {
+  if (options.depth === 'deep') {
+    return isTimelyNewsAnalysis(analysis) ? Math.max(MAX_SOURCE_CATALOG_HOST_DEEP, 96) : MAX_SOURCE_CATALOG_HOST_DEEP;
+  }
+  return isTimelyNewsAnalysis(analysis) ? Math.max(MAX_SOURCE_CATALOG_HOST_STANDARD, 36) : MAX_SOURCE_CATALOG_HOST_STANDARD;
+}
+
+function resolveVerifiedCatalogPageCount(
+  analysis: QueryAnalysis,
+  options: FetchGlobalContextOptions = {},
+): number {
+  if (options.depth === 'deep') {
+    return isTimelyNewsAnalysis(analysis) ? Math.max(MAX_VERIFIED_PAGE_CATALOG_DEEP, 192) : MAX_VERIFIED_PAGE_CATALOG_DEEP;
+  }
+  return isTimelyNewsAnalysis(analysis) ? Math.max(MAX_VERIFIED_PAGE_CATALOG_STANDARD, 72) : MAX_VERIFIED_PAGE_CATALOG_STANDARD;
 }
 
 function resolveSystemContextLimit(options: ContextFormattingOptions = {}): number {
@@ -1140,6 +1668,8 @@ async function fetchReadablePage(rawUrl: string, options: FetchPageOptions, sign
       sourceType: options.sourceType,
       credibility: options.credibility,
       publishedAt: resolvedPublishedAt,
+      discoveryEngines: options.discoveryEngines,
+      contextOrigin: 'page',
     };
   } catch (error) {
     return {
@@ -1152,6 +1682,8 @@ async function fetchReadablePage(rawUrl: string, options: FetchPageOptions, sign
       sourceType: options.sourceType,
       credibility: options.credibility,
       publishedAt: options.publishedAt,
+      discoveryEngines: options.discoveryEngines,
+      contextOrigin: 'page',
     };
   }
 }
@@ -1527,6 +2059,10 @@ function classifySourceFromUrl(
     return { sourceType: 'official', credibility: 'official' };
   }
 
+  if (hostname.endsWith('.edu') || INSTITUTIONAL_REFERENCE_HOST_RE.test(hostname)) {
+    return { sourceType: 'reference', credibility: 'reference' };
+  }
+
   if (WORLD_NEWS_DOMAINS.includes(hostname)) {
     return { sourceType: 'news', credibility: 'major-news' };
   }
@@ -1551,6 +2087,7 @@ function buildContextsFromSearchItems(
     provider: string;
     sourceType: FetchedSourceType;
     credibility: FetchedCredibility;
+    discoveryEngines?: FetchedDiscoveryEngine[];
     maxItems?: number;
   },
 ): FetchedContext[] {
@@ -1577,6 +2114,8 @@ function buildContextsFromSearchItems(
         sourceType: classified.sourceType,
         credibility: classified.credibility,
         publishedAt: item.publishedAt,
+        discoveryEngines: options.discoveryEngines ?? deriveDiscoveryEnginesFromProvider(options.provider),
+        contextOrigin: 'search-result',
       } satisfies FetchedContext;
     })
     .filter((context) => context.text.trim().length >= 24);
@@ -1598,7 +2137,11 @@ function mergeContextsByUrl(
 
     const existingLength = existing.text.trim().length;
     const nextLength = context.text.trim().length;
-    merged.set(key, nextLength > existingLength ? { ...existing, ...context } : { ...context, ...existing });
+    const base = nextLength > existingLength ? { ...existing, ...context } : { ...context, ...existing };
+    merged.set(key, {
+      ...base,
+      discoveryEngines: mergeDiscoveryEngines(existing.discoveryEngines, context.discoveryEngines),
+    });
   }
 
   return [...merged.values()];
@@ -1615,12 +2158,38 @@ function isScrapableSearchResult(url: string): boolean {
   }
 }
 
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  if (!items.length) return [];
+
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.max(1, Math.min(concurrency, items.length));
+
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (true) {
+        const currentIndex = nextIndex;
+        nextIndex += 1;
+        if (currentIndex >= items.length) return;
+        results[currentIndex] = await mapper(items[currentIndex], currentIndex);
+      }
+    }),
+  );
+
+  return results;
+}
+
 async function scrapeSearchResultItems(
   items: SearchResultItem[],
   options: {
     provider: string;
     sourceType: FetchedSourceType;
     credibility: FetchedCredibility;
+    discoveryEngines?: FetchedDiscoveryEngine[];
     maxPages?: number;
     minTextLength?: number;
   },
@@ -1632,17 +2201,16 @@ async function scrapeSearchResultItems(
 
   if (!selectedItems.length) return [];
 
-  const results = await Promise.all(
-    selectedItems.map((item) => fetchReadablePage(item.url, {
+  const results = await mapWithConcurrency(selectedItems, SEARCH_SCRAPE_CONCURRENCY, (item) => fetchReadablePage(item.url, {
       provider: extractHostname(item.url) || options.provider,
       sourceType: options.sourceType,
       credibility: options.credibility,
+      discoveryEngines: options.discoveryEngines ?? deriveDiscoveryEnginesFromProvider(options.provider),
       title: item.title,
       publishedAt: item.publishedAt,
       timeoutMs: FETCH_SEARCH_SCRAPE_TIMEOUT_MS,
       minTextLength: options.minTextLength ?? 120,
-    }, signal)),
-  );
+    }, signal));
 
   return results.filter((context) => !context.error && context.text.trim().length >= (options.minTextLength ?? 120));
 }
@@ -2269,6 +2837,7 @@ export async function collectDestinationContextsFromItems(
     provider: string;
     sourceType: FetchedSourceType;
     credibility: FetchedCredibility;
+    discoveryEngines?: FetchedDiscoveryEngine[];
     maxItems?: number;
     maxPages?: number;
     minTextLength?: number;
@@ -2282,12 +2851,14 @@ export async function collectDestinationContextsFromItems(
     sourceType: options.sourceType,
     credibility: options.credibility,
     maxItems: options.maxItems ?? items.length,
+    discoveryEngines: options.discoveryEngines ?? deriveDiscoveryEnginesFromProvider(options.provider),
   });
 
   const scraped = await scrapeSearchResultItems(items, {
     provider: options.provider,
     sourceType: options.sourceType,
     credibility: options.credibility,
+    discoveryEngines: options.discoveryEngines ?? deriveDiscoveryEnginesFromProvider(options.provider),
     maxPages: options.maxPages,
     minTextLength: options.minTextLength,
   }, signal).catch(() => []);
@@ -2308,6 +2879,7 @@ async function collectSearchContexts(options: {
   summaryProvider: string;
   summarySourceType: FetchedSourceType;
   summaryCredibility: FetchedCredibility;
+  discoveryEngines?: FetchedDiscoveryEngine[];
   scrapeProvider?: string;
   scrapeSourceType?: FetchedSourceType;
   scrapeCredibility?: FetchedCredibility;
@@ -2319,6 +2891,7 @@ async function collectSearchContexts(options: {
     provider: options.summaryProvider,
     sourceType: options.scrapeSourceType ?? options.summarySourceType,
     credibility: options.scrapeCredibility ?? options.summaryCredibility,
+    discoveryEngines: options.discoveryEngines ?? deriveDiscoveryEnginesFromProvider(options.summaryProvider),
     maxItems: options.items.length,
   });
 
@@ -2342,6 +2915,7 @@ async function collectSearchContexts(options: {
       provider: options.scrapeProvider ?? options.summaryProvider,
       sourceType: options.scrapeSourceType ?? options.summarySourceType,
       credibility: options.scrapeCredibility ?? options.summaryCredibility,
+      discoveryEngines: options.discoveryEngines ?? deriveDiscoveryEnginesFromProvider(options.scrapeProvider ?? options.summaryProvider),
       maxPages: options.maxPages,
       minTextLength: options.minTextLength,
     }, scrapeController.signal).catch(() => []);
@@ -2358,6 +2932,38 @@ async function collectSearchContexts(options: {
       signal.removeEventListener('abort', abortFromParent);
     }
   }
+}
+
+async function collectSearchItemContexts(
+  engine: 'duckduckgo' | 'google',
+  queryText: string,
+  pageSize: number,
+  pageCount: number,
+  needsTimelySources: boolean,
+  signal?: AbortSignal,
+): Promise<FetchedContext[]> {
+  const provider = engine === 'duckduckgo' ? 'DuckDuckGo' : 'Google Search';
+  const items = await (
+    engine === 'duckduckgo'
+      ? fetchSearchResultPages(fetchDuckDuckGoSearchResults, queryText, {
+          pageSize,
+          pageCount,
+        }, signal)
+      : fetchSearchResultPages(fetchGoogleSearchResults, queryText, {
+          pageSize,
+          pageCount,
+        }, signal)
+  ).catch(() => []);
+
+  if (!items.length) return [];
+
+  return buildContextsFromSearchItems(items, {
+    provider,
+    sourceType: needsTimelySources ? 'news' : 'search',
+    credibility: needsTimelySources ? 'major-news' : 'search',
+    discoveryEngines: engine === 'duckduckgo' ? ['duckduckgo'] : ['google'],
+    maxItems: items.length,
+  });
 }
 
 async function fetchDuckDuckGoSearchResults(
@@ -2583,8 +3189,19 @@ function credibilityScore(credibility: FetchedCredibility | undefined): number {
 }
 
 function countTermMatches(text: string, terms: string[]): number {
-  const lower = text.toLowerCase();
-  return terms.reduce((score, term) => score + (lower.includes(term.toLowerCase()) ? (term.length >= 6 ? 4 : 2) : 0), 0);
+  const lower = text
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+  return terms.reduce((score, term) => {
+    const normalizedTerm = term
+      .normalize('NFKD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .trim();
+    if (!normalizedTerm) return score;
+    return score + (lower.includes(normalizedTerm) ? (normalizedTerm.length >= 6 ? 4 : 2) : 0);
+  }, 0);
 }
 
 function getPublishedTimestamp(context: FetchedContext): number | null {
@@ -2701,6 +3318,38 @@ function isCrewEvidenceContext(context: FetchedContext): boolean {
     || /\b(crew members|meet the crew|official crew|crew profile|crew roster|astronaut biographies?|flight crew|mission crew)\b/.test(text);
 }
 
+function isCaseParticipantAnalysis(analysis: QueryAnalysis): boolean {
+  const text = `${analysis.primaryTerm} ${analysis.contextTerm} ${analysis.activeTopic}`.toLowerCase();
+  return analysis.participantFocusQuery
+    || analysis.entityRoleQuery
+    || /\b(trial|trials|tribunal|defendant|defendants)\b/.test(text);
+}
+
+function normalizeCaseCandidateName(value: string): string {
+  return normalizeWhitespace(
+    value
+      .replace(/\b(?:Dr|Mr|Mrs|Ms|Sir|Dame|Prof|Professor|Rev|Reverend|Gen|General|Maj|Major|Field Marshal|Marshal|Judge|Justice|Chief|President|Prime Minister|Premier|Minister|Attorney General)\.?\s+/gi, '')
+      .replace(/[.,;:()\[\]{}]+/g, ' ')
+      .replace(/\s+/g, ' '),
+  );
+}
+
+function isLikelyCaseParticipantName(value: string): boolean {
+  const normalized = normalizeCaseCandidateName(value);
+  if (!normalized) return false;
+  if (/^(?:The|A|An)\b/.test(normalized)) return false;
+
+  const words = normalized.split(' ').filter(Boolean);
+  if (words.length < 2 || words.length > 4) return false;
+
+  const loweredWords = words.map((word) => word.toLowerCase());
+  if (words.some((word) => /\d/.test(word))) return false;
+  if (loweredWords.some((word) => CASE_NAME_WORD_BLOCKLIST.has(word))) return false;
+  if (loweredWords.some((word) => MONTH_INDEX_BY_NAME[word] != null)) return false;
+  if (/\b(?:trial|tribunal|defendant|accused|participant|verdict|sentence|crimes|justice|leaders?|powers?|court|prosecut(?:ion|or)s?|hearing|proceedings?|history|people|figures)\b/i.test(normalized)) return false;
+  return true;
+}
+
 function normalizeCrewCandidateName(value: string): string {
   return normalizeWhitespace(
     value
@@ -2736,6 +3385,55 @@ function splitCrewEvidenceSegments(value: string): string[] {
       .map((line) => normalizeWhitespace(line))
       .filter((line) => line.length >= 18 && line.length <= 320),
   );
+}
+
+function splitCaseEvidenceSegments(value: string): string[] {
+  return uniqueStrings(
+    value
+      .replace(/[â€¢Â·]/g, '\n')
+      .replace(/\s+\|\s+/g, '\n')
+      .split(/\n+/)
+      .flatMap((line) => line.split(/(?<=[.!?])\s+/))
+      .map((line) => normalizeWhitespace(line))
+      .filter((line) => line.length >= 18 && line.length <= 340),
+  );
+}
+
+function hasPatternNearName(name: string, segment: string, pattern: RegExp, window = 96): boolean {
+  const escapedName = escapeRegExp(name);
+  const beforePattern = new RegExp(`${escapedName}[^\\n]{0,${window}}${pattern.source}`, 'i');
+  const afterPattern = new RegExp(`${pattern.source}[^\\n]{0,${window}}${escapedName}`, 'i');
+  return beforePattern.test(segment) || afterPattern.test(segment);
+}
+
+function detectCaseOutcomeNearName(name: string, segment: string): string | undefined {
+  for (const { label, pattern } of CASE_OUTCOME_PATTERNS) {
+    if (hasPatternNearName(name, segment, pattern)) {
+      return label;
+    }
+  }
+  return undefined;
+}
+
+function countNegativeCaseEntitySignals(context: FetchedContext, analysis: QueryAnalysis): number {
+  if (!analysis.namedEntities.length) return 0;
+
+  const candidateNames = uniqueStrings(
+    analysis.namedEntities
+      .map((name) => normalizeCaseCandidateName(name))
+      .filter((name) => name.split(/\s+/).filter(Boolean).length >= 2),
+  );
+  if (!candidateNames.length) return 0;
+
+  const segments = splitCaseEvidenceSegments(`${context.title}\n${context.text}`);
+  let hits = 0;
+  for (const name of candidateNames) {
+    if (segments.some((segment) => hasPatternNearName(name, segment, CASE_NEGATIVE_SEGMENT_RE))) {
+      hits += 1;
+    }
+  }
+
+  return hits;
 }
 
 function detectCrewRoleNearName(name: string, segment: string): string | undefined {
@@ -2850,6 +3548,129 @@ export function extractCrewRosterFromContexts(
     });
 }
 
+export function extractCaseParticipantRosterFromContexts(
+  contexts: FetchedContext[],
+  userMessage: string,
+  conversationHistory: Array<{ role: string; content: string }> = [],
+): ExtractedCaseParticipantMember[] {
+  const analysis = analyzeQuery(userMessage, conversationHistory);
+  if (!isCaseParticipantAnalysis(analysis)) return [];
+
+  const candidateContexts = contexts.filter((context) => {
+    if (context.error || context.text.trim().length < 60) return false;
+    if (isSearchSummaryContext(context) || isDirectoryStyleContext(context)) return false;
+    if (isLowSignalMediaContext(context)) return false;
+    if (getMissionAlignmentScore(context, analysis) < 0) return false;
+    return isCaseParticipantEvidenceContext(context) || isPrimaryEvidenceContext(context) || isDirectSourceEvidenceContext(context, analysis);
+  });
+
+  const candidates = new Map<string, {
+    name: string;
+    supportScore: number;
+    sourceUrls: Set<string>;
+    officialHits: number;
+    referenceHits: number;
+    listEvidenceHits: number;
+    outcomeVotes: Map<string, number>;
+  }>();
+
+  for (const context of candidateContexts) {
+    const contextListStyle = CASE_CONTEXT_LIST_RE.test(`${context.title} ${context.url}`);
+    const contextScoreBase = (context.sourceType === 'official' ? 7 : context.sourceType === 'reference' ? 5 : context.sourceType === 'news' ? 4 : 2)
+      + (contextListStyle ? 5 : 0)
+      + (isCaseParticipantEvidenceContext(context) ? 3 : 0)
+      + (isPrimaryEvidenceContext(context) ? 2 : 0)
+      + (getMissionAlignmentScore(context, analysis) > 0 ? 4 : 0);
+    const segments = splitCaseEvidenceSegments(`${context.title}\n${context.text}`);
+    const seenNamesForContext = new Set<string>();
+
+    for (const segment of segments) {
+      const segmentLooksRelevant = contextListStyle || CASE_SEGMENT_HINT_RE.test(segment);
+      if (!segmentLooksRelevant) {
+        continue;
+      }
+
+      const names = uniqueStrings(
+        [...segment.matchAll(CASE_NAME_RE)]
+          .map((match) => normalizeCaseCandidateName(match[1] ?? ''))
+          .filter(isLikelyCaseParticipantName),
+      );
+
+      for (const name of names) {
+        const key = name.toLowerCase();
+        const positiveNearName = contextListStyle || hasPatternNearName(name, segment, CASE_SEGMENT_HINT_RE);
+        const negativeNearName = hasPatternNearName(name, segment, CASE_NEGATIVE_SEGMENT_RE);
+        if (!positiveNearName || negativeNearName) {
+          continue;
+        }
+
+        const candidate = candidates.get(key) ?? {
+          name,
+          supportScore: 0,
+          sourceUrls: new Set<string>(),
+          officialHits: 0,
+          referenceHits: 0,
+          listEvidenceHits: 0,
+          outcomeVotes: new Map<string, number>(),
+        };
+
+        if (!seenNamesForContext.has(key)) {
+          let localScore = contextScoreBase;
+          if (context.title.toLowerCase().includes(name.toLowerCase())) localScore += 2;
+          if (CASE_SEGMENT_HINT_RE.test(segment)) localScore += 2;
+          if (contextListStyle) localScore += 2;
+          candidate.supportScore += localScore;
+          candidate.sourceUrls.add(context.url.toLowerCase());
+          if (context.sourceType === 'official') {
+            candidate.officialHits += 1;
+          }
+          if (context.sourceType === 'reference') {
+            candidate.referenceHits += 1;
+          }
+          if (contextListStyle) {
+            candidate.listEvidenceHits += 1;
+          }
+          seenNamesForContext.add(key);
+        }
+
+        const outcome = detectCaseOutcomeNearName(name, segment);
+        if (outcome) {
+          candidate.outcomeVotes.set(outcome, (candidate.outcomeVotes.get(outcome) ?? 0) + contextScoreBase + 2);
+        }
+
+        candidates.set(key, candidate);
+      }
+    }
+  }
+
+  return [...candidates.values()]
+    .filter((candidate) => {
+      if (candidate.officialHits > 0) return candidate.supportScore >= 10;
+      if (candidate.referenceHits > 0 && candidate.listEvidenceHits > 0) {
+        return candidate.supportScore >= 13;
+      }
+      return candidate.sourceUrls.size >= 2 && candidate.supportScore >= 12;
+    })
+    .map<ExtractedCaseParticipantMember>((candidate) => {
+      const outcomeVote = [...candidate.outcomeVotes.entries()].sort((left, right) => right[1] - left[1])[0];
+      return {
+        name: candidate.name,
+        outcome: outcomeVote && outcomeVote[1] >= 8 ? outcomeVote[0] : undefined,
+        supportScore: candidate.supportScore,
+        sourceCount: candidate.sourceUrls.size,
+      };
+    })
+    .sort((left, right) => {
+      if ((right.sourceCount ?? 0) !== (left.sourceCount ?? 0)) {
+        return (right.sourceCount ?? 0) - (left.sourceCount ?? 0);
+      }
+      if ((right.supportScore ?? 0) !== (left.supportScore ?? 0)) {
+        return (right.supportScore ?? 0) - (left.supportScore ?? 0);
+      }
+      return left.name.localeCompare(right.name);
+    });
+}
+
 function isDirectoryStyleContext(context: FetchedContext): boolean {
   const combined = `${context.title}\n${context.url}\n${context.text}`.toLowerCase();
   return /\b(agency directory|agencies index|directory|agency list|browse agencies|department directory|site index|a-z index|topic index)\b/.test(combined)
@@ -2924,10 +3745,141 @@ function isSearchEngineHost(hostname: string): boolean {
     || hostname.endsWith('.startpage.com');
 }
 
+function matchesDomainList(hostname: string, domains: string[]): boolean {
+  return domains.some((domain) => hostname === domain || hostname.endsWith(`.${domain}`));
+}
+
+function classifyIndexedHostname(hostname: string): {
+  sourceType: FetchedSourceType;
+  credibility: FetchedCredibility;
+} {
+  const normalized = hostname.replace(/^www\./i, '');
+  if (!normalized) return { sourceType: 'reference', credibility: 'reference' };
+
+  if (
+    normalized.endsWith('.gov')
+    || normalized.endsWith('.mil')
+    || matchesDomainList(normalized, GOVERNMENT_DOMAINS)
+    || matchesDomainList(normalized, SPACE_AGENCY_DOMAINS)
+    || matchesDomainList(normalized, US_FEDERAL_AGENCY_DOMAINS)
+  ) {
+    return { sourceType: 'official', credibility: 'official' };
+  }
+
+  if (normalized.endsWith('.edu') || INSTITUTIONAL_REFERENCE_HOST_RE.test(normalized)) {
+    return { sourceType: 'reference', credibility: 'reference' };
+  }
+
+  if (matchesDomainList(normalized, [...WORLD_NEWS_DOMAINS, ...SCIENCE_NEWS_DOMAINS])) {
+    return { sourceType: 'news', credibility: 'major-news' };
+  }
+
+  if (normalized === 'reddit.com' || normalized.endsWith('.reddit.com') || normalized === 'news.ycombinator.com') {
+    return { sourceType: 'community', credibility: 'community' };
+  }
+
+  return { sourceType: 'reference', credibility: 'reference' };
+}
+
+async function fetchLocalSearchContexts(query: string, limit: number): Promise<FetchedContext[]> {
+  const response = await searchLocalIndex(query, limit);
+  if (!response.results.length) return [];
+
+  return response.results
+    .map((result) => {
+      const hostname = extractHostname(result.url);
+      const classification = classifyIndexedHostname(hostname);
+      return {
+        url: result.url,
+        title: result.title || result.host || result.url,
+        text: normalizeWhitespace(result.content || result.snippet),
+        durationMs: response.tookMs,
+        provider: LOCAL_SEARCH_PROVIDER,
+        sourceType: classification.sourceType,
+        credibility: classification.credibility,
+        discoveryEngines: ['local'],
+        contextOrigin: 'local-index',
+      } satisfies FetchedContext;
+    })
+    .filter((context) => context.text.trim().length >= 40)
+    .slice(0, limit);
+}
+
+function indexContextsIntoLocalSearch(contexts: FetchedContext[]): void {
+  const documents = contexts
+    .filter((context) => context.provider !== LOCAL_SEARCH_PROVIDER)
+    .filter((context) => !context.error)
+    .filter((context) => {
+      const hostname = extractHostname(context.url);
+      return hostname ? !isSearchEngineHost(hostname) : false;
+    })
+    .filter((context) => normalizeWhitespace(context.text).length >= 120)
+    .map((context) => ({
+      url: context.url,
+      title: context.title,
+      snippet: trimContextText(context.text, 260),
+      content: context.text,
+      source: context.provider ?? 'external-search',
+      lastCrawledAt: Date.now(),
+    }));
+
+  if (!documents.length) return;
+  void indexSearchDocuments(documents).catch(() => {});
+}
+
+async function scrapeCatalogContexts(
+  contexts: FetchedContext[],
+  analysis: QueryAnalysis,
+  options: FetchGlobalContextOptions = {},
+): Promise<FetchedContext[]> {
+  const scrapeTarget = resolveVerifiedCatalogPageCount(analysis, options);
+  const rawCandidates = contexts
+    .filter((context) => !context.error && context.text.trim().length >= 24)
+    .filter((context) => isScrapableSearchResult(context.url))
+    .filter((context, index, array) => array.findIndex((entry) => entry.url.toLowerCase() === context.url.toLowerCase()) === index)
+    .map((context) => ({ context, score: scoreContext(context, analysis) }));
+  const rankedCandidates = rawCandidates
+    .map(({ context, score }) => ({
+      context,
+      score: score + computeContextConsensusBoost(context, rawCandidates.map((entry) => entry.context), analysis),
+    }))
+    .sort((left, right) => {
+      if (right.score !== left.score) return right.score - left.score;
+      const rightPublished = getPublishedTimestamp(right.context) ?? 0;
+      const leftPublished = getPublishedTimestamp(left.context) ?? 0;
+      return rightPublished - leftPublished;
+    })
+    .map((entry) => entry.context)
+    .slice(0, scrapeTarget);
+
+  if (!rankedCandidates.length) return [];
+
+  const scraped = await mapWithConcurrency(rankedCandidates, SEARCH_SCRAPE_CONCURRENCY, async (context) => {
+    const classified = classifySourceFromUrl(
+      context.url,
+      context.sourceType ?? 'search',
+      context.credibility ?? 'search',
+    );
+    return fetchReadablePage(context.url, {
+      provider: extractHostname(context.url) || context.provider || 'Search Result',
+      sourceType: classified.sourceType,
+      credibility: classified.credibility,
+      discoveryEngines: context.discoveryEngines,
+      title: context.title,
+      publishedAt: context.publishedAt,
+      timeoutMs: FETCH_SEARCH_SCRAPE_TIMEOUT_MS,
+      minTextLength: 120,
+    });
+  });
+
+  return scraped.filter((context) => !context.error && context.text.trim().length >= 120);
+}
+
 function isSearchSummaryContext(context: FetchedContext): boolean {
   const hostname = extractHostname(context.url);
   const normalizedTitle = context.title.toLowerCase();
-  return isSearchEngineHost(hostname)
+  return context.contextOrigin === 'search-result'
+    || isSearchEngineHost(hostname)
     || normalizedTitle.includes('search:')
     || normalizedTitle.includes('snapshot:')
     || normalizedTitle.includes('probe:');
@@ -2938,8 +3890,9 @@ function isPrimaryEvidenceContext(context: FetchedContext): boolean {
   if (isSearchSummaryContext(context)) return false;
   if (isDirectoryStyleContext(context)) return false;
   const sourceType = context.sourceType ?? 'search';
-  if (sourceType !== 'official' && sourceType !== 'news') return false;
+  if (sourceType !== 'official' && sourceType !== 'news' && sourceType !== 'reference') return false;
   const textLength = context.text.trim().length;
+  if (sourceType === 'reference' && context.contextOrigin !== 'page') return false;
   return textLength >= 220 || Boolean(context.publishedAt && textLength >= 140);
 }
 
@@ -2949,6 +3902,15 @@ function isDirectSourceEvidenceContext(context: FetchedContext, analysis: QueryA
   if (isDirectoryStyleContext(context)) return false;
   const hostname = extractHostname(context.url);
   if (!hostname || isSearchEngineHost(hostname)) return false;
+
+  const entityMentioned = analysis.namedEntities.length > 0
+    && countTermMatches(`${context.title}\n${context.text}\n${context.url}`, analysis.namedEntities.slice(0, 3)) > 0;
+  if (analysis.entityRoleQuery && entityMentioned && !isLowSignalMediaContext(context)) {
+    return true;
+  }
+  if (analysis.participantFocusQuery && isCaseParticipantEvidenceContext(context) && !isLowSignalMediaContext(context)) {
+    return true;
+  }
 
   const sourceType = context.sourceType ?? 'search';
   if (analysis.temporalFocus === 'current' || analysis.temporalFocus === 'recent' || analysis.temporalFocus === 'future') {
@@ -3027,11 +3989,26 @@ function temporalScore(context: FetchedContext, analysis: QueryAnalysis): number
 }
 
 function scoreContext(context: FetchedContext, analysis: QueryAnalysis): number {
+  const missionAlignmentScore = getMissionAlignmentScore(context, analysis);
+  const focusedRelevanceScore = countTermMatches(
+    `${context.title}\n${context.text}\n${context.url}`,
+    buildFocusedRelevanceTerms(analysis),
+  );
+  const activeTopicTerms = analysis.activeTopic ? buildSearchTerms(analysis.activeTopic).slice(0, 6) : [];
+  const activeTopicMatchScore = activeTopicTerms.length > 0
+    ? countTermMatches(`${context.title}\n${context.text}\n${context.url}`, activeTopicTerms)
+    : 0;
+  const namedEntityMatchScore = analysis.namedEntities.length > 0
+    ? countTermMatches(`${context.title}\n${context.text}\n${context.url}`, analysis.namedEntities.slice(0, 3))
+    : 0;
   let score = credibilityScore(context.credibility);
   score += sourceTypeBoost(context.sourceType, analysis);
   score += temporalScore(context, analysis);
   score += countTermMatches(`${context.title}\n${context.text}`, analysis.terms);
-  score += getMissionAlignmentScore(context, analysis);
+  score += countTermMatches(`${context.title}\n${context.text}\n${context.url}`, analysis.awarenessPhrases.slice(0, 4));
+  score += activeTopicMatchScore;
+  score += namedEntityMatchScore;
+  score += missionAlignmentScore;
   const hostname = extractHostname(context.url);
   const timelyFocus = analysis.temporalFocus === 'recent' || analysis.temporalFocus === 'current' || analysis.temporalFocus === 'future';
   const searchSummary = isSearchSummaryContext(context);
@@ -3042,6 +4019,9 @@ function scoreContext(context: FetchedContext, analysis: QueryAnalysis): number 
   const currentStatusLanguage = hasCurrentStatusLanguage(context);
   const directoryStyleContext = isDirectoryStyleContext(context);
   const historicalLiveStatusContext = isHistoricalLiveStatusContext(context, analysis);
+  const negativeEntitySignalCount = (analysis.correctionFollowUp || analysis.entityRoleQuery || analysis.activeSubjectFollowUp)
+    ? countNegativeCaseEntitySignals(context, analysis)
+    : 0;
   if (isSearchEngineHost(hostname)) {
     score -= 28;
   }
@@ -3050,7 +4030,13 @@ function scoreContext(context: FetchedContext, analysis: QueryAnalysis): number 
   }
   if (analysis.prefersNewsSources && context.sourceType === 'news') score += 12;
   if (timelyFocus && searchSummary) score -= 26;
+  if ((analysis.participantFocusQuery || analysis.entityRoleQuery || analysis.correctionFollowUp || analysis.activeSubjectFollowUp) && searchSummary) {
+    score -= 42;
+  }
   if (timelyFocus && context.sourceType === 'search') score -= 12;
+  if ((analysis.participantFocusQuery || analysis.entityRoleQuery || analysis.correctionFollowUp || analysis.activeSubjectFollowUp) && context.contextOrigin === 'page') {
+    score += 8;
+  }
   if (isDirectSourceEvidenceContext(context, analysis)) {
     score += timelyFocus ? 12 : 6;
   }
@@ -3082,6 +4068,33 @@ function scoreContext(context: FetchedContext, analysis: QueryAnalysis): number 
   if (timelyFocus && ageDays != null && ageDays > 30) score -= 10;
   if (timelyFocus && ageDays != null && ageDays > 90) score -= 16;
   if (timelyFocus && context.text.trim().length < 180) score -= 10;
+  if ((analysis.participantFocusQuery || analysis.entityRoleQuery) && isLowSignalMediaContext(context)) {
+    score -= 40;
+  }
+  if (analysis.participantFocusQuery && isCaseParticipantEvidenceContext(context)) {
+    score += 22;
+  }
+  if (analysis.entityRoleQuery || analysis.correctionFollowUp || analysis.activeSubjectFollowUp) {
+    score += namedEntityMatchScore * 10;
+    if (analysis.namedEntities.length > 0 && namedEntityMatchScore === 0) {
+      score -= 36;
+    }
+  }
+  if (negativeEntitySignalCount > 0) {
+    score += negativeEntitySignalCount * 24;
+  }
+  if (context.contextOrigin === 'local-index') {
+    score -= 24;
+    if (focusedRelevanceScore === 0 && missionAlignmentScore <= 0) {
+      score -= 24;
+    }
+  }
+  if ((analysis.correctionFollowUp || analysis.activeSubjectFollowUp) && activeTopicTerms.length > 0) {
+    score += activeTopicMatchScore * 8;
+    if (activeTopicMatchScore === 0) {
+      score -= 42;
+    }
+  }
   if (context.error) score -= 100;
   if (!context.text.trim()) score -= 40;
   if (context.sourceType === 'community' && !analysis.prefersCommunitySources) score -= 20;
@@ -3192,22 +4205,36 @@ function selectBestContexts(
   const hasMissionMatchedEvidence = analysis.missionKeys.length > 0 && deduped.some(({ context, score }) =>
     score >= (isDeep ? 22 : 26) && getMissionAlignmentScore(context, analysis) > 0,
   );
-  const shouldLockSearchSummariesOut = timelyFocus && (strongEvidenceCount >= 2 || directEvidenceHostCount >= 2);
+  const shouldLockSearchSummariesOut = analysis.participantFocusQuery
+    || analysis.entityRoleQuery
+    || analysis.correctionFollowUp
+    || analysis.activeSubjectFollowUp
+    || (timelyFocus && (strongEvidenceCount >= 2 || directEvidenceHostCount >= 2));
   const shouldPreferRecentNewsCoverage = timelyNewsFocus
     && recentNewsCandidateCount >= Math.min(isDeep ? 8 : 6, Math.max(6, desiredSourceCount - 2));
 
-  const maxByType: Record<FetchedSourceType, number> = {
-    official: timelyNewsFocus ? (isDeep ? 5 : 4) : isDeep ? 4 : analysis.prefersOfficialSources ? 3 : 2,
-    news: timelyNewsFocus ? (isDeep ? 10 : 8) : isDeep ? 6 : timelyFocus || analysis.prefersNewsSources ? 4 : 3,
-    reference: isDeep ? 2 : 1,
-    search: shouldLockSearchSummariesOut || timelyNewsFocus ? 0 : isDeep ? 3 : 2,
-    community: analysis.prefersCommunitySources ? 1 : 0,
-  };
+  const maxByType: Record<FetchedSourceType, number> = analysis.participantFocusQuery || analysis.entityRoleQuery
+    ? {
+        official: isDeep ? 4 : 3,
+        news: timelyNewsFocus ? (isDeep ? 3 : 2) : 1,
+        reference: isDeep ? 4 : 3,
+        search: shouldLockSearchSummariesOut || timelyNewsFocus ? 0 : isDeep ? 3 : 2,
+        community: 0,
+      }
+    : {
+        official: timelyNewsFocus ? (isDeep ? 5 : 4) : isDeep ? 4 : analysis.prefersOfficialSources ? 3 : 2,
+        news: timelyNewsFocus ? (isDeep ? 10 : 8) : isDeep ? 6 : timelyFocus || analysis.prefersNewsSources ? 4 : 3,
+        reference: isDeep ? 2 : 1,
+        search: shouldLockSearchSummariesOut || timelyNewsFocus ? 0 : isDeep ? 3 : 2,
+        community: analysis.prefersCommunitySources ? 1 : 0,
+      };
   const providerCounts = new Map<string, number>();
   const hostCounts = new Map<string, number>();
   const typeCounts = new Map<FetchedSourceType, number>();
   const selected: FetchedContext[] = [];
-  const minimumScore = isDeep ? 18 : 22;
+  const minimumScore = analysis.participantFocusQuery || analysis.entityRoleQuery
+    ? (isDeep ? 14 : 16)
+    : isDeep ? 18 : 22;
 
   for (const { context, score } of deduped) {
     if (selected.length >= desiredSourceCount) break;
@@ -3388,6 +4415,131 @@ function ensureMinimumSourceCount(
   return supplemented;
 }
 
+function rankCatalogContexts(
+  contexts: FetchedContext[],
+  analysis: QueryAnalysis,
+): Array<{ context: FetchedContext; score: number }> {
+  const rawDeduped = contexts
+    .filter((context) => !context.error && context.text.trim().length >= 24)
+    .filter((context) => !isSearchSummaryContext(context))
+    .filter((context) => {
+      const hostname = extractHostname(context.url);
+      return hostname ? !isSearchEngineHost(hostname) : false;
+    })
+    .filter((context, index, array) => array.findIndex((entry) => entry.url.toLowerCase() === context.url.toLowerCase()) === index)
+    .map((context) => ({ context, score: scoreContext(context, analysis) }));
+
+  return rawDeduped
+    .map(({ context, score }) => ({
+      context,
+      score: score + computeContextConsensusBoost(context, rawDeduped.map((entry) => entry.context), analysis),
+    }))
+    .sort((left, right) => {
+      if (right.score !== left.score) return right.score - left.score;
+      const rightPublished = getPublishedTimestamp(right.context) ?? 0;
+      const leftPublished = getPublishedTimestamp(left.context) ?? 0;
+      return rightPublished - leftPublished;
+    });
+}
+
+function buildExpandedContextCatalog(
+  contexts: FetchedContext[],
+  analysis: QueryAnalysis,
+  options: FetchGlobalContextOptions = {},
+): FetchedContext[] {
+  const targetCount = resolveCatalogSourceCount(analysis, options);
+  const hostCap = resolveCatalogHostCap(analysis, options);
+  const ranked = rankCatalogContexts(contexts, analysis);
+  const selected: FetchedContext[] = [];
+  const hostCounts = new Map<string, number>();
+  const minimumScore = options.depth === 'deep' ? 4 : 6;
+
+  for (const { context, score } of ranked) {
+    if (selected.length >= targetCount) break;
+    if (score < minimumScore) continue;
+
+    const hostKey = extractHostname(context.url) || context.provider || context.title;
+    if ((hostCounts.get(hostKey) ?? 0) >= hostCap) continue;
+
+    selected.push(context);
+    hostCounts.set(hostKey, (hostCounts.get(hostKey) ?? 0) + 1);
+  }
+
+  if (selected.length < targetCount) {
+    for (const { context } of ranked) {
+      if (selected.length >= targetCount) break;
+      if (selected.some((entry) => entry.url.toLowerCase() === context.url.toLowerCase())) continue;
+
+      const hostKey = extractHostname(context.url) || context.provider || context.title;
+      if ((hostCounts.get(hostKey) ?? 0) >= hostCap) continue;
+
+      selected.push(context);
+      hostCounts.set(hostKey, (hostCounts.get(hostKey) ?? 0) + 1);
+    }
+  }
+
+  return selected;
+}
+
+function buildDiscoveryLeadCatalog(
+  contexts: FetchedContext[],
+  analysis: QueryAnalysis,
+  options: FetchGlobalContextOptions = {},
+): FetchedContext[] {
+  const targetCount = resolveCatalogSourceCount(analysis, options);
+  const hostCap = resolveCatalogHostCap(analysis, options);
+  const ranked = rankCatalogContexts(contexts, analysis);
+  const selected: FetchedContext[] = [];
+  const hostCounts = new Map<string, number>();
+
+  for (const { context } of ranked) {
+    if (selected.length >= targetCount) break;
+    if (context.error || context.text.trim().length < 24) continue;
+    if (selected.some((entry) => entry.url.toLowerCase() === context.url.toLowerCase())) continue;
+
+    const hostKey = extractHostname(context.url) || context.provider || context.title;
+    if ((hostCounts.get(hostKey) ?? 0) >= hostCap) continue;
+
+    selected.push(context);
+    hostCounts.set(hostKey, (hostCounts.get(hostKey) ?? 0) + 1);
+  }
+
+  return selected;
+}
+
+function combineSelectedAndCatalogContexts(
+  selected: FetchedContext[],
+  catalog: FetchedContext[],
+): FetchedContext[] {
+  const combined = new Map<string, FetchedContext>();
+
+  for (const context of selected) {
+    combined.set(context.url.toLowerCase(), {
+      ...context,
+      promptSelected: true,
+    });
+  }
+
+  for (const context of catalog) {
+    const key = context.url.toLowerCase();
+    const existing = combined.get(key);
+    if (existing) {
+      combined.set(key, {
+        ...existing,
+        promptSelected: existing.promptSelected || context.promptSelected,
+      });
+      continue;
+    }
+
+    combined.set(key, {
+      ...context,
+      promptSelected: false,
+    });
+  }
+
+  return [...combined.values()];
+}
+
 async function recoverMinimumContexts(
   analysis: QueryAnalysis,
   queryVariants: string[],
@@ -3452,7 +4604,7 @@ async function recoverMinimumContexts(
     });
   }
 
-  const results = await collectContextsWithinBudget(taskFactories, recoveryBudget);
+  const results = await collectContextsWithinBudget(taskFactories, recoveryBudget, 4);
   return buildNonSearchSourcePool(results, analysis).slice(0, isDeep ? 12 : timelyNewsFocus ? 8 : 6);
 }
 
@@ -3465,11 +4617,12 @@ function wait(ms: number): Promise<void> {
 async function collectContextsWithinBudget(
   taskFactories: Array<(signal: AbortSignal) => Promise<FetchedContext | FetchedContext[] | null>>,
   budgetMs: number,
+  concurrency = taskFactories.length,
 ): Promise<FetchedContext[]> {
   const controller = new AbortController();
   const results: FetchedContext[] = [];
 
-  const tasks = taskFactories.map(async (factory) => {
+  const runPromise = mapWithConcurrency(taskFactories, Math.max(1, concurrency), async (factory) => {
     try {
       const result = await factory(controller.signal);
       if (result) {
@@ -3486,13 +4639,13 @@ async function collectContextsWithinBudget(
   });
 
   const raceResult = await Promise.race([
-    Promise.allSettled(tasks).then(() => 'settled' as const),
+    runPromise.then(() => 'settled' as const),
     wait(budgetMs).then(() => 'timeout' as const),
   ]);
 
   if (raceResult === 'timeout') {
     controller.abort('Global context budget exceeded');
-    await Promise.allSettled(tasks);
+    await Promise.allSettled([runPromise]);
   }
 
   return results;
@@ -3507,23 +4660,26 @@ export async function fetchGlobalContext(
   if ((!analysis.shouldFetch && !options.forceFetch) || (!analysis.primaryTerm && !analysis.contextTerm)) return [];
 
   const compactQuery = buildCompactQuery(analysis);
-  const exactSearchQueries = buildExactSearchQueries(userMessage);
+  const exactSearchQueries = buildExactSearchQueries(userMessage, analysis);
   const queryVariants = buildQueryVariants(analysis);
   const primarySearchQuery = queryVariants[0] ?? compactQuery;
   const desiredSourceCount = resolveDesiredSourceCount(analysis, options);
+  const sourceCatalogTarget = resolveCatalogSourceCount(analysis, options);
   const minimumRequired = minimumRequiredSourceCount(analysis, options);
   const needsTimelySources = analysis.temporalFocus === 'recent' || analysis.temporalFocus === 'current' || analysis.temporalFocus === 'future';
-  const searchFallbackSourceType: FetchedSourceType = analysis.prefersNewsSources ? 'news' : analysis.prefersOfficialSources ? 'official' : 'search';
-  const searchFallbackCredibility: FetchedCredibility = analysis.prefersNewsSources ? 'major-news' : analysis.prefersOfficialSources ? 'official' : 'search';
   const isDeep = options.depth === 'deep';
   const expansiveFetch = desiredSourceCount >= 12 || isTimelyNewsAnalysis(analysis);
-  const searchItemLimit = isDeep ? 18 : expansiveFetch ? 16 : 12;
-  const primaryResultPageCount = isDeep ? 2 : expansiveFetch ? 2 : 1;
-  const secondaryResultPageCount = isDeep ? 2 : 1;
-  const primarySearchPageLimit = isDeep ? 5 : expansiveFetch ? 4 : 3;
-  const secondarySearchPageLimit = isDeep ? 4 : expansiveFetch ? 3 : 2;
-  const searchVariantLimit = isDeep ? Math.min(queryVariants.length, 6) : Math.min(queryVariants.length, expansiveFetch ? 4 : 3);
+  const searchItemLimit = MAX_SEARCH_ITEMS_PER_SOURCE;
+  const searchResultPageCount = isDeep
+    ? SEARCH_RESULT_PAGE_COUNT_DEEP
+    : expansiveFetch
+      ? SEARCH_RESULT_PAGE_COUNT_EXPANSIVE
+      : SEARCH_RESULT_PAGE_COUNT_STANDARD;
+  const searchVariantLimit = isDeep
+    ? Math.min(queryVariants.length, SEARCH_VARIANT_LIMIT_DEEP)
+    : Math.min(queryVariants.length, expansiveFetch ? SEARCH_VARIANT_LIMIT_EXPANSIVE : SEARCH_VARIANT_LIMIT_STANDARD);
   const globalBudgetMs = isDeep ? GLOBAL_CONTEXT_BUDGET_DEEP_MS : GLOBAL_CONTEXT_BUDGET_STANDARD_MS;
+  const localSearchItemLimit = isDeep ? 400 : expansiveFetch ? 240 : 160;
   const timelyQuery = needsTimelySources && !/\blatest|current|status|timeline|today\b/i.test(compactQuery)
     ? `${compactQuery} latest status timeline`
     : compactQuery;
@@ -3533,64 +4689,39 @@ export async function fetchGlobalContext(
     ...(needsTimelySources ? [timelyQuery] : []),
     ...queryVariants.slice(1, searchVariantLimit),
   ]).filter(Boolean);
-  const deadline = nowMs() + globalBudgetMs;
-  const results: FetchedContext[] = [];
+  const localSearchQueryLimit = isDeep
+    ? Math.min(engineQueries.length, LOCAL_SEARCH_QUERY_LIMIT_DEEP)
+    : Math.min(engineQueries.length, LOCAL_SEARCH_QUERY_LIMIT_STANDARD);
+  const localSearchQueries = uniqueStrings([
+    buildLocalSearchQuery(compactQuery),
+    buildLocalSearchQuery(analysis.contextTerm),
+    buildLocalSearchQuery(analysis.primaryTerm),
+    ...queryVariants.map((queryText) => buildLocalSearchQuery(queryText)),
+    ...(needsTimelySources ? [buildLocalSearchQuery(timelyQuery)] : []),
+  ]).filter(Boolean);
+  const localTaskFactories = options.includeLocalIndex === false
+    ? []
+    : localSearchQueries
+        .slice(0, localSearchQueryLimit)
+        .map((queryText) => async (_signal: AbortSignal) => fetchLocalSearchContexts(queryText, localSearchItemLimit));
+  const externalTaskFactories = engineQueries.flatMap((queryText) => ([
+    (signal: AbortSignal) => collectSearchItemContexts('duckduckgo', queryText, searchItemLimit, searchResultPageCount, needsTimelySources, signal),
+    (signal: AbortSignal) => collectSearchItemContexts('google', queryText, searchItemLimit, searchResultPageCount, needsTimelySources, signal),
+  ]));
 
-  const collectFromEngine = async (
-    engine: 'duckduckgo' | 'google',
-    queryText: string,
-    pageCount: number,
-    maxPages: number,
-  ): Promise<FetchedContext[]> => {
-    const items = await (
-      engine === 'duckduckgo'
-        ? fetchSearchResultPages(fetchDuckDuckGoSearchResults, queryText, {
-            pageSize: searchItemLimit,
-            pageCount,
-          })
-        : fetchSearchResultPages(fetchGoogleSearchResults, queryText, {
-            pageSize: searchItemLimit,
-            pageCount,
-          })
-    ).catch(() => []);
+  const [localContexts, searchItemContexts] = await Promise.all([
+    localTaskFactories.length > 0
+      ? collectContextsWithinBudget(localTaskFactories, Math.max(6_000, Math.round(globalBudgetMs * 0.2)), 3)
+      : Promise.resolve([]),
+    collectContextsWithinBudget(externalTaskFactories, Math.max(12_000, Math.round(globalBudgetMs * 0.55)), isDeep ? 4 : 3),
+  ]);
+  const verifiedSearchContexts = await scrapeCatalogContexts(searchItemContexts, analysis, options).catch(() => []);
 
-    if (!items.length) return [];
+  const results = mergeContextsByUrl(
+    verifiedSearchContexts,
+    mergeContextsByUrl(localContexts, searchItemContexts),
+  );
 
-    return collectSearchContexts({
-      items,
-      summaryUrl: engine === 'duckduckgo'
-        ? `https://duckduckgo.com/?q=${encodeURIComponent(queryText)}`
-        : `https://www.google.com/search?q=${encodeURIComponent(queryText)}`,
-      summaryTitle: `${engine === 'duckduckgo' ? 'DuckDuckGo' : 'Google Search'}: ${queryText}`,
-      summaryProvider: engine === 'duckduckgo' ? 'DuckDuckGo' : 'Google Search',
-      summarySourceType: needsTimelySources ? 'news' : 'search',
-      summaryCredibility: needsTimelySources ? 'major-news' : 'search',
-      scrapeProvider: engine === 'duckduckgo' ? 'DuckDuckGo' : 'Google Search',
-      scrapeSourceType: searchFallbackSourceType,
-      scrapeCredibility: searchFallbackCredibility,
-      maxPages,
-    }).catch(() => []);
-  };
-
-  for (let index = 0; index < engineQueries.length; index += 1) {
-    if (nowMs() >= deadline) break;
-    const queryText = engineQueries[index];
-    const pageCount = index === 0 ? primaryResultPageCount : secondaryResultPageCount;
-    const maxPages = index === 0 ? primarySearchPageLimit : secondarySearchPageLimit;
-
-    const ddgContexts = await collectFromEngine('duckduckgo', queryText, pageCount, maxPages);
-    results.push(...ddgContexts);
-    if (buildNonSearchSourcePool(results, analysis).length >= Math.max(minimumRequired, desiredSourceCount)) {
-      break;
-    }
-
-    if (nowMs() >= deadline) break;
-    const googleContexts = await collectFromEngine('google', queryText, pageCount, maxPages);
-    results.push(...googleContexts);
-    if (buildNonSearchSourcePool(results, analysis).length >= Math.max(minimumRequired, desiredSourceCount)) {
-      break;
-    }
-  }
   if (analysis.prefersCommunitySources) {
     const redditContext = await redditSearch(primarySearchQuery);
     if (!redditContext.error && redditContext.text.trim().length >= 24) {
@@ -3603,18 +4734,16 @@ export async function fetchGlobalContext(
       }
     }
   }
+  indexContextsIntoLocalSearch(results);
   let selected = ensureMinimumSourceCount(
     selectBestContexts(results, analysis, options),
     results,
     analysis,
     options,
   );
-  if (selected.length && (minimumRequired <= 0 || selected.length >= minimumRequired)) {
-    return selected;
-  }
 
   let recoveredResults: FetchedContext[] = [];
-  if (minimumRequired > 0) {
+  if (minimumRequired > 0 && selected.length < minimumRequired) {
     const recoveryResults = await recoverMinimumContexts(analysis, queryVariants, exactSearchQueries, options);
     recoveredResults = recoveryResults;
     if (recoveryResults.length) {
@@ -3624,29 +4753,40 @@ export async function fetchGlobalContext(
         analysis,
         options,
       );
-      if (selected.length >= minimumRequired) {
-        return selected;
-      }
     }
   }
 
-  const fallbackDirectSources = buildNonSearchSourcePool([...results, ...recoveredResults], analysis)
+  const combinedResults = [...results, ...recoveredResults];
+  const fallbackDirectSources = buildNonSearchSourcePool(combinedResults, analysis)
     .slice(0, Math.max(Math.max(minimumRequired, 2), Math.min(desiredSourceCount, isDeep ? 12 : 10)));
-  if (fallbackDirectSources.length && (minimumRequired <= 0 || fallbackDirectSources.length >= minimumRequired)) {
-    return fallbackDirectSources;
+  if (!selected.length && fallbackDirectSources.length) {
+    selected = fallbackDirectSources;
   }
 
-  const fallbackSearchPages = results
+  const fallbackSearchPages = combinedResults
     .filter((context) => !context.error && context.text.trim().length >= 40)
     .filter((context) => !isSearchSummaryContext(context))
     .filter((context, index, array) => array.findIndex((entry) => entry.url === context.url) === index)
     .slice(0, Math.max(2, Math.min(desiredSourceCount, isDeep ? 12 : 10)));
 
-  if (fallbackSearchPages.length) {
-    return fallbackSearchPages;
+  if (!selected.length && fallbackSearchPages.length) {
+    selected = fallbackSearchPages;
   }
 
-  return [];
+  let catalog = buildExpandedContextCatalog(combinedResults, analysis, options);
+  if (!catalog.length && selected.length) {
+    catalog = selected;
+  }
+
+  if (!selected.length && catalog.length) {
+    selected = catalog.slice(0, Math.min(desiredSourceCount, resolveSystemContextLimit({ depth: options.depth })));
+  }
+
+  if (!selected.length && !catalog.length) {
+    catalog = buildDiscoveryLeadCatalog(combinedResults, analysis, options);
+  }
+
+  return combineSelectedAndCatalogContexts(selected, catalog).slice(0, sourceCatalogTarget);
 }
 
 function describeContext(context: FetchedContext, options: ContextFormattingOptions = {}): string {
@@ -3696,6 +4836,10 @@ export function globalContextToSystemInject(
     '- Community or forum material is secondary context only and must never be the sole basis for factual claims.',
     '- For news-oriented prompts, weight the answer toward very recent reporting and use older coverage only as background or change-over-time context.',
     '- When several recent reports are available, synthesize across that wider set instead of leaning on a single article or outlet.',
+    '- For trial, defendant, or person-specific questions, prefer sources that explicitly name the people, roles, verdicts, or sentences over broad trial overviews, commemorative coverage, galleries, or video pages.',
+    '- If the user names one specific person, answer that person directly in the first sentence instead of restarting with general background about the whole event.',
+    '- Do not say a person was tried or was a defendant unless the fetched evidence explicitly describes them that way.',
+    '- Do not make blanket outcome claims about all defendants unless the fetched evidence explicitly supports that summary.',
     '- Only make precise status, crew, launch, landing, return, or schedule claims that are explicitly supported by the fetched evidence below.',
     '- When answering name, crew, roster, pilot, commander, or role questions, list only the names and roles explicitly shown in the fetched sources.',
     '- Do not infer a full mission schedule or exact event outcome from a partial excerpt, a search result snippet, or a general mission overview page.',
@@ -3713,7 +4857,8 @@ export function globalContextToSystemInject(
     '- Avoid relative time phrases like "in four days" unless they are explicitly recomputed from the fetch date and still true.',
     '- If the evidence includes both older schedule coverage and newer status updates, describe the older material as earlier reporting or an earlier plan instead of presenting both as current.',
     '- When giving a timeline, present it in chronological order, keep the current status separate from older background milestones, and resolve contradictions plainly.',
-    '- The source list below is already ordered strongest-first. Keep the strongest source or sources central in the answer.',
+    '- Answer directly from the evidence below without narrating the retrieval process.',
+    '- Unless the user explicitly asks for sources, citations, links, or methodology, do not say "based on the sources", "from the context above", or add a Sources or References section.',
     '',
     sortedContexts.map((context) => describeContext(context, options)).join('\n\n'),
     '',
@@ -3746,12 +4891,17 @@ export function globalContextToConversationInject(
   return [{
     role: 'assistant',
     content: [
-      `I reviewed live external sources before responding (fetched ${fetchedAt}).`,
+      `Current research for this prompt was gathered at ${fetchedAt}.`,
       'I already have usable current research in hand and must answer from it directly.',
+      'Unless the user explicitly asks for sources, citations, links, or methodology, I must not mention the retrieval process, say "based on the sources" or "from the context above", or append a Sources or References section.',
       'I must not say that I lack real-time access, and I must not deflect to outside search when the evidence below is enough to provide insight.',
       'I should prefer the newest corroborated official and major-news evidence over forum discussion.',
       'For news-oriented prompts, I should weight the answer toward the freshest reporting and use older coverage only as background context.',
       'When several recent sources align, I should synthesize across that wider set instead of anchoring the answer on one article alone.',
+      'For trial, defendant, or person-specific questions, I should prefer sources that explicitly name the people, roles, verdicts, or sentences over broad event overviews, commemorative coverage, galleries, or video pages.',
+      'If the user names one specific person, I must answer that person directly in the first sentence instead of restarting with general background about the whole event.',
+      'I must not say a person was tried or was a defendant unless the retrieved evidence explicitly describes them that way.',
+      'I must not make blanket outcome claims about all defendants unless the retrieved evidence explicitly supports that summary.',
       'I must treat directory pages, agency indexes, and site indexes as discovery aids, not as evidence for mission status, timelines, crew, or outcomes.',
       'I must only make precise current-status, crew, launch, landing, return, or schedule claims that the retrieved evidence explicitly supports.',
       'If the user asks for people, crew, pilot, commander, or names, I must list only names and roles explicitly present in the retrieved sources.',
@@ -3760,7 +4910,6 @@ export function globalContextToConversationInject(
       'If the user did not ask for crew names or roles, I should not volunteer a crew roster unless it is necessary to answer the actual question.',
       'If the sources only partially confirm the situation, I should clearly separate what is confirmed from what remains unclear.',
       'For current-status answers, I should anchor my answer to the freshest corroborated sources by actual publish date, not just any source that mentions the current year.',
-      'I should attribute the main status claim to the strongest source or sources by name.',
       `I must anchor all timeline language to ${referenceDateLabel}. If a cited date is already before that date, I must describe it as past or completed, not upcoming.`,
       'If a source only says an event was delayed, rescheduled, or scheduled to a date or month that has already arrived by the reference date, I must treat that as earlier planning coverage unless the source also states what actually happened after that point.',
       'I must keep chronology consistent, avoid stale relative countdowns, and treat older schedule coverage as earlier reporting when newer status exists.',
@@ -3775,7 +4924,7 @@ export function globalContextToConversationInject(
       '',
       strongest,
       '',
-      `I will now directly answer the user using that research: "${trimContextText(userMessage, 160)}"`,
+      `I will now answer the user directly: "${trimContextText(userMessage, 160)}"`,
     ].join('\n'),
   }];
 }

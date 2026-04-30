@@ -256,7 +256,7 @@ export function PromptLibraryView({
     return {
       value: option.value,
       label: option.label,
-      description: `Targets ${optionConfig.maxSources} live sources with a ${optionConfig.fetchDepth === 'deep' ? 'deep' : 'standard'} comparison pass; requires at least ${optionConfig.minLiveSources} verified source${optionConfig.minLiveSources === 1 ? '' : 's'}.`,
+      description: `Uses up to ${optionConfig.maxSources} of the strongest live sources in the final prompt bundle while retaining a much larger retrieval catalog; requires at least ${optionConfig.minLiveSources} verified source${optionConfig.minLiveSources === 1 ? '' : 's'}.`,
     };
   });
   const composerPresetOptions = CHAT_START_PRESETS.map<ChatComposerOption>((preset) => ({

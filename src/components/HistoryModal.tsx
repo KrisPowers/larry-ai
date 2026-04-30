@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import type { ChatRecord } from '../types';
+import { stripExportedChatMetadata } from '../lib/chatLog';
 import { IconX, IconMessageSquare, IconTrash2, IconUpload } from './Icon';
 
 interface Props {
@@ -49,7 +50,7 @@ function parseChatLog(md: string, filename: string): ChatRecord | null {
         const content = s.replace(/^###\s+You\s*\n/, '').trim();
         if (content) messages.push({ role: 'user', content });
       } else if (s.startsWith('### Assistant')) {
-        const content = s.replace(/^###\s+Assistant\s*\n/, '').trim();
+        const content = stripExportedChatMetadata(s.replace(/^###\s+Assistant\s*\n/, '').trim());
         if (content) messages.push({ role: 'assistant', content });
       }
     }

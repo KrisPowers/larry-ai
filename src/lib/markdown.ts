@@ -1,3 +1,5 @@
+import { workspaceFilePathHasDefinedType } from './workspaceFileTypes';
+
 export const EXT_MAP: Record<string, string> = {
   js: 'js', javascript: 'js',
   ts: 'ts', typescript: 'ts',
@@ -129,6 +131,8 @@ function preprocess(raw: string): string {
       if (filename.includes('.') || /^[\w\-./]+$/.test(filename)) {
         const commentStyle = ['js','ts','jsx','tsx','java','c','cpp','cs','go','rs','swift','kt'].includes(lang)
           ? `// FILE: ${filename}`
+          : ['css', 'scss', 'sass', 'less'].includes(lang)
+            ? `/* FILE: ${filename} */`
           : ['py','rb','sh','bash','shell','yaml','yml'].includes(lang)
             ? `# FILE: ${filename}`
             : `// FILE: ${filename}`;
@@ -424,7 +428,7 @@ function renderTable(lines: string[]): string {
 
 export function renderTextBlock(text: string): string {
   // ── Pre-clean AI artifacts ────────────────────────────────────────────────
-  text = text.replace(/^(?:\/\/\s*|#\s*|<!--\s*)?FILE:\s*.+?(?:\s*-->)?\s*$/gm, '');
+  text = text.replace(/^(?:(?:\/\/|#)\s*|<!--\s*|\/\*\s*)?FILE:\s*.+?(?:\s*\*\/|\s*-->)?\s*$/gm, '');
   text = text.replace(
     /`(bash|sh|shell|node|python|py|js|ts|npm|npx|yarn|pnpm|cmd|powershell)\s+([^`\n]+)`/g,
     '`$2`'
@@ -529,6 +533,7 @@ export function extractFilePath(code: string, suggestedFilename: string): string
   const patterns = [
     /^\/\/\s*FILE:\s*(.+)$/,
     /^#\s*FILE:\s*(.+)$/,
+    /^\/\*\s*FILE:\s*(.+?)\s*\*\/$/,
     /^<!--\s*FILE:\s*(.+?)\s*-->$/,
   ];
   for (const pat of patterns) {
@@ -550,7 +555,8 @@ export function hasFileComment(code: string): boolean {
   return (
     /^\/\/\s*FILE:/i.test(first) ||
     /^#\s*FILE:/i.test(first) ||
-    /^<!--\s*FILE:/i.test(first)
+    /^<!--\s*FILE:/i.test(first) ||
+    /^\/\*\s*FILE:/i.test(first)
   );
 }
 
@@ -560,7 +566,8 @@ export function stripFileComment(code: string): string {
   if (
     /^\/\/\s*FILE:/.test(first) ||
     /^#\s*FILE:/.test(first) ||
-    /^<!--\s*FILE:/.test(first)
+    /^<!--\s*FILE:/.test(first) ||
+    /^\/\*\s*FILE:/.test(first)
   ) {
     return lines.slice(1).join('\n').replace(/^\n/, '');
   }
@@ -584,5 +591,5 @@ export function extractCodeBlocksForRegistry(
       content: stripFileComment(p.block.code),
       lang: p.block.lang,
     }))
-    .filter(b => b.content.trim().length > 0 && b.path.includes('.'));
+    .filter(b => b.content.trim().length > 0 && workspaceFilePathHasDefinedType(b.path));
 }

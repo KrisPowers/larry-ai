@@ -17,10 +17,23 @@ export interface ModelProviderState {
   error?: string;
 }
 
+export interface ProviderConnectionSettings {
+  selectedModels: string[];
+  autoUpdate: boolean;
+}
+
+export interface ProviderSettingsMap {
+  ollama: ProviderConnectionSettings;
+  openai: ProviderConnectionSettings;
+  anthropic: ProviderConnectionSettings;
+}
+
 export interface ResponseTraceMetric {
   label: string;
   value: string;
 }
+
+export type SearchDiscoveryEngine = 'duckduckgo' | 'google' | 'local';
 
 export interface ResponseTraceSource {
   id: string;
@@ -35,6 +48,11 @@ export interface ResponseTraceSource {
   sourceType?: 'search' | 'news' | 'official' | 'reference' | 'community';
   credibility?: 'official' | 'major-news' | 'reference' | 'search' | 'community';
   publishedAt?: string;
+  discoveryEngines?: SearchDiscoveryEngine[];
+  host?: string;
+  path?: string;
+  contextOrigin?: 'page' | 'search-result' | 'local-index';
+  promptSelected?: boolean;
 }
 
 export interface ResponseTracePackage {
@@ -88,9 +106,32 @@ export interface ResponseTrace {
   plannerSteps?: ResponseTracePlannerStep[];
 }
 
+export interface MessageFileChange {
+  path: string;
+  lang: string;
+  previousContent?: string;
+  nextContent?: string;
+}
+
+export interface MessageWorkspaceChangeSet {
+  files: MessageFileChange[];
+  backup?: WorkspaceBackupReference | null;
+}
+
+export interface ChatExchangeMemory {
+  topic: string;
+  promptSummary: string;
+  replySummary: string;
+  keyTerms: string[];
+  keyPhrases: string[];
+  keyFacts: string[];
+}
+
 export interface Message {
   role: 'user' | 'assistant';
   content: string;
+  exchangeMemory?: ChatExchangeMemory;
+  workspaceChanges?: MessageWorkspaceChangeSet | null;
   responseTimeMs?: number;
   responseFirstTokenMs?: number;
   responseStartedAt?: number;
@@ -122,9 +163,61 @@ export interface AppSettings {
   defaultReasoningEffort: ChatReasoningEffort;
   developerToolsEnabled: boolean;
   advancedUseEnabled: boolean;
+  codeEditorAutoSaveEnabled: boolean;
+  codeEditorIndentGuidesEnabled: boolean;
+  codeEditorSetupGuideEnabled: boolean;
+  codeEditorDependencyInstallEnabled: boolean;
   ollamaEndpoint: string;
   openAIApiKey: string;
   anthropicApiKey: string;
+  providerSettings: ProviderSettingsMap;
+}
+
+export interface WorkspaceBackupReference {
+  id: string;
+  label: string;
+  createdAt: number;
+  archivePath?: string;
+  browserBackupId?: string;
+}
+
+export interface WorkspaceRuntimeCommand {
+  kind: 'build' | 'test' | 'start' | 'lint' | 'install';
+  label: string;
+  command: string;
+}
+
+export interface WorkspaceRuntimeProfile {
+  ecosystem: string;
+  label: string;
+  detectedFiles: string[];
+  commands: WorkspaceRuntimeCommand[];
+}
+
+export interface WorkspaceCommandResult {
+  command: string;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  combinedOutput: string;
+  durationMs: number;
+  timedOut: boolean;
+}
+
+export interface WorkspaceValidationSummary {
+  profile: WorkspaceRuntimeProfile | null;
+  command: WorkspaceCommandResult | null;
+}
+
+export interface InterruptedTaskState {
+  prompt: string;
+  startedAt: number;
+  assistantMessageCountAtStart: number;
+  threadType: ThreadType;
+  projectId?: string;
+  projectLabel?: string;
+  lastPhaseLabel?: string;
+  resumePrompt?: string;
 }
 
 export interface ChatRecord {
@@ -140,6 +233,8 @@ export interface ChatRecord {
   updatedAt: number;
   archivedAt?: number;
   fileEntries?: FileEntry[];
+  latestWorkspaceBackup?: WorkspaceBackupReference | null;
+  interruptedTask?: InterruptedTaskState | null;
 }
 
 export interface WorkspaceFileNode {
@@ -157,6 +252,14 @@ export interface WorkspaceSnapshot {
   fileCount: number;
   directoryCount: number;
   syncedAt: number;
+}
+
+export interface WorkspaceFileDocument {
+  path: string;
+  content: string;
+  lang: string;
+  sizeBytes: number;
+  modifiedAt: number;
 }
 
 export interface WorkspaceSelection {
@@ -208,6 +311,8 @@ export interface Panel {
   fileRegistry: FileRegistry;
   prevRegistry: FileRegistry;
   streamingPhase: StreamingPhase | null;
+  latestWorkspaceBackup?: WorkspaceBackupReference | null;
+  interruptedTask?: InterruptedTaskState | null;
 }
 
 export type OllamaStatus = ModelCatalogStatus;

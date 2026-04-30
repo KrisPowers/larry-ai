@@ -4,6 +4,10 @@ import type {
   PersistedAppSnapshot,
   ProjectFolder,
   ReplyPreferenceRecord,
+  WorkspaceBackupReference,
+  WorkspaceCommandResult,
+  WorkspaceFileDocument,
+  WorkspaceRuntimeProfile,
   WorkspaceSelection,
   WorkspaceSnapshot,
 } from './index';
@@ -22,11 +26,21 @@ interface WailsAppBridge {
   PickWorkspaceDirectory(): Promise<WorkspaceSelection>;
   CreateManagedWorkspaceDirectory(label: string): Promise<WorkspaceSelection>;
   ScanWorkspace(rootPath: string): Promise<WorkspaceSnapshot>;
+  ReadWorkspaceFile(rootPath: string, relativePath: string): Promise<WorkspaceFileDocument>;
+  WriteWorkspaceFileDocument(rootPath: string, relativePath: string, content: string): Promise<WorkspaceFileDocument>;
   OpenWorkspaceInExplorer(rootPath: string): Promise<void>;
   CreateWorkspaceDirectory(rootPath: string, relativePath: string): Promise<WorkspaceSnapshot>;
   CreateWorkspaceFile(rootPath: string, relativePath: string, content: string): Promise<WorkspaceSnapshot>;
   WriteWorkspaceFile(rootPath: string, relativePath: string, content: string): Promise<WorkspaceSnapshot>;
+  RenameWorkspaceEntry(rootPath: string, relativePath: string, nextRelativePath: string): Promise<WorkspaceSnapshot>;
+  CopyWorkspaceEntry(rootPath: string, relativePath: string, nextRelativePath: string): Promise<WorkspaceSnapshot>;
   DeleteWorkspaceEntry(rootPath: string, relativePath: string): Promise<WorkspaceSnapshot>;
+  OpenWorkspaceEntry(rootPath: string, relativePath: string): Promise<void>;
+  CreateWorkspaceBackup(rootPath: string, workspaceID: string, label: string): Promise<WorkspaceBackupReference>;
+  RestoreWorkspaceBackup(rootPath: string, archivePath: string): Promise<WorkspaceSnapshot>;
+  InspectWorkspaceRuntime(rootPath: string): Promise<WorkspaceRuntimeProfile>;
+  RunWorkspaceCommand(rootPath: string, command: string, timeoutMs: number): Promise<WorkspaceCommandResult>;
+  RunWorkspaceWebPreview(rootPath: string, command: string, timeoutMs: number): Promise<WorkspaceCommandResult>;
   FetchOllamaModels(endpoint: string): Promise<string[]>;
   ChatOllama(
     endpoint: string,

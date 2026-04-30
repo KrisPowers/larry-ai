@@ -1,18 +1,20 @@
 // FILE: src/components/MessageBubble.tsx
 import { useState } from 'react';
-import { parseContent, renderTextBlock, extractFilePath, stripFileComment } from '../lib/markdown';
+import { parseContent, renderTextBlock, extractFilePath, hasFileComment } from '../lib/markdown';
 import type { CodeBlock as CodeBlockType } from '../lib/markdown';
 import { AssistantRunStatus } from './AssistantRunStatus';
 import { CodeBlock } from './CodeBlock';
-import { computeDiff } from '../lib/diffMetrics';
-import { IconCheck, IconCopy, IconFileText, IconRefreshCw, IconThumbsDown, IconThumbsUp } from './Icon';
+import { computeDiff, computeLineDiff } from '../lib/diffMetrics';
+import { highlightWorkspaceFileContent } from '../lib/workspaceSyntax';
+import { IconCheck, IconChevronDown, IconChevronUp, IconCopy, IconRotateCcw, IconThumbsDown, IconThumbsUp } from './Icon';
 import { NoCodeWarning } from './NoCodeWarning';
 import { MessageSourcesPanel } from './MessageSourcesPanel';
-import type { Message, ReplyFeedback, ResponseTraceSource, StreamingPhase } from '../types';
+import type { Message, MessageWorkspaceChangeSet, ReplyFeedback, ResponseTraceSource, SearchDiscoveryEngine, StreamingPhase } from '../types';
 import type { FileRegistry } from '../lib/fileRegistry';
 
 interface Props {
   message: Message;
+  chatTitle?: string;
   withDownload?: boolean;
   prevRegistry?: FileRegistry;
   model?: string;
@@ -24,6 +26,7 @@ interface Props {
   liveResponseMs?: number | null;
   isMostRecentReply?: boolean;
   onAssistantRunStatusToggle?: () => void;
+  onUndoWorkspaceChanges?: (changeSet: MessageWorkspaceChangeSet) => void | Promise<void>;
   // When true, never show the NoCodeWarning even if the pattern fires.
   suppressNoCodeWarning?: boolean;
 }
@@ -49,6 +52,48 @@ function sourcePublishedAt(source: ResponseTraceSource): number {
   if (!source.publishedAt) return 0;
   const value = new Date(source.publishedAt).getTime();
   return Number.isFinite(value) ? value : 0;
+}
+
+function mergeDiscoveryEngines(
+  left?: SearchDiscoveryEngine[],
+  right?: SearchDiscoveryEngine[],
+): SearchDiscoveryEngine[] | undefined {
+  const merged = [...(left ?? []), ...(right ?? [])];
+  if (!merged.length) return undefined;
+  return [...new Set(merged)];
+}
+
+function mergeTraceSources(sources: ResponseTraceSource[]): ResponseTraceSource[] {
+  const merged = new Map<string, ResponseTraceSource>();
+
+  for (const source of sources) {
+    const existing = merged.get(source.url);
+    if (!existing) {
+      merged.set(source.url, {
+        ...source,
+        discoveryEngines: mergeDiscoveryEngines(source.discoveryEngines),
+      });
+      continue;
+    }
+
+    merged.set(source.url, {
+      ...existing,
+      preview: existing.preview || source.preview,
+      error: existing.error || source.error,
+      provider: existing.provider ?? source.provider,
+      host: existing.host ?? source.host,
+      path: existing.path ?? source.path,
+      sourceType: existing.sourceType ?? source.sourceType,
+      credibility: existing.credibility ?? source.credibility,
+      publishedAt: existing.publishedAt ?? source.publishedAt,
+      durationMs: existing.durationMs ?? source.durationMs,
+      contextOrigin: existing.contextOrigin ?? source.contextOrigin,
+      promptSelected: existing.promptSelected || source.promptSelected,
+      discoveryEngines: mergeDiscoveryEngines(existing.discoveryEngines, source.discoveryEngines),
+    });
+  }
+
+  return [...merged.values()];
 }
 
 function detectFakeCompletion(content: string, fileBlockCount: number): boolean {
@@ -113,38 +158,179 @@ function InlineCodeBlock({ block }: { block: CodeBlockType }) {
   );
 }
 
-function FileChangePill({
-  block,
-  prevContent,
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function fallbackHighlightedLines(content: string): string[] {
+  return content
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .split('\n')
+    .map((line) => escapeHtml(line) || '<span class="workspace-file-editor-render-placeholder"> </span>');
+}
+
+function extractHighlightedLineHtmls(content: string, lang: string): string[] {
+  const highlighted = highlightWorkspaceFileContent(content, lang || 'text');
+  const linePrefix = '<span class="workspace-file-editor-render-line">';
+  const segments = highlighted
+    .split(linePrefix)
+    .slice(1)
+    .map((segment) => {
+      const closingIndex = segment.lastIndexOf('</span>');
+      return closingIndex >= 0
+        ? segment.slice(0, closingIndex)
+        : segment;
+    });
+  if (!segments.length) return fallbackHighlightedLines(content);
+  return segments.map((segment) => segment || '<span class="workspace-file-editor-render-placeholder"> </span>');
+}
+
+function renderDiffLineHtml(
+  line: ReturnType<typeof computeLineDiff>[number],
+  oldHighlightedLines: string[],
+  newHighlightedLines: string[],
+): string {
+  if (line.type === 'removed' && line.oldNumber != null) {
+    return oldHighlightedLines[line.oldNumber - 1]
+      ?? escapeHtml(line.content || '')
+      ?? '<span class="workspace-file-editor-render-placeholder"> </span>';
+  }
+
+  if (line.newNumber != null) {
+    return newHighlightedLines[line.newNumber - 1]
+      ?? escapeHtml(line.content || '')
+      ?? '<span class="workspace-file-editor-render-placeholder"> </span>';
+  }
+
+  if (line.oldNumber != null) {
+    return oldHighlightedLines[line.oldNumber - 1]
+      ?? escapeHtml(line.content || '')
+      ?? '<span class="workspace-file-editor-render-placeholder"> </span>';
+  }
+
+  return '<span class="workspace-file-editor-render-placeholder"> </span>';
+}
+
+function ReplyWorkspaceChangePanel({
+  changeSet,
+  onUndo,
 }: {
-  block: CodeBlockType;
-  prevContent?: string;
+  changeSet: MessageWorkspaceChangeSet;
+  onUndo?: (changeSet: MessageWorkspaceChangeSet) => void | Promise<void>;
 }) {
-  const resolvedPath = extractFilePath(block.code, block.suggestedFilename);
-  const cleanCode = stripFileComment(block.code);
-  const metrics = computeDiff(prevContent ?? '', cleanCode);
-  const isNew = !prevContent;
-  const name = resolvedPath.split('/').pop() ?? resolvedPath;
-  const dir = resolvedPath.includes('/')
-    ? resolvedPath.slice(0, resolvedPath.lastIndexOf('/'))
-    : '';
+  const [expandedPath, setExpandedPath] = useState<string | null>(null);
+  const files = changeSet.files.map((file) => ({
+    ...file,
+    metrics: computeDiff(file.previousContent ?? '', file.nextContent ?? ''),
+  }));
+  const totals = files.reduce(
+    (acc, file) => ({
+      added: acc.added + file.metrics.added,
+      removed: acc.removed + file.metrics.removed,
+    }),
+    { added: 0, removed: 0 },
+  );
+
+  if (!files.length) return null;
 
   return (
-    <div className="change-pill">
-      <IconFileText size={12} className="change-pill-icon" />
-      <div className="change-pill-info">
-        {dir && <span className="change-pill-dir">{dir}/</span>}
-        <span className="change-pill-name">{name}</span>
-      </div>
-      <div className="change-pill-metrics">
-        {isNew ? (
-          <span className="diff-added change-pill-new">new</span>
-        ) : (
-          <>
-            {metrics.added > 0 && <span className="diff-added">+{metrics.added}</span>}
-            {metrics.removed > 0 && <span className="diff-removed">-{metrics.removed}</span>}
-          </>
+    <div className="reply-change-summary">
+      <div className="reply-change-summary-header">
+        <div className="reply-change-summary-label">
+          <span>{files.length} file{files.length === 1 ? '' : 's'} changed</span>
+          <span className={`reply-change-summary-metric diff-added${totals.added === 0 ? ' is-zero' : ''}`}>+{totals.added}</span>
+          <span className={`reply-change-summary-metric diff-removed${totals.removed === 0 ? ' is-zero' : ''}`}>-{totals.removed}</span>
+        </div>
+
+        {changeSet.backup && onUndo && (
+          <button
+            type="button"
+            className="reply-change-undo"
+            onClick={() => {
+              void onUndo(changeSet);
+            }}
+          >
+            <span>Undo</span>
+            <IconRotateCcw size={14} />
+          </button>
         )}
+      </div>
+
+      <div className="reply-change-file-list">
+        {files.map((file) => {
+          const isExpanded = expandedPath === file.path;
+          const diffLines = isExpanded
+            ? computeLineDiff(file.previousContent ?? '', file.nextContent ?? '', { contextLines: 3 })
+            : [];
+          const oldHighlightedLines = isExpanded
+            ? extractHighlightedLineHtmls(file.previousContent ?? '', file.lang)
+            : [];
+          const newHighlightedLines = isExpanded
+            ? extractHighlightedLineHtmls(file.nextContent ?? '', file.lang)
+            : [];
+
+          return (
+            <div key={file.path} className={`reply-change-file${isExpanded ? ' is-expanded' : ''}`}>
+              <button
+                type="button"
+                className="reply-change-file-row"
+                onClick={() => setExpandedPath(isExpanded ? null : file.path)}
+                aria-expanded={isExpanded}
+                title={file.path}
+              >
+                <div className="reply-change-file-main">
+                  <span className="reply-change-file-path">{file.path}</span>
+                  <div className="reply-change-file-metrics">
+                    <span className={`reply-change-summary-metric diff-added${file.metrics.added === 0 ? ' is-zero' : ''}`}>+{file.metrics.added}</span>
+                    <span className={`reply-change-summary-metric diff-removed${file.metrics.removed === 0 ? ' is-zero' : ''}`}>-{file.metrics.removed}</span>
+                  </div>
+                </div>
+
+                <span className="reply-change-file-toggle">
+                  {isExpanded ? <IconChevronUp size={16} /> : <IconChevronDown size={16} />}
+                </span>
+              </button>
+
+              {isExpanded && (
+                <div className="reply-change-diff-shell">
+                  <div className="reply-change-diff-scroll">
+                    {diffLines.map((line, index) => {
+                      if (line.type === 'spacer') {
+                        return (
+                          <div key={`${file.path}-spacer-${index}`} className="reply-change-diff-spacer">
+                            {line.hiddenLineCount ?? 0} unchanged line{line.hiddenLineCount === 1 ? '' : 's'}
+                          </div>
+                        );
+                      }
+
+                      return (
+                        <div key={`${file.path}-${line.oldNumber ?? 'n'}-${line.newNumber ?? 'n'}-${index}`} className={`reply-change-diff-line is-${line.type}`}>
+                          <span className="reply-change-diff-number">{line.oldNumber ?? ''}</span>
+                          <span className="reply-change-diff-number">{line.newNumber ?? ''}</span>
+                          <span className="reply-change-diff-marker" aria-hidden="true">
+                            {line.type === 'added' ? '+' : line.type === 'removed' ? '-' : ' '}
+                          </span>
+                          <span
+                            className="reply-change-diff-code"
+                            dangerouslySetInnerHTML={{
+                              __html: renderDiffLineHtml(line, oldHighlightedLines, newHighlightedLines),
+                            }}
+                          />
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -152,6 +338,7 @@ function FileChangePill({
 
 export function MessageBubble({
   message,
+  chatTitle,
   withDownload = false,
   prevRegistry,
   model,
@@ -163,6 +350,7 @@ export function MessageBubble({
   liveResponseMs = null,
   isMostRecentReply = false,
   onAssistantRunStatusToggle,
+  onUndoWorkspaceChanges,
   suppressNoCodeWarning = false,
 }: Props) {
   const isUser = message.role === 'user';
@@ -181,7 +369,7 @@ export function MessageBubble({
 
   const allFileBlocks = parsed.parts
     .filter((part): part is { type: 'code'; block: CodeBlockType } => part.type === 'code')
-    .filter((part) => !part.block.isInline);
+    .filter((part) => !part.block.isInline && hasFileComment(part.block.code));
 
   const seenPaths = new Map<string, typeof allFileBlocks[0]>();
   for (const part of allFileBlocks) {
@@ -189,11 +377,13 @@ export function MessageBubble({
     seenPaths.set(path, part);
   }
   const fileBlocks = [...seenPaths.values()];
+  const workspaceChanges = !isUser ? message.workspaceChanges ?? null : null;
 
   const isFakeCompletion =
     !isUser &&
     !isStreaming &&
     !suppressNoCodeWarning &&
+    message.responseTrace?.surface !== 'code' &&
     withDownload &&
     detectFakeCompletion(cleanedFull, fileBlocks.length);
   const responseTrace = !isUser ? message.responseTrace : undefined;
@@ -210,7 +400,7 @@ export function MessageBubble({
         return sourcePublishedAt(b) - sourcePublishedAt(a);
       })
     : [];
-  const messageSources = [...new Map(traceSources.map((source) => [source.url, source])).values()];
+  const messageSources = mergeTraceSources(traceSources);
   const copyableReply = !isUser ? cleanedDisplay.trim() : '';
   const feedbackEnabled = !isUser && typeof onFeedbackChange === 'function';
 
@@ -228,7 +418,7 @@ export function MessageBubble({
               return <InlineCodeBlock key={index} block={part.block} />;
             }
 
-            if (hideCodeBlocks && !isUser) {
+            if (hideCodeBlocks && !isUser && hasFileComment(part.block.code)) {
               return null;
             }
 
@@ -333,6 +523,8 @@ export function MessageBubble({
       {renderedReplyContent}
     </div>
   ) : null;
+  const isCodeRun = message.responseTrace?.surface === 'code';
+  const runStatusDefaultOpen = isStreaming || (!isCodeRun && isMostRecentReply);
 
   return (
     <div className={`msg ${message.role}`}>
@@ -340,11 +532,12 @@ export function MessageBubble({
       {shouldShowAssistantRunStatus && (
         <AssistantRunStatus
           trace={responseTrace}
+          chatTitle={chatTitle}
           streamingPhase={streamingPhase}
           isStreaming={isStreaming}
           liveResponseMs={isStreaming ? liveResponseMs : message.responseTimeMs ?? liveResponseMs}
           hasStreamingContent={hasVisibleContent}
-          defaultOpen={isMostRecentReply}
+          defaultOpen={runStatusDefaultOpen}
           onToggleOpenChange={onAssistantRunStatusToggle}
           onOpenSources={messageSources.length > 0 ? () => setSourcesOpen(true) : undefined}
           replyContent={renderReplyInsideRunStatus ? assistantReplyBlock : null}
@@ -366,25 +559,12 @@ export function MessageBubble({
         />
       )}
 
-      {!isUser && withDownload && fileBlocks.length > 0 && (
-        <div className="change-summary">
-          <div className="change-summary-label">
-            <IconRefreshCw size={11} style={{ color: 'var(--accent)' }} />
-            {fileBlocks.length} file{fileBlocks.length !== 1 ? 's' : ''} changed
-          </div>
-          <div className="change-pills">
-            {fileBlocks.map((part) => (
-              <FileChangePill
-                key={part.block.id}
-                block={part.block}
-                prevContent={prevRegistry?.get(
-                  extractFilePath(part.block.code, part.block.suggestedFilename)
-                )?.content}
-              />
-            ))}
-          </div>
-        </div>
-      )}
+      {!isUser && workspaceChanges?.files.length ? (
+        <ReplyWorkspaceChangePanel
+          changeSet={workspaceChanges}
+          onUndo={onUndoWorkspaceChanges}
+        />
+      ) : null}
     </div>
   );
 }

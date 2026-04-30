@@ -14,9 +14,14 @@ import type {
   ReplyPreferenceRecord,
   StorageMode,
 } from '../types';
+import { createDefaultProviderSettingsMap, normalizeProviderSettingsMap } from './providerConnections';
 
 const DEFAULT_OLLAMA_BASE = 'http://localhost:11434';
 const DEFAULT_REASONING_EFFORT: ChatReasoningEffort = 'balanced';
+const DEFAULT_CODE_EDITOR_AUTO_SAVE = true;
+const DEFAULT_CODE_EDITOR_INDENT_GUIDES = true;
+const DEFAULT_CODE_EDITOR_SETUP_GUIDE = false;
+const DEFAULT_CODE_EDITOR_DEPENDENCY_INSTALL = false;
 
 const FOLDERS_STORAGE_KEY = 'larry_project_folders_v1';
 const DEFAULT_MODEL_STORAGE_KEY = 'larry_default_model_v1';
@@ -24,9 +29,14 @@ const DEFAULT_CHAT_PRESET_STORAGE_KEY = 'larry_default_chat_preset_v1';
 const DEFAULT_REASONING_STORAGE_KEY = 'larry_default_reasoning_effort_v1';
 const DEVELOPER_TOOLS_STORAGE_KEY = 'larry_developer_tools_v1';
 const ADVANCED_USE_STORAGE_KEY = 'larry_advanced_use_v1';
+const CODE_EDITOR_AUTO_SAVE_STORAGE_KEY = 'larry_code_editor_auto_save_v1';
+const CODE_EDITOR_INDENT_GUIDES_STORAGE_KEY = 'larry_code_editor_indent_guides_v1';
+const CODE_EDITOR_SETUP_GUIDE_STORAGE_KEY = 'larry_code_editor_setup_guide_v1';
+const CODE_EDITOR_DEPENDENCY_INSTALL_STORAGE_KEY = 'larry_code_editor_dependency_install_v1';
 const OLLAMA_BASE_STORAGE_KEY = 'larry_ollama_base_v1';
 const OPENAI_API_KEY_STORAGE_KEY = 'larry_openai_api_key_v1';
 const ANTHROPIC_API_KEY_STORAGE_KEY = 'larry_anthropic_api_key_v1';
+const PROVIDER_SETTINGS_STORAGE_KEY = 'larry_provider_settings_v1';
 const REPLY_PREFERENCES_STORAGE_KEY = 'larry_reply_preferences_v1';
 
 interface DesktopBridge {
@@ -60,9 +70,14 @@ function createDefaultSettings(): AppSettings {
     defaultReasoningEffort: DEFAULT_REASONING_EFFORT,
     developerToolsEnabled: false,
     advancedUseEnabled: false,
+    codeEditorAutoSaveEnabled: DEFAULT_CODE_EDITOR_AUTO_SAVE,
+    codeEditorIndentGuidesEnabled: DEFAULT_CODE_EDITOR_INDENT_GUIDES,
+    codeEditorSetupGuideEnabled: DEFAULT_CODE_EDITOR_SETUP_GUIDE,
+    codeEditorDependencyInstallEnabled: DEFAULT_CODE_EDITOR_DEPENDENCY_INSTALL,
     ollamaEndpoint: DEFAULT_OLLAMA_BASE,
     openAIApiKey: '',
     anthropicApiKey: '',
+    providerSettings: createDefaultProviderSettingsMap(),
   };
 }
 
@@ -79,9 +94,26 @@ function normaliseSettings(settings?: Partial<AppSettings> | null): AppSettings 
         : DEFAULT_REASONING_EFFORT,
     developerToolsEnabled: Boolean(next.developerToolsEnabled),
     advancedUseEnabled: Boolean(next.advancedUseEnabled),
+    codeEditorAutoSaveEnabled:
+      typeof next.codeEditorAutoSaveEnabled === 'boolean'
+        ? next.codeEditorAutoSaveEnabled
+        : DEFAULT_CODE_EDITOR_AUTO_SAVE,
+    codeEditorIndentGuidesEnabled:
+      typeof next.codeEditorIndentGuidesEnabled === 'boolean'
+        ? next.codeEditorIndentGuidesEnabled
+        : DEFAULT_CODE_EDITOR_INDENT_GUIDES,
+    codeEditorSetupGuideEnabled:
+      typeof next.codeEditorSetupGuideEnabled === 'boolean'
+        ? next.codeEditorSetupGuideEnabled
+        : DEFAULT_CODE_EDITOR_SETUP_GUIDE,
+    codeEditorDependencyInstallEnabled:
+      typeof next.codeEditorDependencyInstallEnabled === 'boolean'
+        ? next.codeEditorDependencyInstallEnabled
+        : DEFAULT_CODE_EDITOR_DEPENDENCY_INSTALL,
     ollamaEndpoint: normalizeOllamaBase(next.ollamaEndpoint),
     openAIApiKey: next.openAIApiKey?.trim() ?? '',
     anthropicApiKey: next.anthropicApiKey?.trim() ?? '',
+    providerSettings: normalizeProviderSettingsMap(next.providerSettings),
   };
 }
 
@@ -196,6 +228,17 @@ function readLocalStorageValue(key: string): string {
   }
 }
 
+function readLocalStorageJson<T>(key: string): T | null {
+  const raw = readLocalStorageValue(key);
+  if (!raw) return null;
+
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
 function writeLocalStorageValue(key: string, value: string) {
   if (typeof window === 'undefined') return;
 
@@ -210,8 +253,16 @@ function writeLocalStorageValue(key: string, value: string) {
   }
 }
 
+function readBooleanStorage(key: string, fallback: boolean): boolean {
+  const raw = readLocalStorageValue(key);
+  if (!raw) return fallback;
+  if (/^(?:1|true)$/i.test(raw)) return true;
+  if (/^(?:0|false)$/i.test(raw)) return false;
+  return fallback;
+}
+
 function writeBooleanStorage(key: string, value: boolean) {
-  writeLocalStorageValue(key, value ? '1' : '');
+  writeLocalStorageValue(key, value ? '1' : '0');
 }
 
 async function loadBrowserSnapshot(): Promise<PersistedAppSnapshot> {
@@ -219,11 +270,27 @@ async function loadBrowserSnapshot(): Promise<PersistedAppSnapshot> {
     defaultModel: readLocalStorageValue(DEFAULT_MODEL_STORAGE_KEY),
     defaultChatPreset: readLocalStorageValue(DEFAULT_CHAT_PRESET_STORAGE_KEY) || DEFAULT_PRESET_ID,
     defaultReasoningEffort: readLocalStorageValue(DEFAULT_REASONING_STORAGE_KEY) as ChatReasoningEffort,
-    developerToolsEnabled: /^(?:1|true)$/i.test(readLocalStorageValue(DEVELOPER_TOOLS_STORAGE_KEY)),
-    advancedUseEnabled: /^(?:1|true)$/i.test(readLocalStorageValue(ADVANCED_USE_STORAGE_KEY)),
+    developerToolsEnabled: readBooleanStorage(DEVELOPER_TOOLS_STORAGE_KEY, false),
+    advancedUseEnabled: readBooleanStorage(ADVANCED_USE_STORAGE_KEY, false),
+    codeEditorAutoSaveEnabled: readBooleanStorage(CODE_EDITOR_AUTO_SAVE_STORAGE_KEY, DEFAULT_CODE_EDITOR_AUTO_SAVE),
+    codeEditorIndentGuidesEnabled: readBooleanStorage(
+      CODE_EDITOR_INDENT_GUIDES_STORAGE_KEY,
+      DEFAULT_CODE_EDITOR_INDENT_GUIDES,
+    ),
+    codeEditorSetupGuideEnabled: readBooleanStorage(
+      CODE_EDITOR_SETUP_GUIDE_STORAGE_KEY,
+      DEFAULT_CODE_EDITOR_SETUP_GUIDE,
+    ),
+    codeEditorDependencyInstallEnabled: readBooleanStorage(
+      CODE_EDITOR_DEPENDENCY_INSTALL_STORAGE_KEY,
+      DEFAULT_CODE_EDITOR_DEPENDENCY_INSTALL,
+    ),
     ollamaEndpoint: readLocalStorageValue(OLLAMA_BASE_STORAGE_KEY) || DEFAULT_OLLAMA_BASE,
     openAIApiKey: readLocalStorageValue(OPENAI_API_KEY_STORAGE_KEY),
     anthropicApiKey: readLocalStorageValue(ANTHROPIC_API_KEY_STORAGE_KEY),
+    providerSettings: normalizeProviderSettingsMap(
+      readLocalStorageJson<Partial<AppSettings['providerSettings']>>(PROVIDER_SETTINGS_STORAGE_KEY),
+    ),
   });
 
   const workspaces = parseJsonArray<ProjectFolder>(
@@ -266,9 +333,14 @@ function snapshotHasMeaningfulData(snapshot: PersistedAppSnapshot): boolean {
     settings.defaultReasoningEffort !== defaults.defaultReasoningEffort ||
     settings.developerToolsEnabled !== defaults.developerToolsEnabled ||
     settings.advancedUseEnabled !== defaults.advancedUseEnabled ||
+    settings.codeEditorAutoSaveEnabled !== defaults.codeEditorAutoSaveEnabled ||
+    settings.codeEditorIndentGuidesEnabled !== defaults.codeEditorIndentGuidesEnabled ||
+    settings.codeEditorSetupGuideEnabled !== defaults.codeEditorSetupGuideEnabled ||
+    settings.codeEditorDependencyInstallEnabled !== defaults.codeEditorDependencyInstallEnabled ||
     settings.ollamaEndpoint !== defaults.ollamaEndpoint ||
     settings.openAIApiKey !== defaults.openAIApiKey ||
-    settings.anthropicApiKey !== defaults.anthropicApiKey
+    settings.anthropicApiKey !== defaults.anthropicApiKey ||
+    JSON.stringify(settings.providerSettings) !== JSON.stringify(defaults.providerSettings)
   );
 }
 
@@ -344,6 +416,10 @@ export async function saveAppSettings(settings: AppSettings): Promise<void> {
 
   writeBooleanStorage(DEVELOPER_TOOLS_STORAGE_KEY, next.developerToolsEnabled);
   writeBooleanStorage(ADVANCED_USE_STORAGE_KEY, next.advancedUseEnabled);
+  writeBooleanStorage(CODE_EDITOR_AUTO_SAVE_STORAGE_KEY, next.codeEditorAutoSaveEnabled);
+  writeBooleanStorage(CODE_EDITOR_INDENT_GUIDES_STORAGE_KEY, next.codeEditorIndentGuidesEnabled);
+  writeBooleanStorage(CODE_EDITOR_SETUP_GUIDE_STORAGE_KEY, next.codeEditorSetupGuideEnabled);
+  writeBooleanStorage(CODE_EDITOR_DEPENDENCY_INSTALL_STORAGE_KEY, next.codeEditorDependencyInstallEnabled);
 
   if (next.ollamaEndpoint !== DEFAULT_OLLAMA_BASE) {
     writeLocalStorageValue(OLLAMA_BASE_STORAGE_KEY, next.ollamaEndpoint);
@@ -353,6 +429,12 @@ export async function saveAppSettings(settings: AppSettings): Promise<void> {
 
   writeLocalStorageValue(OPENAI_API_KEY_STORAGE_KEY, next.openAIApiKey);
   writeLocalStorageValue(ANTHROPIC_API_KEY_STORAGE_KEY, next.anthropicApiKey);
+
+  if (JSON.stringify(next.providerSettings) !== JSON.stringify(createDefaultSettings().providerSettings)) {
+    writeLocalStorageValue(PROVIDER_SETTINGS_STORAGE_KEY, JSON.stringify(next.providerSettings));
+  } else {
+    writeLocalStorageValue(PROVIDER_SETTINGS_STORAGE_KEY, '');
+  }
 }
 
 export async function saveWorkspaces(workspaces: ProjectFolder[]): Promise<void> {

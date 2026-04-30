@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
-import type { ResponseTraceSource } from '../types';
+import type { ResponseTraceSource, SearchDiscoveryEngine } from '../types';
 import { IconLink, IconX } from './Icon';
 
 interface Props {
@@ -43,6 +43,36 @@ function cleanPreview(value?: string): string {
   return value.replace(/\s+/g, ' ').trim();
 }
 
+function deriveDiscoveryEngines(source: ResponseTraceSource): SearchDiscoveryEngine[] {
+  if (source.discoveryEngines?.length) return source.discoveryEngines;
+
+  switch (source.provider) {
+    case 'DuckDuckGo':
+      return ['duckduckgo'];
+    case 'Google Search':
+      return ['google'];
+    case 'Larry Local Search':
+      return ['local'];
+    default:
+      return [];
+  }
+}
+
+function getDiscoveryBadgeMeta(engine: SearchDiscoveryEngine): {
+  symbol: string;
+  label: string;
+  className: string;
+} {
+  switch (engine) {
+    case 'duckduckgo':
+      return { symbol: 'D', label: 'Found via DuckDuckGo', className: 'duckduckgo' };
+    case 'google':
+      return { symbol: 'G', label: 'Found via Google', className: 'google' };
+    case 'local':
+      return { symbol: 'L', label: 'Found via Local Search', className: 'local' };
+  }
+}
+
 function SourceRow({ source }: { source: ResponseTraceSource }) {
   const [iconFailed, setIconFailed] = useState(false);
   const hostname = getSourceHostname(source.url);
@@ -51,6 +81,7 @@ function SourceRow({ source }: { source: ResponseTraceSource }) {
   const sourceType = prettifySourceType(source.sourceType);
   const preview = cleanPreview(source.preview);
   const domainLabel = hostname || source.provider || source.title || source.url;
+  const discoveryEngines = deriveDiscoveryEngines(source);
 
   return (
     <a
@@ -75,6 +106,23 @@ function SourceRow({ source }: { source: ResponseTraceSource }) {
           )}
         </span>
         <div className="message-sources-item-domain">{domainLabel}</div>
+        {discoveryEngines.length > 0 && (
+          <div className="message-sources-item-engine-badges" aria-label="Search engines that surfaced this source">
+            {discoveryEngines.map((engine) => {
+              const badge = getDiscoveryBadgeMeta(engine);
+              return (
+                <span
+                  key={engine}
+                  className={`message-sources-item-engine-badge ${badge.className}`}
+                  title={badge.label}
+                  aria-label={badge.label}
+                >
+                  {badge.symbol}
+                </span>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       <strong className="message-sources-item-title">{source.title || hostname || source.url}</strong>
